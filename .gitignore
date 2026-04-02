@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+.vscode/
+
+/projects/PhyGenBench
+
+README0.md
