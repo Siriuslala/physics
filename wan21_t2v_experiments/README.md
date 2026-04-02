@@ -18,6 +18,7 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - `joint_attention_suite`
 - `step_window_cross_attn_off`
 - `step_window_ffn_off`
+- `cross_attn_head_ablation`
 - `step_window_prompt_replace`
 
 ## Experiment Overview (EN + 中文)
@@ -126,7 +127,21 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - Key readout:
   - sensitivity of motion quality to FFN removal by step/layer.
 
-### 10) `step_window_prompt_replace`
+### 10) `cross_attn_head_ablation`
+- Motivation: test the causal role of specific cross-attention heads found from visualization.
+- 动机：针对在可视化中观察到的关键 cross-attention heads 做定点消融，检验其因果作用。
+- Input:
+  - `ablate_heads`: head list, canonical format `LxHy` (e.g. `L29H7,L12H3`)
+  - `head_ablation_steps`: optional step list (empty => all diffusion steps)
+- Output:
+  - one ablated video
+  - `cross_attn_head_ablation_summary.json/.csv`
+  - `cross_attn_head_ablation_heads.csv`.
+- Key readout:
+  - video-level semantic/motion changes after removing selected heads
+  - `cross_attn_ablation_calls`, `ablated_head_instances`.
+
+### 11) `step_window_prompt_replace`
 - Motivation: test plan-locking by replacing the conditional prompt at chosen denoising steps.
 - 动机：在指定扩散步替换条件文本，测试运动规划的不可逆锁定窗口。
 - Input:
@@ -141,7 +156,7 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - Key readout:
   - earliest step where replacing prompt no longer changes trajectory semantics.
 
-### 11) `trajectory_entropy`
+### 12) `trajectory_entropy`
 - Motivation: quantify cross-attention spatial concentration for motion-plan analysis.
 - 动机：量化 cross-attention 的空间分布熵，分析轨迹规划何时从“多候选”收敛到“已锁定”。
 - Three sub-analyses:
@@ -282,6 +297,25 @@ python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
   --timestep_idx_to_remove_ffn 1,2,3,5,8,13,21,34,50 \
   --layer_idx_to_remove_ffn "" \
   --ffn_remove_scope single_step
+```
+
+### Cross-Attn Head Ablation
+
+```bash
+python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
+  --experiment cross_attn_head_ablation \
+  --ckpt_dir /path/to/Wan2.1-T2V-14B \
+  --prompt "A basketball falls to the ground and bounces up several times." \
+  --ablate_heads L29H7,L29H11 \
+  --head_ablation_steps ""   # empty => all steps
+
+# optional: only ablate selected steps
+python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
+  --experiment cross_attn_head_ablation \
+  --ckpt_dir /path/to/Wan2.1-T2V-14B \
+  --prompt "A basketball falls to the ground and bounces up several times." \
+  --ablate_heads L29H7,L29H11 \
+  --head_ablation_steps 1,2,3,5
 ```
 
 ### Step-Window Prompt Replace
@@ -469,6 +503,16 @@ For `joint_attention_suite`:
 - `replace_cond_only`:
 - Values: `true` / `false` (default `true`).
 - 中文：是否只替换 cond 分支的 prompt（推荐 `true`，更符合 CFG 分析语义）。
+
+- `ablate_heads`:
+- Used by `cross_attn_head_ablation`.
+- Format: CSV `LxHy` (recommended), e.g. `L29H7,L12H3` (also accepts `(x,y)`).
+- 中文：指定要消融的 cross-attention 头。推荐写法 `LxHy`，如 `L29H7`。
+
+- `head_ablation_steps`:
+- Used by `cross_attn_head_ablation`.
+- Values: CSV steps or empty string `""`.
+- 中文：指定在哪些扩散步做 head 消融。留空表示对所有扩散步都消融。
 
 - `trajectory_entropy_steps`:
 - Values: CSV steps or empty string `""`.

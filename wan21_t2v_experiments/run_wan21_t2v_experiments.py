@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
             "causal_schedule",
             "step_window_cross_attn_off",
             "step_window_ffn_off",
+            "cross_attn_head_ablation",
             "step_window_prompt_replace",
             "cross_attention_token_viz",
             "token_trajectory_seed_stability",
@@ -157,6 +158,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="single_step",
         choices=["single_step", "from_step"],
         help="Apply FFN removal on only selected step or selected step and all later steps.",
+    )
+    parser.add_argument(
+        "--ablate_heads",
+        type=str,
+        default="",
+        help=(
+            "CSV head specs for cross_attn_head_ablation. "
+            "Canonical format: LxHy (e.g., L29H7,L12H3). "
+            "Also accepts (x,y)."
+        ),
+    )
+    parser.add_argument(
+        "--head_ablation_steps",
+        type=str,
+        default="",
+        help=(
+            "CSV diffusion steps for cross_attn_head_ablation. "
+            "Empty means apply on all steps [1..sampling_steps]."
+        ),
     )
     parser.add_argument(
         "--replacement_prompt",
@@ -278,6 +298,7 @@ def main():
         run_wan21_t2v_joint_attention_suite,
         run_wan21_t2v_motion_aligned_attention,
         run_wan21_t2v_rope_axis_ablation,
+        run_wan21_t2v_cross_attn_head_ablation,
         run_wan21_t2v_step_window_cross_attn_off,
         run_wan21_t2v_step_window_ffn_off,
         run_wan21_t2v_step_window_prompt_replace,
@@ -291,8 +312,10 @@ def main():
     size = _parse_size(args.size)
     probe_steps = _parse_csv_ints(args.probe_steps)
     cross_attn_steps = _parse_csv_ints(args.cross_attn_steps)
+    head_ablation_steps = _parse_csv_ints(args.head_ablation_steps)
     trajectory_entropy_steps = _parse_csv_ints(args.trajectory_entropy_steps)
     trajectory_entropy_layerwise_steps = _parse_csv_ints(args.trajectory_entropy_layerwise_steps)
+    ablate_heads = _parse_csv_strs(args.ablate_heads)
     target_object_words = _parse_csv_strs(args.target_object_words)
     target_verb_words = _parse_csv_strs(args.target_verb_words)
     seed_list = _parse_csv_ints(args.seed_list)
@@ -395,6 +418,14 @@ def main():
             timestep_idx_to_remove_ffn=timestep_idx_to_remove_ffn,
             layer_idx_to_remove_ffn=layer_idx_to_remove_ffn if layer_idx_to_remove_ffn else None,
             ffn_remove_scope=args.ffn_remove_scope,
+        )
+    elif experiment_name == "cross_attn_head_ablation":
+        if not ablate_heads:
+            raise ValueError("--ablate_heads must be non-empty for cross_attn_head_ablation.")
+        run_wan21_t2v_cross_attn_head_ablation(
+            **common_kwargs,
+            ablate_heads=ablate_heads,
+            head_ablation_steps=head_ablation_steps,
         )
     elif experiment_name == "step_window_prompt_replace":
         prompt_replace_steps = _parse_csv_ints(args.prompt_replace_steps)
