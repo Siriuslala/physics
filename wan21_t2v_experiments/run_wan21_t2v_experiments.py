@@ -221,6 +221,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--traj_arrow_stride", type=int, default=4)
     parser.add_argument("--traj_include_head_mean", type=_str2bool, default=True)
     parser.add_argument("--save_attention_pdfs", type=_str2bool, default=True)
+    parser.add_argument(
+        "--skip_existing_pdfs",
+        type=_str2bool,
+        default=True,
+        help=(
+            "When saving visualization PDFs (attention/trajectory/timeline), "
+            "skip files that already exist in output_dir. Useful for resume after interruption."
+        ),
+    )
     parser.add_argument("--save_trajectory_pdfs", type=_str2bool, default=True)
     parser.add_argument("--save_trajectory_timeline_pdfs", type=_str2bool, default=True)
     parser.add_argument("--trajectory_timeline_num_frames", type=int, default=10)
@@ -463,6 +472,7 @@ def main():
             trajectory_arrow_stride=args.traj_arrow_stride,
             trajectory_include_head_mean=args.traj_include_head_mean,
             save_attention_pdfs=args.save_attention_pdfs,
+            skip_existing_pdfs=args.skip_existing_pdfs,
             save_trajectory_pdfs=args.save_trajectory_pdfs,
             save_trajectory_timeline_pdfs=args.save_trajectory_timeline_pdfs,
             trajectory_timeline_num_frames=args.trajectory_timeline_num_frames,

@@ -5,7 +5,7 @@ cd $ROOT_DIR
 # t2v-14B: '720*1280', '1280*720', '480*832', '832*480'
 # t2v-1.3B: '480*832', '832*480'
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 
 build_prompt_tag() {
     local prompt="$1"
@@ -50,7 +50,7 @@ SAMPLE_GUIDE_SCALE=5.0
 # SAMPLE_GUIDE_SCALE=5.0
 
 # ==============================
-SEEDS=(23)
+SEEDS=(26)
 # SEEDS=($(seq 1 32))
 
 PROMPTS=(
@@ -73,15 +73,18 @@ TRAJ_QUANTILE=0.8
 TRAJ_ARROW_STRIDE=4
 
 
+SKIP_EXISTING_PDFS=True  # resume mode: if target pdf already exists (map/trajectory/timeline), skip drawing
 SAVE_ATTENTION_PDFS=True  # save attention maps for each timestep -> layer -> head
 SAVE_TRAJECTORY_PDFS=True  # save trajectory (in one picture) for each timestep -> layer -> head
 SAVE_TRAJECTORY_TIMELINE_PDFS=True  # save trajectory timeline for each timestep -> layer -> head
 TRAJECTORY_TIMELINE_NUM_FRAMES=10  # number of frames for trajectory timeline (default: fps=2)
 
-DRAW_ATTENTION_MAP_ONLY=False  # whether to only visualize attention & trajectory via the saved attention maps
-DRAW_ATTENTION_MAPS_PATH=""  # the path to the saved attention maps for re-drawing
-# VISUALIZATION_OUTPUT_DIR="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw"  # "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw1"  # for re-drawing
-VISUALIZATION_OUTPUT_DIR=""
+DRAW_ATTENTION_MAP_ONLY=True  # whether to only visualize attention & trajectory via the saved attention maps
+# DRAW_ATTENTION_MAPS_PATH=""  # the path to the saved attention maps for re-drawing; if empty, use the attention maps in the standard output dir
+
+VISUALIZATION_OUTPUT_DIR="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw"  # "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw1"  # for re-drawing
+# VISUALIZATION_OUTPUT_DIR=""
+
 STREAM_FLUSH_PER_STEP=False
 PLOT_DURING_SAMPLING=False
 
@@ -131,8 +134,9 @@ for SEED in "${SEEDS[@]}"; do
         --traj_quantile $TRAJ_QUANTILE \
         --traj_arrow_stride $TRAJ_ARROW_STRIDE \
         --traj_include_head_mean True \
-        --save_attention_pdfs True \
-        --save_trajectory_pdfs True \
+        --save_attention_pdfs $SAVE_ATTENTION_PDFS \
+        --skip_existing_pdfs $SKIP_EXISTING_PDFS \
+        --save_trajectory_pdfs $SAVE_TRAJECTORY_PDFS \
         --save_trajectory_timeline_pdfs $SAVE_TRAJECTORY_TIMELINE_PDFS \
         --trajectory_timeline_num_frames $TRAJECTORY_TIMELINE_NUM_FRAMES \
         --save_video True \

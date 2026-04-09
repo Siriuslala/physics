@@ -5,7 +5,7 @@ cd $ROOT_DIR
 # t2v-14B: '720*1280', '1280*720', '480*832', '832*480'
 # t2v-1.3B: '480*832', '832*480'
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=3
 
 build_prompt_tag() {
     local prompt="$1"
@@ -49,19 +49,65 @@ SAMPLE_GUIDE_SCALE=5.0
 # SAMPLE_SHIFT=5.0
 # SAMPLE_GUIDE_SCALE=5.0
 
-# ==============================
-SEEDS=(23)
-PROMPTS=(
-    "A basketball falls to the ground."
-)
-
+# Head config ==============================
 # Canonical format: LxHy, x/y are 0-based.
 # Example: "L29H7,L29H11"
-ABLATE_HEADS="L29H7"
+
+## Black hole heads
+BLACK_HOLE_HEADS_1B3_T40="L0H3,L1H9,L3H0,L3H4,L3H10,L5H3,L6H3,L10H1,L12H4,L17H8,L20H8,L21H0,L21H5,L22H8,L23H6,L23H10,L27H7,L28H2,L28H8,L29H6,L29H9"
+
+## Traj heads
+TRAJ_HEADS_1B3_T2="L6H9,L10H3,L13H1,L13H8,L16H3,L16H6,L18H10,L23H3,L27H1,L27H3"
+TRAJ_HEADS_1B3_T6="L2H2,L2H6,L2H11,L3H7,L3H8,L3H9,L4H3,L4H7,L5H0,L5H1,L5H4,L5H5,L5H6,L5H9,L6H4,L6H6,L6H7,L6H8,L6H9,L7H0,L7H1,L7H2,L7H3,L7H5,L7H9"
+TRAJ_HEADS_1B3_T40=""
+
+# Exp config ==============================
+SEEDS=(26)  #
+PROMPTS=(
+    "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times."
+)  #
+HEAD_TYPE="traj"  # "black_hole", "traj"
+
+BLACK_HOLE_HEADS_1B3_SOURCE="BLACK_HOLE_HEADS_1B3_T40"  #
+BLACK_HOLE_HEADS_1B3="${!BLACK_HOLE_HEADS_1B3_SOURCE}"
+TRAJ_HEADS_1B3_SOURCE="TRAJ_HEADS_1B3_T6"  #
+TRAJ_HEADS_1B3="${!TRAJ_HEADS_1B3_SOURCE}"
+
+BLACK_HOLE_HEADS_14B_SOURCE=""  #
+BLACK_HOLE_HEADS_14B="${!BLACK_HOLE_HEADS_14B_SOURCE}"
+TRAJ_HEADS_14B_SOURCE=""  #
+TRAJ_HEADS_14B="${!TRAJ_HEADS_14B_SOURCE}"
+
 
 # Empty -> ablate on all diffusion steps.
 # Example: "1,2,3,5"
 HEAD_ABLATION_STEPS=""
+
+# ==============================
+if [ "$task" == "t2v-1.3B" ]; then
+    if [ "$HEAD_TYPE" == "black_hole" ]; then
+        ABLATE_HEADS="$BLACK_HOLE_HEADS_1B3"
+        HEAD_TAG="${HEAD_TYPE}_${BLACK_HOLE_HEADS_1B3_SOURCE##*_}"
+    elif [ "$HEAD_TYPE" == "traj" ]; then
+        ABLATE_HEADS="$TRAJ_HEADS_1B3"
+        HEAD_TAG="${HEAD_TYPE}_${TRAJ_HEADS_1B3_SOURCE##*_}"
+    fi
+elif [ "$task" == "t2v-14B" ]; then
+    if [ "$HEAD_TYPE" == "black_hole" ]; then
+        ABLATE_HEADS="$BLACK_HOLE_HEADS_14B"
+        HEAD_TAG="${HEAD_TYPE}_${BLACK_HOLE_HEADS_14B_SOURCE##*_}"
+    elif [ "$HEAD_TYPE" == "traj" ]; then
+        ABLATE_HEADS="$TRAJ_HEADS_14B"
+        HEAD_TAG="${HEAD_TYPE}_${TRAJ_HEADS_14B_SOURCE##*_}"
+    fi
+fi
+
+if [ "$HEAD_ABLATION_STEPS" == "" ]; then
+    HEAD_ABLATION_STEPS_TAG="all_steps"
+else
+    # Replace commas with underscores for the tag.
+    HEAD_ABLATION_STEPS_TAG=$(echo "$HEAD_ABLATION_STEPS" | tr ',' '_')
+fi
 
 # ==============================
 for PROMPT in "${PROMPTS[@]}"; do
@@ -71,7 +117,7 @@ for SEED in "${SEEDS[@]}"; do
     echo "=================================================================================="
 
     PROMPT_TAG=$(build_prompt_tag "$PROMPT")
-    SAVE_DIR="$WORK_DIR/outputs_wan_2_1_${task}/cross_attn_head_ablation/${PROMPT_TAG}/seed_${SEED}_shift_${SAMPLE_SHIFT}_guide_${SAMPLE_GUIDE_SCALE}"
+    SAVE_DIR="$WORK_DIR/outputs_wan_2_1_${task}/cross_attn_head_ablation/${PROMPT_TAG}/seed_${SEED}_shift_${SAMPLE_SHIFT}_guide_${SAMPLE_GUIDE_SCALE}/ablate_${HEAD_TAG}-steps_${HEAD_ABLATION_STEPS_TAG}"
     SUMMARY_FILE="$SAVE_DIR/cross_attn_head_ablation_summary.json"
     if [ -f "$SUMMARY_FILE" ]; then
         echo "Summary already exists: $SUMMARY_FILE"

@@ -62,6 +62,7 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - `target_verb_words`: verb words used for map only
   - `viz_num_frames`: uniform frame count for map panels
   - `viz_frame_indices`: optional explicit frame index list; overrides uniform sampling
+  - `skip_existing_pdfs`: if `true`, skip already-generated PDFs (attention map + trajectory + timeline)
   - `stream_flush_per_step`: flush one completed diffusion step to disk and free memory
   - `plot_during_sampling`: if `true`, render PDFs during sampling; if `false`, defer plotting
   - `draw_attention_map_only`: redraw mode from saved map tensors without rerunning sampling
@@ -374,6 +375,7 @@ python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
   --traj_smooth_radius 2 \
   --traj_power 1.5 \
   --traj_quantile 0.8 \
+  --skip_existing_pdfs true \
   --save_trajectory_timeline_pdfs true \
   --trajectory_timeline_num_frames 10 \
   --stream_flush_per_step true \
@@ -387,6 +389,7 @@ python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
   --draw_attention_maps_path /path/to/existing/cross_attention_token_viz/cross_attention_maps.pt \
   --visualization_output_dir /path/to/new/redraw_outputs \
   --save_attention_pdfs true \
+  --skip_existing_pdfs true \
   --save_trajectory_pdfs true \
   --save_trajectory_timeline_pdfs true
 ```
@@ -514,6 +517,11 @@ For `joint_attention_suite`:
 - Values: CSV steps or empty string `""`.
 - 中文：指定在哪些扩散步做 head 消融。留空表示对所有扩散步都消融。
 
+- `skip_existing_pdfs`:
+- Used by `cross_attention_token_viz`.
+- Values: `true` / `false` (default `true`).
+- 中文：保存可视化 PDF 时（attention map / trajectory / timeline），若目标文件已存在则直接跳过，支持中断后续跑。
+
 - `trajectory_entropy_steps`:
 - Values: CSV steps or empty string `""`.
 - 中文：轨迹熵的 step-wise / head-wise 采集步。留空表示全步长 `[1..sampling_steps]`。
@@ -570,3 +578,7 @@ For `joint_attention_suite`:
   - optional path to a map file; if empty, load `output_dir/cross_attention_maps.pt` or stream index.
 - `--visualization_output_dir` (default: empty)
   - optional separate directory for PDF redraw outputs; useful to keep previous figures unchanged.
+- `--skip_existing_pdfs` (default: `true`)
+  - affects all PDF rendering in `cross_attention_token_viz` (map/trajectory/timeline).
+  - `true`: if target PDF already exists, skip drawing this file.
+  - useful for resume after OOM/kill during long visualization rendering.
