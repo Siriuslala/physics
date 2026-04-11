@@ -5701,11 +5701,25 @@ def _compute_wan21_t2v_head_evolution_metrics(
         support_mask_fhw=support_mask_fhw,
         eps=eps,
     )
-    concentrated_region_stats = _compute_wan21_t2v_concentrated_region_score_stats(
-        probability_map_fhw=map_for_metrics_fhw,
-        top_ratio=float(concentrated_region_top_ratio),
-        eps=eps,
-    )
+    if bool(apply_preprocess_on_metrics):
+        concentrated_region_stats = _compute_wan21_t2v_concentrated_region_score_stats(
+            probability_map_fhw=map_for_metrics_fhw,
+            top_ratio=float(concentrated_region_top_ratio),
+            eps=eps,
+        )
+        concentrated_region_stats["concentrated_region_enabled"] = 1
+    else:
+        # When preprocessing is disabled, skip all outlier-related region logic (top-k + connectivity).
+        concentrated_region_stats = {
+            "concentrated_region_score": 0.0,
+            "concentrated_region_score_std": 0.0,
+            "concentrated_region_intensity": 0.0,
+            "concentrated_region_connectivity": 0.0,
+            "concentrated_region_compactness": 0.0,
+            "concentrated_region_top_ratio": float(concentrated_region_top_ratio),
+            "concentrated_region_top_k": 0,
+            "concentrated_region_enabled": 0,
+        }
 
     entropy_frame = float(entropy_stats["entropy_norm_mean"])
     entropy_video = float(entropy_stats["entropy_video_norm"])
@@ -5892,13 +5906,29 @@ def _plot_wan21_t2v_head_evolution_headwise_metric_for_layer(
         return ""
 
     fig, axis = plt.subplots(1, 1, figsize=(8.2, 5.0))
+    head_indices = sorted(rows_by_head.keys())
+    num_heads = len(head_indices)
+    if num_heads <= 20:
+        # Use a discrete qualitative palette to avoid repeated default cycle colors.
+        color_map = plt.get_cmap("tab20", num_heads)
+    else:
+        # Fall back to a high-cardinality palette when the head count is large.
+        color_map = plt.get_cmap("gist_rainbow", num_heads)
+
     all_values: List[float] = []
-    for head_index in sorted(rows_by_head.keys()):
+    for color_index, head_index in enumerate(head_indices):
         head_rows = sorted(rows_by_head[head_index], key=lambda row: int(row["step"]))
         x_steps = [int(row["step"]) for row in head_rows]
         y_values = [float(row[metric_key]) for row in head_rows]
         all_values.extend(y_values)
-        axis.plot(x_steps, y_values, linewidth=1.2, alpha=0.85, label=f"h{head_index:02d}")
+        axis.plot(
+            x_steps,
+            y_values,
+            linewidth=1.2,
+            alpha=0.9,
+            color=color_map(color_index),
+            label=f"h{head_index:02d}",
+        )
 
     axis.set_title(f"Head Evolution Head-Wise: {metric_key} (layer={int(layer)})")
     axis.set_xlabel("diffusion step")
@@ -6648,9 +6678,10 @@ def run_wan21_t2v_head_evolution(
         ("entropy_video", "video-level normalized entropy"),
         ("support_quality_frame", "frame-level trajectory support quality"),
         ("support_quality_video", "video-level trajectory support quality"),
-        ("concentrated_region_score", "concentrated-region score"),
         ("planning_aggregate_video", "planning aggregate score"),
     ]
+    if bool(head_evolution_apply_preprocess_on_metrics):
+        metric_specs.append(("concentrated_region_score", "concentrated-region score"))
 
     plot_paths_stepwise: List[str] = []
     plot_paths_layerwise: List[str] = []

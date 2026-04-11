@@ -645,7 +645,7 @@ For `head_evolution`:
 
 - `head_evolution_apply_preprocess_on_metrics`:
 - Values: `true` / `false` (default `true`).
-- 中文：是否在各项指标计算前对 map 做 winsorize+despike。注意：参考轨迹（object center 与邻域）提取仍固定使用去离群点后的 map。
+- 中文：是否在各项指标计算前对 map 做 winsorize+despike。设为 `false` 时，会跳过指标阶段所有离群点相关逻辑（包括 top-k 连通域集中度计算）；注意参考轨迹（object center 与邻域）提取仍固定使用去离群点后的 map。
 
 - `head_evolution_preprocess_winsorize_quantile`:
 - Values: float in `[0,1]`.
