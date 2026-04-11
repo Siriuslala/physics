@@ -11,6 +11,7 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - `rope_axis_ablation`
 - `attention_dt_profile`
 - `trajectory_entropy`
+- `head_evolution`
 - `motion_aligned_attention`
 - `causal_schedule`
 - `cross_attention_token_viz`
@@ -179,6 +180,29 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - `trajectory_entropy_stepwise_object_mean_videowise.pdf` (video-wise normalization on `F*H*W`)
   - layer/head entropy curve PDFs
   - `trajectory_entropy_summary.json`.
+
+### 13) `head_evolution`
+- Motivation: analyze dynamic head patterns over denoising steps and identify likely planning heads vs state-driven/modulation-driven heads.
+- 动机：分析 head pattern 随扩散步的动态演化，区分可能的规划头、状态驱动头和调制驱动头。
+- Core input:
+  - `reuse_cross_attention_dir` (required): existing `cross_attention_token_viz` output directory
+  - `target_object_words`: object words used to build object-mean maps
+  - `head_evolution_reference_step/layer`: reference map location for trajectory-support construction
+  - `head_evolution_center_mode`: `peak` / `centroid` / `geometric_center` (`bbox_center` is removed)
+  - `head_evolution_support_radius_mode`: `fixed` or `adaptive_area`
+- Core outputs:
+  - `head_evolution_stepwise.csv` / `head_evolution_layerwise.csv` / `head_evolution_headwise.csv`
+  - `head_evolution_head_scores.csv` (planning/readout/modulation/state-coupling scores + category)
+  - `head_evolution_reference_radius_overlay.pdf` (reference map with center+r overlay for radius sanity-check)
+  - Plot metric keys now use clean `frame` / `video` naming:
+    - `entropy_frame`, `entropy_video`
+    - `support_quality_frame`, `support_quality_video`
+  - `head_evolution_summary.json`.
+
+- MSS (Modulation Sensitivity Score):
+  - Full name: `Modulation Sensitivity Score`.
+  - Motivation: distinguish heads that simply follow denoising state evolution from heads with stronger step-selective behavior.
+  - Meaning: larger MSS indicates stronger head-specific residual dynamics relative to layer-level average dynamics across diffusion steps.
 
 ## Important Notes
 
@@ -357,6 +381,28 @@ python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
   --reuse_cross_attention_dir /path/to/previous/cross_attention_token_viz
 ```
 
+### Head Evolution
+
+```bash
+python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
+  --experiment head_evolution \
+  --ckpt_dir /path/to/Wan2.1-T2V-14B \
+  --prompt "A basketball falls to the ground and bounces up several times." \
+  --target_object_words basketball \
+  --target_verb_words falls,bounces \
+  --head_evolution_steps "" \
+  --head_evolution_layerwise_steps "" \
+  --head_evolution_stepwise_layer 27 \
+  --head_evolution_head_layer -2 \
+  --head_evolution_reference_step 50 \
+  --head_evolution_reference_layer 27 \
+  --head_evolution_center_mode centroid \
+  --head_evolution_support_radius_mode adaptive_area \
+  --head_evolution_support_radius_alpha 1.5 \
+  --head_evolution_save_reference_radius_overlay true \
+  --reuse_cross_attention_dir /path/to/previous/cross_attention_token_viz
+```
+
 ### Cross-Attention Token Visualization
 
 ```bash
@@ -456,6 +502,18 @@ For `joint_attention_suite`:
 - `joint_attention_suite_summary.json` unified report
 - if `--reuse_cross_attention_dir` is set, stage-1 is loaded from that external directory and only stage-2/3 are generated under current output dir
 
+For `head_evolution`:
+
+- `head_evolution_reference_trajectory.csv`: reference per-frame centers/radius metadata
+- `head_evolution_reference_head_mean_map.pt`: reference map used to construct support mask
+- `head_evolution_support_mask_fhw.pt`: support mask tensor `[F, H, W]`
+- `head_evolution_reference_radius_overlay.pdf`: center+radius sanity-check figure on reference maps
+- `head_evolution_stepwise.csv`: step-wise metrics (selected layer, head-mean map)
+- `head_evolution_layerwise.csv`: layer-wise metrics (selected steps, head-mean map)
+- `head_evolution_headwise.csv`: head-wise metrics (selected layers, per-head curves)
+- `head_evolution_head_scores.csv`: per-head scores and category labels
+- `head_evolution_summary.json`: full configuration, thresholds, and artifact paths
+
 ## How To Read Main Metrics
 
 - `maas_local_ratio`:
@@ -541,6 +599,69 @@ For `joint_attention_suite`:
 - `reuse_cross_attention_dir`:
 - Values: existing `cross_attention_token_viz` output directory path.
 - 中文：可复用已有 cross-attention 结果目录。`trajectory_entropy` 将直接读取 `cross_attention_maps.pt`（或 stream 文件），不重新采样；`joint_attention_suite` 会跳过 stage-1。
+
+- `head_evolution_steps`:
+- Values: CSV steps or empty string `""`.
+- 中文：`head_evolution` 的 step-wise/head-wise 分析步列表。留空表示使用复用目录中的所有可用 steps。
+
+- `head_evolution_layerwise_steps`:
+- Values: CSV steps or empty string `""`.
+- 中文：`head_evolution` 的 layer-wise 分析步列表。留空时默认等于 `head_evolution_steps`。
+
+- `head_evolution_stepwise_layer`:
+- Values: layer index (`-1` means last layer).
+- 中文：step-wise 曲线使用的层号。推荐 `27`（与你现有实验约定一致）。
+
+- `head_evolution_head_layer`:
+- Values: `-2` (all layers), `-1` (last layer), or non-negative layer index.
+- 中文：head-wise 曲线分析层号，`-2` 表示所有层。
+
+- `head_evolution_reference_step` / `head_evolution_reference_layer`:
+- 中文：构建参考轨迹和支撑掩码时使用的参考图位置（step 1-based，layer 0-based）。
+
+- `head_evolution_center_mode`:
+- Values: `peak` / `centroid` / `geometric_center`.
+- 中文：参考中心点选取方式。`peak` 取峰值；`centroid` 使用分位阈值+连通域加权质心；`geometric_center` 使用连通域几何中心。`bbox_center` 不再支持。
+
+- `head_evolution_support_radius_mode`:
+- Values: `fixed` / `adaptive_area`.
+- 中文：半径模式。`adaptive_area` 按参考高亮连通域面积自适应半径，`fixed` 使用固定半径。
+
+- `head_evolution_save_reference_radius_overlay`:
+- Values: `true` / `false` (default `true`).
+- 中文：是否保存参考图中心点+半径圆盘叠加图，用于检查 `r` 是否合理。
+
+- `head_evolution_reference_viz_num_frames`:
+- Values: integer.
+- 中文：参考半径叠加图展示多少帧（时间轴并排）。
+
+- `head_evolution_early_step_end`:
+- Values: integer.
+- 中文：head 打分时用于区分“早期窗口”和“后期窗口”的边界 step。
+
+- `head_evolution_score_quantile`:
+- Values: float in `[0,1]`.
+- 中文：head 分类阈值采用的分位数参数（用于 early/late/state/MSS 阈值）。
+
+- `head_evolution_apply_preprocess_on_metrics`:
+- Values: `true` / `false` (default `true`).
+- 中文：是否在各项指标计算前对 map 做 winsorize+despike。注意：参考轨迹（object center 与邻域）提取仍固定使用去离群点后的 map。
+
+- `head_evolution_preprocess_winsorize_quantile`:
+- Values: float in `[0,1]`.
+- 中文：每帧 winsorize 截断分位点，用于压制极端高值离群点（attention sink）。
+
+- `head_evolution_preprocess_despike_quantile`:
+- Values: float in `[0,1]`.
+- 中文：每帧空间去尖刺分位阈值。先取高值掩码，再做连通域面积筛选，移除零星高亮点。
+
+- `head_evolution_preprocess_min_component_area`:
+- Values: integer `>=1`.
+- 中文：空间去尖刺时保留连通域的最小面积阈值（像素/token 数）。
+
+- `head_evolution_concentrated_region_top_ratio`:
+- Values: float in `(0,1]`.
+- 中文：计算 concentrated-region score 时选取前多少比例的高权重 token。
 
 ## How To Read DT Plots
 

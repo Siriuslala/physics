@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
             "rope_axis_ablation",
             "attention_dt_profile",
             "trajectory_entropy",
+            "head_evolution",
             "motion_aligned_attention",
             "causal_schedule",
             "step_window_cross_attn_off",
@@ -275,6 +276,71 @@ def build_parser() -> argparse.ArgumentParser:
         help="Whether trajectory_entropy should save generated video.",
     )
 
+    # Head-evolution options
+    parser.add_argument(
+        "--head_evolution_steps",
+        type=str,
+        default="",
+        help="CSV steps for head_evolution step-wise/head-wise analysis. Empty means all available steps.",
+    )
+    parser.add_argument(
+        "--head_evolution_layerwise_steps",
+        type=str,
+        default="",
+        help="CSV steps for head_evolution layer-wise analysis. Empty defaults to head_evolution_steps.",
+    )
+    parser.add_argument(
+        "--head_evolution_head_layer",
+        type=int,
+        default=-2,
+        help="Layer index for head-wise curves. -2 means all layers; -1 means last layer.",
+    )
+    parser.add_argument(
+        "--head_evolution_stepwise_layer",
+        type=int,
+        default=27,
+        help="Layer index used for step-wise curves. -1 means last layer.",
+    )
+    parser.add_argument("--head_evolution_reference_step", type=int, default=50)
+    parser.add_argument("--head_evolution_reference_layer", type=int, default=27)
+    parser.add_argument(
+        "--head_evolution_center_mode",
+        type=str,
+        default="centroid",
+        choices=["peak", "centroid", "geometric_center"],
+        help="Reference center mode used to build support masks.",
+    )
+    parser.add_argument(
+        "--head_evolution_support_radius_mode",
+        type=str,
+        default="adaptive_area",
+        choices=["fixed", "adaptive_area"],
+        help="Radius mode for trajectory-support disk neighborhood.",
+    )
+    parser.add_argument("--head_evolution_support_radius_fixed", type=float, default=2.0)
+    parser.add_argument("--head_evolution_support_radius_alpha", type=float, default=1.5)
+    parser.add_argument("--head_evolution_support_radius_min", type=float, default=1.0)
+    parser.add_argument("--head_evolution_support_radius_max_ratio", type=float, default=0.25)
+    parser.add_argument("--head_evolution_traj_power", type=float, default=1.5)
+    parser.add_argument("--head_evolution_traj_quantile", type=float, default=0.8)
+    parser.add_argument("--head_evolution_reference_viz_num_frames", type=int, default=10)
+    parser.add_argument("--head_evolution_save_reference_radius_overlay", type=_str2bool, default=True)
+    parser.add_argument("--head_evolution_early_step_end", type=int, default=5)
+    parser.add_argument("--head_evolution_score_quantile", type=float, default=0.7)
+    parser.add_argument(
+        "--head_evolution_apply_preprocess_on_metrics",
+        type=_str2bool,
+        default=True,
+        help=(
+            "Whether to apply winsorize+despike preprocessing when computing head_evolution metrics. "
+            "Reference trajectory extraction still uses preprocessing regardless of this switch."
+        ),
+    )
+    parser.add_argument("--head_evolution_preprocess_winsorize_quantile", type=float, default=0.995)
+    parser.add_argument("--head_evolution_preprocess_despike_quantile", type=float, default=0.98)
+    parser.add_argument("--head_evolution_preprocess_min_component_area", type=int, default=2)
+    parser.add_argument("--head_evolution_concentrated_region_top_ratio", type=float, default=0.05)
+
     # Seed stability / joint suite options
     parser.add_argument("--seed_list", type=str, default="0,1,2,3")
     parser.add_argument("--stability_num_points", type=int, default=41)
@@ -304,6 +370,7 @@ def main():
         run_wan21_t2v_attention_dt_profile,
         run_wan21_t2v_causal_schedule,
         run_wan21_t2v_cross_attention_token_viz,
+        run_wan21_t2v_head_evolution,
         run_wan21_t2v_joint_attention_suite,
         run_wan21_t2v_motion_aligned_attention,
         run_wan21_t2v_rope_axis_ablation,
@@ -324,6 +391,8 @@ def main():
     head_ablation_steps = _parse_csv_ints(args.head_ablation_steps)
     trajectory_entropy_steps = _parse_csv_ints(args.trajectory_entropy_steps)
     trajectory_entropy_layerwise_steps = _parse_csv_ints(args.trajectory_entropy_layerwise_steps)
+    head_evolution_steps = _parse_csv_ints(args.head_evolution_steps)
+    head_evolution_layerwise_steps = _parse_csv_ints(args.head_evolution_layerwise_steps)
     ablate_heads = _parse_csv_strs(args.ablate_heads)
     target_object_words = _parse_csv_strs(args.target_object_words)
     target_verb_words = _parse_csv_strs(args.target_verb_words)
@@ -394,6 +463,40 @@ def main():
             trajectory_entropy_head_layer=args.trajectory_entropy_head_layer,
             trajectory_entropy_stepwise_layer=args.trajectory_entropy_stepwise_layer,
             save_video=args.trajectory_entropy_save_video,
+            reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
+        )
+    elif experiment_name == "head_evolution":
+        if not target_object_words:
+            raise ValueError("--target_object_words is required for head_evolution.")
+        if not args.reuse_cross_attention_dir.strip():
+            raise ValueError("--reuse_cross_attention_dir is required for head_evolution.")
+        run_wan21_t2v_head_evolution(
+            **common_kwargs,
+            target_object_words=target_object_words,
+            target_verb_words=target_verb_words,
+            head_evolution_steps=head_evolution_steps,
+            head_evolution_layerwise_steps=head_evolution_layerwise_steps,
+            head_evolution_head_layer=args.head_evolution_head_layer,
+            head_evolution_stepwise_layer=args.head_evolution_stepwise_layer,
+            head_evolution_reference_step=args.head_evolution_reference_step,
+            head_evolution_reference_layer=args.head_evolution_reference_layer,
+            head_evolution_center_mode=args.head_evolution_center_mode,
+            head_evolution_support_radius_mode=args.head_evolution_support_radius_mode,
+            head_evolution_support_radius_fixed=args.head_evolution_support_radius_fixed,
+            head_evolution_support_radius_alpha=args.head_evolution_support_radius_alpha,
+            head_evolution_support_radius_min=args.head_evolution_support_radius_min,
+            head_evolution_support_radius_max_ratio=args.head_evolution_support_radius_max_ratio,
+            head_evolution_traj_power=args.head_evolution_traj_power,
+            head_evolution_traj_quantile=args.head_evolution_traj_quantile,
+            head_evolution_reference_viz_num_frames=args.head_evolution_reference_viz_num_frames,
+            head_evolution_save_reference_radius_overlay=args.head_evolution_save_reference_radius_overlay,
+            head_evolution_early_step_end=args.head_evolution_early_step_end,
+            head_evolution_score_quantile=args.head_evolution_score_quantile,
+            head_evolution_apply_preprocess_on_metrics=args.head_evolution_apply_preprocess_on_metrics,
+            head_evolution_preprocess_winsorize_quantile=args.head_evolution_preprocess_winsorize_quantile,
+            head_evolution_preprocess_despike_quantile=args.head_evolution_preprocess_despike_quantile,
+            head_evolution_preprocess_min_component_area=args.head_evolution_preprocess_min_component_area,
+            head_evolution_concentrated_region_top_ratio=args.head_evolution_concentrated_region_top_ratio,
             reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
         )
     elif experiment_name == "causal_schedule":
