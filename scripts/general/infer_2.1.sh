@@ -10,7 +10,7 @@ cd $ROOT_DIR/projects/Wan2_1
 # t2v-A14B: '720*1280', '1280*720', '480*832', '832*480'
 # t2v-1.3b: '480*832', '832*480'
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 GPU_TAG="a800"
 
 build_prompt_tag() {
@@ -56,6 +56,7 @@ SAMPLE_GUIDE_SCALE=5.0
 
 # SEEDS=(26)
 SEEDS=($(seq 1 32))
+# SEEDS=($(seq 33 1024))
 
 PROMPT="A basketball falls to the ground and bounces up several times, with the height of each bounce gradually decreasing until it comes to a stop."
 PROMPTS=(
@@ -79,11 +80,12 @@ PROMPTS=(
     # "Against a pure white background, a little green ball rolls to the right on a wooden flat surface and bounces back when it hits a vertical wall."
     # "Against a pure white background, there is a horizontal wooden tabletop with a wall leaning against its right side. A small green ball starts rolling uniformly and horizontally to the right from the left end of the tabletop, rebounds after colliding with the wall, and then rolls to the left."
     # "Against a pure white background, there is a flat wooden table with a wall next to its right edge. A little green ball begins rolling steadily to the right from the left end of the table, bounces back when it hits the wall, and then rolls leftwards."
-    "Against a pure white background, a wooden horizontal surface lies at the bottom of the frame, a vertical wall stands on the right side, and a small green ball is placed on the middle of the surface. The ball starts rolling slowly to the right from the center of the surface; upon colliding with the right wall, it rebounds and rolls leftward at a constant speed."
+    # "Against a pure white background, a wooden horizontal surface lies at the bottom of the frame, a vertical wall stands on the right side, and a small green ball is placed on the middle of the surface. The ball starts rolling slowly to the right from the center of the surface; upon colliding with the right wall, it rebounds and rolls leftward at a constant speed."
 
     # "Against a pure white background, a small green ball is thrown vertically upward from below, reaches its highest point, and then falls vertically back down to the ground."
     # "Against a pure white background, a small green ball is thrown from the bottom left corner toward the upper right, rises to its highest point, and then falls back down."
 
+    "Against a pure white background, a wooden cube block at the top of a smooth slope slides straight down the slope with steadily and uniformly increasing speed."
     # "Against a pure white background, a wooden cube block starts from rest at the top of a smooth slope (higher on the left, lower on the right), slides straight down the slope with steadily and uniformly increasing speed, and never tips over or flips throughout the entire movement."
     # "Against a pure white background, a small green ball starts from rest at the top of a smooth slope (higher on the left, lower on the right), slides straight along the slope the entire time, with its speed increasing steadily and uniformly."
     # "Against a pure white background, there is one single wooden slope. A small green ball starts from rest at the top of the slope, slides straight along the slope the entire time, with its speed increasing steadily and uniformly."
