@@ -12,6 +12,10 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - `attention_dt_profile`
 - `trajectory_entropy`
 - `head_evolution`
+- `head_trajectory_dynamics`
+- `self_attention_temporal_kernel`
+- `seed_to_trajectory_predictability`
+- `event_token_value`
 - `motion_aligned_attention`
 - `causal_schedule`
 - `cross_attention_token_viz`
@@ -203,6 +207,114 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - Full name: `Modulation Sensitivity Score`.
   - Motivation: distinguish heads that simply follow denoising state evolution from heads with stronger step-selective behavior.
   - Meaning: larger MSS indicates stronger head-specific residual dynamics relative to layer-level average dynamics across diffusion steps.
+
+### 14) `head_trajectory_dynamics`
+- Motivation: test whether heads that show object-token trajectories become mutually consistent over early denoising, and whether some heads behave like attractors that pull other heads' soft trajectories closer over subsequent steps.
+- 动机：分析多个 cross-attention heads 的 object-token 轨迹是否在扩散早期形成共识，以及是否存在“吸引子头”使其他 head 的软轨迹逐步靠近。
+- Type: offline analysis. It reuses saved maps from an existing `cross_attention_token_viz` directory and does not resample video.
+- Input:
+  - `reuse_cross_attention_dir` (required): existing `cross_attention_token_viz` output directory
+  - `target_object_words`: object words to aggregate into object-token maps
+  - `head_trajectory_dynamics_heads`: optional head list such as `L4H1,L7H8`; empty means all heads
+  - `head_trajectory_dynamics_steps`: optional diffusion-step list; empty means all steps available in reused maps
+  - `head_trajectory_dynamics_distance_metrics`: `js`, `wasserstein`, or empty for both
+  - `head_trajectory_dynamics_reference_step/layer`: final reference map used for distance-to-final-soft-center
+- Output:
+  - `head_trajectory_dynamics_head_maps.csv`: map inventory after filtering
+  - `head_trajectory_dynamics_pairwise.csv`: pairwise head trajectory distances within each step/layer
+  - `head_trajectory_dynamics_consensus.csv`: consensus score per step/layer
+  - `head_trajectory_dynamics_attractor.csv`: attractor score for each candidate leader head
+  - `head_trajectory_dynamics_final_distance.csv`: distance from each head's soft trajectory to final reference soft trajectory
+  - `head_trajectory_dynamics_soft_centers.csv`: per-frame soft centers for each step/layer/head
+  - `head_trajectory_dynamics_plots/`: consensus heatmaps, consensus curves, attractor curves, and soft-center spaghetti plots.
+- Metrics:
+  - `js_distance`: Jensen-Shannon distance between per-frame spatial probability maps.
+  - `wasserstein_distance`: approximate Wasserstein-like distance computed by soft-center displacement, not full 2D optimal transport.
+  - `consensus = 1 / (1 + mean_pairwise_distance)`: larger means heads in the same layer/step are more similar.
+  - `attractor_score_mean`: average decrease in follower-head distance to a leader head from one selected step to the next selected step; positive means followers move closer.
+
+### 15) `self_attention_temporal_kernel`
+- Motivation: intervene on self-attention's temporal coherence path and test whether smoother longer-range temporal mixing improves or disrupts motion planning.
+- 动机：干预 self-attention 的时序一致性通路，观察把局部帧输出平滑分配到邻近/更远帧是否改善或破坏轨迹规划。
+- Type: online monkey patch. It does not modify Wan source files.
+- Important implementation detail:
+  - The experiment does not materialize full `[heads, L, L]` attention matrices, because that is too expensive for long video sequences.
+  - Instead, Wan self-attention is computed normally, then its output `y` is mixed along the latent-frame axis for the same spatial token position:
+    `y' = (1 - alpha) * y + alpha * temporal_kernel(y)`.
+  - The temporal kernel is normalized, so the intervention is a residual output smoothing operation rather than an unnormalized attention rewrite.
+- Input:
+  - `self_attn_kernel_steps`: 1-based diffusion steps; empty means all steps
+  - `self_attn_kernel_layers`: DiT layer list; empty means all layers
+  - `self_attn_kernel_branch`: `cond`, `uncond`, or `both`
+  - `self_attn_kernel_radius`: frame radius in latent-token time
+  - `self_attn_kernel_sigma`: Gaussian kernel width
+  - `self_attn_kernel_mix_alpha`: mixing coefficient in `[0,1]`
+- Output:
+  - generated video
+  - `self_attention_temporal_kernel_calls.csv`
+  - `self_attention_temporal_kernel_summary.json`.
+- Key readout:
+  - qualitative video motion changes vs baseline
+  - whether increasing temporal smoothing stabilizes trajectory, over-smooths motion, or introduces artifacts.
+
+### 16) `seed_to_trajectory_predictability`
+- Motivation: test whether the selected reference object trajectory is predictable from the initial latent noise and/or early cross-attention trajectories.
+- 动机：检验指定的参考轨迹能否从初始 latent 噪声和/或扩散早期的 cross-attention 轨迹中预测出来。
+- Type: multi-seed analysis. It runs one generation per seed, captures the initial Gaussian latent `z_T`, captures early/reference object-token cross-attention maps in the same run, and then fits lightweight probes.
+- Four built-in variants:
+  - `noise_only`: use compact features from initial latent noise `z_T`
+  - `step1_attention`: use only step-1 object-token trajectory
+  - `steps1_to_k_attention`: use early-step object-token trajectories, e.g. steps `1..6`
+  - `noise_plus_attention`: concatenate `z_T` features and early attention features
+- Core idea:
+  - For each seed, sample one video and save `initial_noise.pt`.
+  - In the same run, collect selected early steps and one reference step of object-token cross-attention maps.
+  - Use leave-one-seed-out ridge regression to predict the reference trajectory from each feature variant.
+- Input:
+  - `seed_list`: seeds to analyze
+  - `seed_to_trajectory_early_steps`: early steps used by the attention-based variants
+  - `seed_to_trajectory_reference_step`: reference trajectory step, usually `50`
+  - `seed_to_trajectory_reference_layer`: layer used for early and reference trajectories, usually `27`
+  - `seed_to_trajectory_head`: `mean` or a head id string
+  - `seed_to_trajectory_num_points`: trajectory resampling point count; set `<= 0` to keep the original latent-frame trajectory length
+- Output:
+  - `seed_000000/initial_noise.pt`: saved initial Gaussian latent
+  - `seed_000000/seed_to_trajectory_cross_attention_maps.pt`: early/reference attention maps collected in the same run
+  - `seed_to_trajectory_seed_runs.csv`
+  - `seed_to_trajectory_features.csv`
+  - `seed_to_trajectory_targets.csv`
+  - `seed_to_trajectory_predictions.csv`: leave-one-seed-out error for all four variants
+  - `seed_to_trajectory_plots/<variant>/`: target vs predicted reference trajectory PDFs
+  - `seed_to_trajectory_predictability_summary.json`.
+- Key readout:
+  - compare `noise_only`, `step1_attention`, `steps1_to_k_attention`, `noise_plus_attention`
+  - `mean_point_error`: mean token-grid distance between predicted and reference trajectory
+  - `normalized_mean_point_error`: error normalized by average final-trajectory step displacement.
+
+### 17) `event_token_value`
+- Motivation: compare different prompt tokens not only by where their cross-attention maps look, but by how large their value-side contribution is to the cross-attention residual.
+- 动机：不只看某个文本 token 被视频 token 注意到哪里，还看该 token 的 value 对 cross-attention 输出 residual 的贡献强度。
+- Type: online monkey patch. Token matching reuses the same `_locate_wan21_t2v_prompt_words` helper as `cross_attention_token_viz`.
+- What is measured:
+  - `attention_mean`: mean attention probability to the selected word positions.
+  - `pre_output_value_norm_mean`: norm of the selected token's pre-output per-head value contribution.
+  - `projected_value_norm_mean`: norm after applying the corresponding slice of the cross-attention output projection `o.weight`; the projection bias is not assigned to individual tokens.
+- Input:
+  - `target_object_words`: object words
+  - `target_verb_words`: verb/action words
+  - `event_token_value_words`: additional event words to mark as `event`; they are located through the same tokenizer matching path
+  - `event_token_value_steps`: collection steps
+  - `event_token_value_layers`: collection layers; empty means all layers
+  - `event_token_value_branch`: `cond`, `uncond`, or `both`
+- Output:
+  - generated video
+  - `event_token_value_summary.csv`
+  - `event_token_value_maps.pt`: value-contribution maps
+  - `event_token_attention_maps.pt`: matching attention maps
+  - `event_token_value_maps/`: head-mean projected-value-norm timeline PDFs
+  - `event_token_value_summary.json`.
+- Key readout:
+  - Tokens may have similar attention maps but different projected value norms. Such a gap indicates that a token is visually co-located in attention but contributes differently to the actual residual stream.
 
 ## Important Notes
 
@@ -401,6 +513,70 @@ python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
   --head_evolution_support_radius_alpha 1.5 \
   --head_evolution_save_reference_radius_overlay true \
   --reuse_cross_attention_dir /path/to/previous/cross_attention_token_viz
+```
+
+### Head Trajectory Dynamics
+
+```bash
+python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
+  --experiment head_trajectory_dynamics \
+  --ckpt_dir /path/to/Wan2.1-T2V-1.3B \
+  --prompt "A basketball falls to the ground and bounces up several times." \
+  --target_object_words basketball \
+  --target_verb_words falls,bounces \
+  --head_trajectory_dynamics_heads "" \
+  --head_trajectory_dynamics_steps 1,2,3,4,5,6 \
+  --head_trajectory_dynamics_distance_metrics "" \
+  --head_trajectory_dynamics_reference_step 50 \
+  --head_trajectory_dynamics_reference_layer 27 \
+  --reuse_cross_attention_dir /path/to/previous/cross_attention_token_viz
+```
+
+### Self-Attention Temporal Kernel
+
+```bash
+python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
+  --experiment self_attention_temporal_kernel \
+  --ckpt_dir /path/to/Wan2.1-T2V-1.3B \
+  --prompt "A basketball falls to the ground and bounces up several times." \
+  --self_attn_kernel_steps 1,2,3,4,5,6 \
+  --self_attn_kernel_layers "" \
+  --self_attn_kernel_branch cond \
+  --self_attn_kernel_radius 2 \
+  --self_attn_kernel_sigma 1.0 \
+  --self_attn_kernel_mix_alpha 0.25
+```
+
+### Seed-To-Trajectory Predictability
+
+```bash
+python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
+  --experiment seed_to_trajectory_predictability \
+  --ckpt_dir /path/to/Wan2.1-T2V-1.3B \
+  --prompt "A basketball falls to the ground and bounces up several times." \
+  --target_object_words basketball \
+  --target_verb_words falls,bounces \
+  --seed_list 0,1,2,3,4,5,6,7 \
+  --seed_to_trajectory_early_steps 1,2,3,4,5,6 \
+  --seed_to_trajectory_reference_step 50 \
+  --seed_to_trajectory_reference_layer 27 \
+  --seed_to_trajectory_head mean \
+  --seed_to_trajectory_num_points 0
+```
+
+### Event-Token Value
+
+```bash
+python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
+  --experiment event_token_value \
+  --ckpt_dir /path/to/Wan2.1-T2V-1.3B \
+  --prompt "A basketball falls to the ground and bounces up several times." \
+  --target_object_words basketball \
+  --target_verb_words falls,bounces \
+  --event_token_value_words falls,bounces \
+  --event_token_value_steps 1,2,3,4,5,6 \
+  --event_token_value_layers 27 \
+  --event_token_value_branch cond
 ```
 
 ### Cross-Attention Token Visualization
@@ -662,6 +838,70 @@ For `head_evolution`:
 - `head_evolution_concentrated_region_top_ratio`:
 - Values: float in `(0,1]`.
 - 中文：计算 concentrated-region score 时选取前多少比例的高权重 token。
+
+- `head_trajectory_dynamics_heads`:
+- Values: CSV `LxHy` specs or empty string `""`.
+- 中文：指定参与共识/吸引子动态分析的 heads。留空表示使用复用 map 里的所有 heads。
+
+- `head_trajectory_dynamics_steps`:
+- Values: CSV steps or empty string `""`.
+- 中文：指定分析哪些扩散步。留空表示使用复用 map 里的所有可用 steps；若只关心 motion plan，建议先用 `1,2,3,4,5,6`。
+
+- `head_trajectory_dynamics_distance_metrics`:
+- Values: `js`, `wasserstein`, `js,wasserstein`, or empty string `""`.
+- 中文：head 轨迹距离度量。`wasserstein` 当前是 soft-center displacement 近似，不是完整二维最优传输。
+
+- `head_trajectory_dynamics_reference_step` / `head_trajectory_dynamics_reference_layer`:
+- 中文：用于构造最终参考软轨迹的位置，默认 `step=50, layer=27`。
+
+- `self_attn_kernel_steps`:
+- Values: CSV steps or empty string `""`.
+- 中文：在哪些扩散步对 self-attention 输出做时间核混合。留空表示所有 steps。
+
+- `self_attn_kernel_layers`:
+- Values: CSV layer ids or empty string `""`.
+- 中文：在哪些 DiT 层做时间核混合。留空表示所有层。
+
+- `self_attn_kernel_branch`:
+- Values: `cond` / `uncond` / `both`.
+- 中文：指定干预 CFG 的哪个分支。Wan T2V 中每个 step 先跑 cond，再跑 uncond。
+
+- `self_attn_kernel_radius` / `self_attn_kernel_sigma` / `self_attn_kernel_mix_alpha`:
+- 中文：时间核半径、核宽度、残差混合强度。`mix_alpha=0` 是 no-op，`mix_alpha=1` 完全使用平滑后的 self-attention 输出。
+
+- `seed_to_trajectory_early_steps`:
+- Values: CSV steps.
+- 中文：用于预测最终轨迹的早期扩散步。推荐先关注前几步，例如 `1,2,3,4,5,6`。
+
+- `seed_to_trajectory_reference_step` / `seed_to_trajectory_reference_layer` / `seed_to_trajectory_head`:
+- 中文：参考轨迹标签的提取位置。默认 `step=50, layer=27, head=mean`。
+
+- `seed_to_trajectory_num_points`:
+- Values: integer.
+- 中文：每条轨迹重采样为多少个点后进入预测模型；若设为 `<= 0`，则直接使用原始 latent-frame 个数，不做插值。
+
+- `seed_to_trajectory_ridge_alpha`:
+- Values: non-negative float.
+- 中文：leave-one-seed-out ridge regression 的 L2 正则强度。
+
+- `event_token_value_words`:
+- Values: CSV words.
+- 中文：额外标记为 `event` 的动作/事件词。token 匹配复用 `cross_attention_token_viz` 的 `_locate_wan21_t2v_prompt_words`。
+
+- `event_token_value_steps` / `event_token_value_layers`:
+- 中文：采集 event-token value contribution 的扩散步和层。layers 留空表示所有层。
+
+- `event_token_value_branch`:
+- Values: `cond` / `uncond` / `both`.
+- 中文：指定采集 CFG 的哪个分支。
+
+- `event_token_value_chunk_size`:
+- Values: integer.
+- 中文：计算 cross-attention token contribution 时 query 维分块大小。调小可省显存，调大可更快。
+
+- `event_token_value_num_viz_frames`:
+- Values: integer.
+- 中文：head-mean projected-value-norm timeline PDF 中展示多少帧。
 
 ## How To Read DT Plots
 

@@ -54,6 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
             "attention_dt_profile",
             "trajectory_entropy",
             "head_evolution",
+            "head_trajectory_dynamics",
+            "self_attention_temporal_kernel",
+            "seed_to_trajectory_predictability",
+            "event_token_value",
             "motion_aligned_attention",
             "causal_schedule",
             "step_window_cross_attn_off",
@@ -341,6 +345,90 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head_evolution_preprocess_min_component_area", type=int, default=2)
     parser.add_argument("--head_evolution_concentrated_region_top_ratio", type=float, default=0.05)
 
+    # Head trajectory dynamics options
+    parser.add_argument(
+        "--head_trajectory_dynamics_heads",
+        type=str,
+        default="",
+        help="CSV head specs `LxHy` for head_trajectory_dynamics. Empty means all heads.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_steps",
+        type=str,
+        default="",
+        help="CSV diffusion steps for head_trajectory_dynamics. Empty means all available reused-map steps.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_distance_metrics",
+        type=str,
+        default="",
+        help="CSV distance metrics for head_trajectory_dynamics: js,wasserstein. Empty means both.",
+    )
+    parser.add_argument("--head_trajectory_dynamics_reference_step", type=int, default=50)
+    parser.add_argument("--head_trajectory_dynamics_reference_layer", type=int, default=27)
+
+    # Self-attention temporal-kernel intervention options
+    parser.add_argument(
+        "--self_attn_kernel_steps",
+        type=str,
+        default="1,2,3,4,5,6",
+        help="CSV diffusion steps for self_attention_temporal_kernel. Empty means all steps.",
+    )
+    parser.add_argument(
+        "--self_attn_kernel_layers",
+        type=str,
+        default="",
+        help="CSV layer ids for self_attention_temporal_kernel. Empty means all layers.",
+    )
+    parser.add_argument(
+        "--self_attn_kernel_branch",
+        type=str,
+        default="cond",
+        choices=["cond", "uncond", "both"],
+    )
+    parser.add_argument("--self_attn_kernel_radius", type=int, default=2)
+    parser.add_argument("--self_attn_kernel_sigma", type=float, default=1.0)
+    parser.add_argument("--self_attn_kernel_mix_alpha", type=float, default=0.25)
+
+    # Seed-to-trajectory predictability options
+    parser.add_argument(
+        "--seed_to_trajectory_early_steps",
+        type=str,
+        default="1,2,3,4,5,6",
+        help="CSV early diffusion steps used as trajectory-prediction features.",
+    )
+    parser.add_argument("--seed_to_trajectory_reference_step", type=int, default=50)
+    parser.add_argument("--seed_to_trajectory_reference_layer", type=int, default=27)
+    parser.add_argument("--seed_to_trajectory_head", type=str, default="mean")
+    parser.add_argument(
+        "--seed_to_trajectory_num_points",
+        type=int,
+        default=0,
+        help=(
+            "Trajectory resampling point count. "
+            "Set <= 0 to keep the original latent-frame trajectory length."
+        ),
+    )
+    parser.add_argument("--seed_to_trajectory_ridge_alpha", type=float, default=1e-3)
+
+    # Event-token value options
+    parser.add_argument(
+        "--event_token_value_words",
+        type=str,
+        default="",
+        help="CSV event/action words whose cross-attention value contributions are collected.",
+    )
+    parser.add_argument("--event_token_value_steps", type=str, default="1,2,3,4,5,6")
+    parser.add_argument("--event_token_value_layers", type=str, default="")
+    parser.add_argument(
+        "--event_token_value_branch",
+        type=str,
+        default="cond",
+        choices=["cond", "uncond", "both"],
+    )
+    parser.add_argument("--event_token_value_chunk_size", type=int, default=512)
+    parser.add_argument("--event_token_value_num_viz_frames", type=int, default=10)
+
     # Seed stability / joint suite options
     parser.add_argument("--seed_list", type=str, default="0,1,2,3")
     parser.add_argument("--stability_num_points", type=int, default=41)
@@ -370,11 +458,15 @@ def main():
         run_wan21_t2v_attention_dt_profile,
         run_wan21_t2v_causal_schedule,
         run_wan21_t2v_cross_attention_token_viz,
+        run_wan21_t2v_event_token_value,
         run_wan21_t2v_head_evolution,
+        run_wan21_t2v_head_trajectory_dynamics,
         run_wan21_t2v_joint_attention_suite,
         run_wan21_t2v_motion_aligned_attention,
         run_wan21_t2v_rope_axis_ablation,
         run_wan21_t2v_cross_attn_head_ablation,
+        run_wan21_t2v_seed_to_trajectory_predictability,
+        run_wan21_t2v_self_attention_temporal_kernel,
         run_wan21_t2v_step_window_cross_attn_off,
         run_wan21_t2v_step_window_ffn_off,
         run_wan21_t2v_step_window_prompt_replace,
@@ -393,6 +485,15 @@ def main():
     trajectory_entropy_layerwise_steps = _parse_csv_ints(args.trajectory_entropy_layerwise_steps)
     head_evolution_steps = _parse_csv_ints(args.head_evolution_steps)
     head_evolution_layerwise_steps = _parse_csv_ints(args.head_evolution_layerwise_steps)
+    head_trajectory_dynamics_heads = _parse_csv_strs(args.head_trajectory_dynamics_heads)
+    head_trajectory_dynamics_steps = _parse_csv_ints(args.head_trajectory_dynamics_steps)
+    head_trajectory_dynamics_distance_metrics = _parse_csv_strs(args.head_trajectory_dynamics_distance_metrics)
+    self_attn_kernel_steps = _parse_csv_ints(args.self_attn_kernel_steps)
+    self_attn_kernel_layers = _parse_csv_ints(args.self_attn_kernel_layers)
+    seed_to_trajectory_early_steps = _parse_csv_ints(args.seed_to_trajectory_early_steps)
+    event_token_value_words = _parse_csv_strs(args.event_token_value_words)
+    event_token_value_steps = _parse_csv_ints(args.event_token_value_steps)
+    event_token_value_layers = _parse_csv_ints(args.event_token_value_layers)
     ablate_heads = _parse_csv_strs(args.ablate_heads)
     target_object_words = _parse_csv_strs(args.target_object_words)
     target_verb_words = _parse_csv_strs(args.target_verb_words)
@@ -498,6 +599,72 @@ def main():
             head_evolution_preprocess_min_component_area=args.head_evolution_preprocess_min_component_area,
             head_evolution_concentrated_region_top_ratio=args.head_evolution_concentrated_region_top_ratio,
             reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
+        )
+    elif experiment_name == "head_trajectory_dynamics":
+        if not target_object_words:
+            raise ValueError("--target_object_words is required for head_trajectory_dynamics.")
+        if not args.reuse_cross_attention_dir.strip():
+            raise ValueError("--reuse_cross_attention_dir is required for head_trajectory_dynamics.")
+        run_wan21_t2v_head_trajectory_dynamics(
+            **common_kwargs,
+            target_object_words=target_object_words,
+            target_verb_words=target_verb_words,
+            head_trajectory_dynamics_heads=head_trajectory_dynamics_heads,
+            head_trajectory_dynamics_steps=head_trajectory_dynamics_steps,
+            head_trajectory_dynamics_distance_metrics=head_trajectory_dynamics_distance_metrics,
+            head_trajectory_dynamics_reference_step=args.head_trajectory_dynamics_reference_step,
+            head_trajectory_dynamics_reference_layer=args.head_trajectory_dynamics_reference_layer,
+            reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
+        )
+    elif experiment_name == "self_attention_temporal_kernel":
+        run_wan21_t2v_self_attention_temporal_kernel(
+            **common_kwargs,
+            self_attn_kernel_steps=self_attn_kernel_steps,
+            self_attn_kernel_layers=self_attn_kernel_layers,
+            self_attn_kernel_branch=args.self_attn_kernel_branch,
+            self_attn_kernel_radius=args.self_attn_kernel_radius,
+            self_attn_kernel_sigma=args.self_attn_kernel_sigma,
+            self_attn_kernel_mix_alpha=args.self_attn_kernel_mix_alpha,
+        )
+    elif experiment_name == "seed_to_trajectory_predictability":
+        if not target_object_words:
+            raise ValueError("--target_object_words is required for seed_to_trajectory_predictability.")
+        run_wan21_t2v_seed_to_trajectory_predictability(
+            **common_kwargs,
+            target_object_words=target_object_words,
+            target_verb_words=target_verb_words,
+            seed_list=seed_list,
+            seed_to_trajectory_early_steps=seed_to_trajectory_early_steps,
+            seed_to_trajectory_reference_step=args.seed_to_trajectory_reference_step,
+            seed_to_trajectory_reference_layer=args.seed_to_trajectory_reference_layer,
+            seed_to_trajectory_head=args.seed_to_trajectory_head,
+            seed_to_trajectory_num_points=args.seed_to_trajectory_num_points,
+            seed_to_trajectory_ridge_alpha=args.seed_to_trajectory_ridge_alpha,
+            num_viz_frames=args.viz_num_frames,
+            layers_to_collect=viz_layers if viz_layers else None,
+            chunk_size=args.cross_attn_chunk_size,
+            trajectory_style=args.traj_style,
+            trajectory_smooth_radius=args.traj_smooth_radius,
+            trajectory_power=args.traj_power,
+            trajectory_quantile=args.traj_quantile,
+            trajectory_arrow_stride=args.traj_arrow_stride,
+        )
+    elif experiment_name == "event_token_value":
+        if not (target_object_words or target_verb_words or event_token_value_words):
+            raise ValueError(
+                "--target_object_words, --target_verb_words, or --event_token_value_words "
+                "is required for event_token_value."
+            )
+        run_wan21_t2v_event_token_value(
+            **common_kwargs,
+            target_object_words=target_object_words,
+            target_verb_words=target_verb_words,
+            event_token_value_words=event_token_value_words,
+            event_token_value_steps=event_token_value_steps,
+            event_token_value_layers=event_token_value_layers,
+            event_token_value_branch=args.event_token_value_branch,
+            event_token_value_chunk_size=args.event_token_value_chunk_size,
+            event_token_value_num_viz_frames=args.event_token_value_num_viz_frames,
         )
     elif experiment_name == "causal_schedule":
         run_wan21_t2v_causal_schedule(

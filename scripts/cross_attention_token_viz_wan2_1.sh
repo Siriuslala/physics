@@ -50,19 +50,21 @@ SAMPLE_GUIDE_SCALE=5.0
 # SAMPLE_GUIDE_SCALE=5.0
 
 # ==============================
-SEEDS=(4)
+SEEDS=(20)
 # SEEDS=($(seq 1 32))
 
 PROMPTS=(
     # "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor."
-    # "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times."
+    "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times."
     # "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times, with the height of each bounce gradually decreasing until it comes to a stop."
     # "Against a pure white background, there is a wooden horizontal surface, with one single wooden slope attached to its left end. One small green ball starts from rest at the top of the slope, slides straight along the slope the entire time with its speed increasing steadily and uniformly, then rolls rightward along the wooden horizontal surface after reaching it."
-    "Against a pure white background, a wooden cube block at the top of a smooth slope slides straight down the slope with steadily and uniformly increasing speed."
+    # "Against a pure white background, a wooden cube block at the top of a smooth slope slides straight down the slope with steadily and uniformly increasing speed."
 )
 
-TARGET_OBJECT_WORDS="cube"  # "basketball"
-TARGET_VERB_WORDS="slope,slides"  # "falls,bounces,up"
+TARGET_OBJECT_WORDS="basketball"
+TARGET_VERB_WORDS="falls,bounces,up"
+# TARGET_OBJECT_WORDS="cube"  # "basketball"
+# TARGET_VERB_WORDS="slope,slides"  # "falls,bounces,up"
 
 CROSS_ATTN_STEPS=$(seq -s, 1 $SAMPLE_STEPS)  # $(seq -s, 1 $SAMPLE_STEPS)  "1,2,3"
 VIZ_NUM_FRAMES=10
@@ -81,10 +83,11 @@ SAVE_TRAJECTORY_PDFS=True  # save trajectory (in one picture) for each timestep 
 SAVE_TRAJECTORY_TIMELINE_PDFS=True  # save trajectory timeline for each timestep -> layer -> head
 TRAJECTORY_TIMELINE_NUM_FRAMES=10  # number of frames for trajectory timeline (default: fps=2)
 
-DRAW_ATTENTION_MAP_ONLY=False  # whether to only visualize attention & trajectory via the saved attention maps
-# DRAW_ATTENTION_MAPS_PATH=""  # the path to the saved attention maps (.pt) for re-drawing; if empty, use the attention maps in the standard output dir
+DRAW_ATTENTION_MAP_ONLY=True  # whether to only visualize attention & trajectory via the saved attention maps
+DRAW_ATTENTION_MAPS_PATH=""  # the path to the saved attention maps (.pt) for re-drawing; if empty, use the attention maps in the standard output dir
+DRAW_ATTENTION_MAPS_PATH="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_20_shift_5.0_guide_5.0/old/cross_attention_maps.pt"
 
-VISUALIZATION_OUTPUT_DIR="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw"  # "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw1"  # for re-drawing
+# VISUALIZATION_OUTPUT_DIR="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw"  # "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw1"  # for re-drawing
 VISUALIZATION_OUTPUT_DIR=""
 
 STREAM_FLUSH_PER_STEP=False
