@@ -1423,6 +1423,7 @@ def _save_wan21_t2v_timeline_map_pdf(
     trajectory: Optional[Sequence[Tuple[float, float]]] = None,
     draw_points: bool = False,
     draw_arrows: bool = False,
+    share_color_scale: bool = False,
 ):
     """Save one-row timeline map panels with optional trajectory points/arrows."""
     import matplotlib
@@ -1446,6 +1447,15 @@ def _save_wan21_t2v_timeline_map_pdf(
             return
         points = [(float(trajectory[i][0]), float(trajectory[i][1])) for i in valid_indices]
 
+    shared_vmin = None
+    shared_vmax = None
+    if bool(share_color_scale):
+        stacked_frames = torch.stack([map_fhw[frame_idx].detach().float().cpu() for frame_idx in valid_indices], dim=0)
+        shared_vmin = float(stacked_frames.min().item())
+        shared_vmax = float(stacked_frames.max().item())
+        if abs(shared_vmax - shared_vmin) < 1e-12:
+            shared_vmax = shared_vmin + 1e-12
+
     num_panels = len(valid_indices)
     fig = plt.figure(figsize=(2.25 * num_panels, 2.8))
     gs = fig.add_gridspec(1, num_panels, wspace=0.01, hspace=0.0)
@@ -1455,7 +1465,13 @@ def _save_wan21_t2v_timeline_map_pdf(
     for i, frame_idx in enumerate(valid_indices):
         ax = axes[i]
         bg = map_fhw[frame_idx].detach().float().cpu().numpy()
-        ax.imshow(bg, cmap="magma", alpha=0.9)
+        ax.imshow(
+            bg,
+            cmap="magma",
+            alpha=0.9,
+            vmin=shared_vmin,
+            vmax=shared_vmax,
+        )
 
         if draw_points:
             y, x = points[i]
@@ -1508,6 +1524,7 @@ def _save_wan21_t2v_cross_attention_pdf(
     frame_labels: Optional[Sequence[int]],
     save_file: str,
     title: str,
+    share_color_scale: bool = False,
 ):
     """Save a single head's timeline-style cross-attention map as a PDF."""
     _save_wan21_t2v_timeline_map_pdf(
@@ -1519,6 +1536,7 @@ def _save_wan21_t2v_cross_attention_pdf(
         trajectory=None,
         draw_points=False,
         draw_arrows=False,
+        share_color_scale=share_color_scale,
     )
 
 def _extract_wan21_t2v_attention_trajectory(

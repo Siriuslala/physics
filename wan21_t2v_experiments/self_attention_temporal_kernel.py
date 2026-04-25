@@ -38,50 +38,81 @@ from .utils import (
     _ensure_dir,
     _generate_wan21_t2v_video,
     _init_wan21_t2v_runtime,
+    _parse_wan21_t2v_layer_head_specs,
     _resolve_wan21_t2v_offload_model,
     _resolve_wan21_t2v_steps,
     _save_csv,
     _save_json,
     _save_wan21_t2v_video,
+    _unwrap_wan21_t2v_dit_model_for_runtime_patch,
     _wan21_t2v_branch_matches,
 )
 
-class Wan21T2VSelfAttentionTemporalKernelState:
-    """Runtime state for self-attention temporal output mixing.
+from projects.Wan2_1.wan.modules.attention import flash_attention
+from projects.Wan2_1.wan.modules.model import rope_apply
 
-    The experiment keeps Wan's original self-attention computation intact and
-    then mixes a fraction of each self-attention output token with outputs from
-    nearby frames at the same spatial token position. This is a lightweight
-    proxy for injecting a smoother temporal self-attention kernel without
-    materializing a full `[num_heads, L, L]` attention matrix.
+class Wan21T2VSelfAttentionTemporalKernelState:
+    """Runtime state for self-attention interventions.
+
+    Supported modes:
+    - `postoutput_same_position_kernel`:
+      keep Wan self-attention unchanged, then smooth selected head outputs
+      along the latent-frame axis at the same spatial position.
+    - `prelogit_token_temperature`:
+      directly flatten selected heads' token-level attention distributions by
+      scaling their q/k logits with an exact softmax temperature before
+      flash-attention is evaluated.
     """
 
     def __init__(
         self,
         intervention_steps: Sequence[int],
         layers: Optional[Sequence[int]],
+        layer_head_specs: Optional[Sequence[Tuple[int, int]]],
         branch: str,
+        intervention_mode: str,
         kernel_radius: int,
         kernel_sigma: float,
         mix_alpha: float,
+        token_temperature: float,
     ):
         if not intervention_steps:
             raise ValueError("intervention_steps must be non-empty.")
+        intervention_mode = str(intervention_mode).strip().lower()
+        if intervention_mode not in {"postoutput_same_position_kernel", "prelogit_token_temperature"}:
+            raise ValueError(
+                "intervention_mode must be one of "
+                "{'postoutput_same_position_kernel', 'prelogit_token_temperature'}."
+            )
         if kernel_radius < 1:
             raise ValueError("kernel_radius must be >= 1.")
         if kernel_sigma <= 0:
             raise ValueError("kernel_sigma must be > 0.")
         if not (0.0 <= float(mix_alpha) <= 1.0):
             raise ValueError("mix_alpha must be in [0, 1].")
+        if float(token_temperature) <= 0.0:
+            raise ValueError("token_temperature must be > 0.")
 
         self.intervention_steps = set(int(step) for step in intervention_steps)
         self.layers = None if layers is None else set(int(layer) for layer in layers)
+        if layer_head_specs:
+            layer_to_heads = defaultdict(set)
+            for layer_idx, head_idx in layer_head_specs:
+                layer_to_heads[int(layer_idx)].add(int(head_idx))
+            self.layer_to_heads = {
+                int(layer_idx): tuple(sorted(int(head_idx) for head_idx in head_set))
+                for layer_idx, head_set in layer_to_heads.items()
+            }
+        else:
+            self.layer_to_heads = None
         self.branch = str(branch).strip().lower()
         if self.branch not in {"cond", "uncond", "both"}:
             raise ValueError("branch must be one of cond/uncond/both.")
+        self.intervention_mode = intervention_mode
         self.kernel_radius = int(kernel_radius)
         self.kernel_sigma = float(kernel_sigma)
         self.mix_alpha = float(mix_alpha)
+        self.token_temperature = float(token_temperature)
 
         self.current_step = 0
         self.current_timestep_value = None
@@ -89,6 +120,7 @@ class Wan21T2VSelfAttentionTemporalKernelState:
         self.total_self_attention_calls = 0
         self.modified_self_attention_calls = 0
         self.modified_by_step_layer: Dict[Tuple[int, int], int] = defaultdict(int)
+        self.modified_by_step_layer_head: Dict[Tuple[int, int, int], int] = defaultdict(int)
 
     def on_forward_start(self, t_tensor):
         """Update the current 1-based diffusion step and CFG forward index."""
@@ -110,14 +142,58 @@ class Wan21T2VSelfAttentionTemporalKernelState:
             return False
         return True
 
-    def temporal_mix(self, y: torch.Tensor, seq_lens: torch.Tensor, grid_sizes: torch.Tensor) -> torch.Tensor:
-        """Apply same-spatial-position temporal kernel mixing to `[B, L, C]` outputs."""
-        if self.mix_alpha <= 0.0:
-            return y
+    def heads_for_layer(self, layer_idx: int, num_heads: int) -> Tuple[int, ...]:
+        """Return selected head ids for one layer. Empty means no head is modified."""
+        if self.layer_to_heads is None:
+            return tuple(range(int(num_heads)))
+        return tuple(
+            head_idx
+            for head_idx in self.layer_to_heads.get(int(layer_idx), tuple())
+            if 0 <= int(head_idx) < int(num_heads)
+        )
 
-        out = y.clone()
-        device = y.device
-        dtype = y.dtype
+    def apply_token_temperature_to_qk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        selected_heads: Sequence[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply exact token-level softmax temperature to selected heads.
+
+        For selected heads, the attention logits become
+        `<q, k> / (sqrt(d) * T)` by scaling both q and k with `T^(-1/2)`.
+        """
+        if self.intervention_mode != "prelogit_token_temperature":
+            return query, key
+        if not selected_heads:
+            return query, key
+        if abs(float(self.token_temperature) - 1.0) < 1e-8:
+            return query, key
+
+        q = query.clone()
+        k = key.clone()
+        scale = float(self.token_temperature) ** (-0.5)
+        head_index_tensor = torch.tensor(list(selected_heads), device=q.device, dtype=torch.long)
+        q[:, :, head_index_tensor, :] = q[:, :, head_index_tensor, :] * scale
+        k[:, :, head_index_tensor, :] = k[:, :, head_index_tensor, :] * scale
+        return q, k
+
+    def temporal_mix_heads(
+        self,
+        y_heads: torch.Tensor,
+        seq_lens: torch.Tensor,
+        grid_sizes: torch.Tensor,
+        selected_heads: Sequence[int],
+    ) -> torch.Tensor:
+        """Apply same-spatial-position temporal kernel mixing to selected heads in `[B, L, N, D]`."""
+        if self.mix_alpha <= 0.0:
+            return y_heads
+        if not selected_heads:
+            return y_heads
+
+        out = y_heads.clone()
+        device = y_heads.device
+        dtype = y_heads.dtype
         offsets = torch.arange(
             -self.kernel_radius,
             self.kernel_radius + 1,
@@ -126,42 +202,59 @@ class Wan21T2VSelfAttentionTemporalKernelState:
         )
         kernel = torch.exp(-0.5 * (offsets / float(self.kernel_sigma)).pow(2))
         kernel = kernel / kernel.sum().clamp_min(1e-8)
+        selected_head_indices = torch.tensor(list(selected_heads), device=device, dtype=torch.long)
 
-        for batch_index in range(int(y.size(0))):
+        for batch_index in range(int(y_heads.size(0))):
             seq_len = int(seq_lens[batch_index].item())
             if seq_len <= 0:
                 continue
             frame_count, token_grid_height, token_grid_width = [
                 int(v) for v in grid_sizes[batch_index].tolist()
             ]
-            valid_len = min(seq_len, frame_count * token_grid_height * token_grid_width, y.size(1))
+            valid_len = min(seq_len, frame_count * token_grid_height * token_grid_width, y_heads.size(1))
             if valid_len <= 0:
                 continue
             if valid_len != frame_count * token_grid_height * token_grid_width:
                 continue
+            if frame_count <= 1:
+                continue
 
-            y_fhwc = y[batch_index, :valid_len].reshape(
+            y_fhwnd = out[batch_index, :valid_len].reshape(
                 frame_count,
                 token_grid_height,
                 token_grid_width,
-                y.size(-1),
+                y_heads.size(2),
+                y_heads.size(3),
             )
-            # Conv1d runs on `[channels, frames]`, so each spatial/channel
-            # stream is independently smoothed along the frame axis.
-            y_chf = y_fhwc.permute(1, 2, 3, 0).reshape(-1, 1, frame_count)
-            smoothed = F.conv1d(
+            selected_head_values = y_fhwnd[:, :, :, selected_head_indices, :]
+            # Conv1d runs on `[channels, frames]`, so each selected
+            # (head, spatial, channel) stream is independently smoothed
+            # along the latent-frame axis.
+            y_chf = selected_head_values.permute(3, 1, 2, 4, 0).reshape(-1, 1, frame_count)
+            padded = F.pad(
                 y_chf.float(),
+                (int(self.kernel_radius), int(self.kernel_radius)),
+                mode="replicate",
+            )
+            smoothed = F.conv1d(
+                padded,
                 kernel.view(1, 1, -1),
-                padding=int(self.kernel_radius),
+                padding=0,
             ).to(dtype=dtype)
-            smoothed_fhwc = smoothed.reshape(
+            smoothed_fhwnd = smoothed.reshape(
+                len(selected_heads),
                 token_grid_height,
                 token_grid_width,
-                y.size(-1),
+                y_heads.size(3),
                 frame_count,
-            ).permute(3, 0, 1, 2)
-            mixed = (1.0 - self.mix_alpha) * y_fhwc + self.mix_alpha * smoothed_fhwc
-            out[batch_index, :valid_len] = mixed.reshape(valid_len, y.size(-1))
+            ).permute(4, 1, 2, 0, 3)
+            mixed = (1.0 - self.mix_alpha) * selected_head_values + self.mix_alpha * smoothed_fhwnd
+            y_fhwnd[:, :, :, selected_head_indices, :] = mixed
+            out[batch_index, :valid_len] = y_fhwnd.reshape(
+                valid_len,
+                y_heads.size(2),
+                y_heads.size(3),
+            )
 
         return out
 
@@ -183,7 +276,7 @@ def _install_wan21_t2v_self_attention_temporal_kernel_patch(
     state: Wan21T2VSelfAttentionTemporalKernelState,
 ) -> Wan21T2VSelfAttentionTemporalKernelPatchHandle:
     """Install self-attention temporal output mixing without editing Wan source."""
-    target = model.module if (hasattr(model, "module") and hasattr(model.module, "blocks")) else model
+    target = _unwrap_wan21_t2v_dit_model_for_runtime_patch(model)
     if not hasattr(target, "blocks"):
         raise RuntimeError("Invalid DiT model for self-attention temporal-kernel patch.")
 
@@ -205,13 +298,43 @@ def _install_wan21_t2v_self_attention_temporal_kernel_patch(
 
         def build_patched_self(layer_id: int, orig_self_fn):
             def patched_self(self, x, seq_lens, grid_sizes, freqs):
-                y = orig_self_fn(x, seq_lens, grid_sizes, freqs)
                 state.total_self_attention_calls += 1
                 if not state.should_modify(layer_id):
-                    return y
-                mixed = state.temporal_mix(y, seq_lens, grid_sizes)
+                    return orig_self_fn(x, seq_lens, grid_sizes, freqs)
+
+                batch_size, seq_length = x.shape[:2]
+                num_heads, head_dim = self.num_heads, self.head_dim
+                selected_heads = state.heads_for_layer(layer_id, num_heads)
+                if not selected_heads:
+                    return orig_self_fn(x, seq_lens, grid_sizes, freqs)
+
+                query = self.norm_q(self.q(x)).view(batch_size, seq_length, num_heads, head_dim)
+                key = self.norm_k(self.k(x)).view(batch_size, seq_length, num_heads, head_dim)
+                value = self.v(x).view(batch_size, seq_length, num_heads, head_dim)
+                query, key = state.apply_token_temperature_to_qk(
+                    query=query,
+                    key=key,
+                    selected_heads=selected_heads,
+                )
+                attended_heads = flash_attention(
+                    q=rope_apply(query, grid_sizes, freqs),
+                    k=rope_apply(key, grid_sizes, freqs),
+                    v=value,
+                    k_lens=seq_lens,
+                    window_size=self.window_size,
+                )
+                if state.intervention_mode == "postoutput_same_position_kernel":
+                    attended_heads = state.temporal_mix_heads(
+                        y_heads=attended_heads,
+                        seq_lens=seq_lens,
+                        grid_sizes=grid_sizes,
+                        selected_heads=selected_heads,
+                    )
+                mixed = self.o(attended_heads.flatten(2))
                 state.modified_self_attention_calls += 1
                 state.modified_by_step_layer[(int(state.current_step), int(layer_id))] += 1
+                for head_idx in selected_heads:
+                    state.modified_by_step_layer_head[(int(state.current_step), int(layer_id), int(head_idx))] += 1
                 return mixed
 
             return patched_self
@@ -241,10 +364,13 @@ def run_wan21_t2v_self_attention_temporal_kernel(
     offload_model: bool = True,
     self_attn_kernel_steps: Sequence[int] = tuple(),
     self_attn_kernel_layers: Sequence[int] = tuple(),
+    self_attn_kernel_heads: Sequence[str] = tuple(),
     self_attn_kernel_branch: str = "cond",
+    self_attn_temporal_intervention_mode: str = "postoutput_same_position_kernel",
     self_attn_kernel_radius: int = 2,
     self_attn_kernel_sigma: float = 1.0,
     self_attn_kernel_mix_alpha: float = 0.25,
+    self_attn_token_temperature: float = 1.0,
     parallel_cfg: Optional[Wan21T2VParallelConfig] = None,
 ):
     """Generate one video with self-attention temporal output-kernel intervention.
@@ -254,11 +380,17 @@ def run_wan21_t2v_self_attention_temporal_kernel(
             means all sampling steps.
         self_attn_kernel_layers: DiT layer indices to intervene. Empty means
             all layers.
+        self_attn_kernel_heads: optional head specs `LxHy`. Empty means all
+            heads inside the selected layers.
         self_attn_kernel_branch: `cond`, `uncond`, or `both` CFG branch.
+        self_attn_temporal_intervention_mode:
+            `postoutput_same_position_kernel` or `prelogit_token_temperature`.
         self_attn_kernel_radius: temporal radius in latent-token frames.
         self_attn_kernel_sigma: Gaussian-kernel width in latent-token frames.
         self_attn_kernel_mix_alpha: residual mixing coefficient. `0` is no-op;
             `1` fully replaces the self-attention output by the smoothed output.
+        self_attn_token_temperature: exact token-level softmax temperature used
+            by `prelogit_token_temperature`. `1.0` is no-op.
 
     Outputs:
         Generated video, intervention call table, and summary JSON.
@@ -271,6 +403,7 @@ def run_wan21_t2v_self_attention_temporal_kernel(
 
     resolved_steps = _resolve_wan21_t2v_steps(self_attn_kernel_steps, sampling_steps)
     resolved_layers = _dedup_wan21_t2v_int_list(self_attn_kernel_layers)
+    resolved_layer_head_specs = _parse_wan21_t2v_layer_head_specs(self_attn_kernel_heads)
 
     pipeline, cfg = _build_wan21_t2v_pipeline(
         wan21_root=wan21_root,
@@ -283,10 +416,13 @@ def run_wan21_t2v_self_attention_temporal_kernel(
     state = Wan21T2VSelfAttentionTemporalKernelState(
         intervention_steps=resolved_steps,
         layers=resolved_layers if resolved_layers else None,
+        layer_head_specs=resolved_layer_head_specs,
         branch=self_attn_kernel_branch,
+        intervention_mode=self_attn_temporal_intervention_mode,
         kernel_radius=self_attn_kernel_radius,
         kernel_sigma=self_attn_kernel_sigma,
         mix_alpha=self_attn_kernel_mix_alpha,
+        token_temperature=self_attn_token_temperature,
     )
     handle = _install_wan21_t2v_self_attention_temporal_kernel_patch(pipeline.model, state)
 
@@ -325,6 +461,20 @@ def run_wan21_t2v_self_attention_temporal_kernel(
             for (step, layer), count in sorted(state.modified_by_step_layer.items())
         ]
         _save_csv(os.path.join(output_dir, "self_attention_temporal_kernel_calls.csv"), rows)
+        head_rows = [
+            {
+                "step": int(step),
+                "layer": int(layer),
+                "head": int(head),
+                "head_tag": f"L{int(layer)}H{int(head)}",
+                "modified_calls": int(count),
+            }
+            for (step, layer, head), count in sorted(state.modified_by_step_layer_head.items())
+        ]
+        _save_csv(
+            os.path.join(output_dir, "self_attention_temporal_kernel_head_calls.csv"),
+            head_rows,
+        )
         summary = {
             "experiment": "wan21_t2v_self_attention_temporal_kernel",
             "prompt": prompt,
@@ -332,12 +482,28 @@ def run_wan21_t2v_self_attention_temporal_kernel(
             "video_path": video_path,
             "self_attn_kernel_steps": [int(step) for step in resolved_steps],
             "self_attn_kernel_layers": [int(layer) for layer in resolved_layers],
+            "self_attn_kernel_heads_input": [str(spec) for spec in self_attn_kernel_heads],
+            "self_attn_kernel_heads_parsed": [
+                {
+                    "layer": int(layer_idx),
+                    "head": int(head_idx),
+                    "head_tag": f"L{int(layer_idx)}H{int(head_idx)}",
+                }
+                for layer_idx, head_idx in resolved_layer_head_specs
+            ],
             "self_attn_kernel_branch": str(self_attn_kernel_branch),
+            "self_attn_temporal_intervention_mode": str(self_attn_temporal_intervention_mode),
             "self_attn_kernel_radius": int(self_attn_kernel_radius),
             "self_attn_kernel_sigma": float(self_attn_kernel_sigma),
             "self_attn_kernel_mix_alpha": float(self_attn_kernel_mix_alpha),
+            "self_attn_token_temperature": float(self_attn_token_temperature),
             "total_self_attention_calls": int(state.total_self_attention_calls),
             "modified_self_attention_calls": int(state.modified_self_attention_calls),
+            "modified_by_step_layer": rows,
+            "modified_by_step_layer_head_csv": os.path.join(
+                output_dir,
+                "self_attention_temporal_kernel_head_calls.csv",
+            ),
         }
         _save_json(os.path.join(output_dir, "self_attention_temporal_kernel_summary.json"), summary)
         return summary

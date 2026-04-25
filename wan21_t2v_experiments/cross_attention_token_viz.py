@@ -41,6 +41,7 @@ from .utils import (
     _load_wan21_t2v_cross_attention_mean_maps_from_disk,
     _load_wan21_t2v_cross_attention_token_meta,
     _locate_wan21_t2v_prompt_words,
+    _normalize_wan21_t2v_attention_map_per_frame,
     _resolve_wan21_t2v_offload_model,
     _resolve_wan21_t2v_viz_frame_indices,
     _sanitize_wan21_t2v_token_name,
@@ -86,6 +87,8 @@ def run_wan21_t2v_cross_attention_token_viz(
     trajectory_arrow_stride: int = 4,
     trajectory_include_head_mean: bool = True,
     save_attention_pdfs: bool = True,
+    attention_pdf_per_frame_normalize: bool = False,
+    attention_pdf_share_color_scale: bool = False,
     skip_existing_pdfs: bool = True,
     save_trajectory_pdfs: bool = True,
     save_trajectory_timeline_pdfs: bool = True,
@@ -241,11 +244,16 @@ def run_wan21_t2v_cross_attention_token_viz(
                     if plot_attention_now:
                         if (not skip_existing_pdfs) or (not os.path.exists(map_pdf_path)):
                             _save_wan21_t2v_cross_attention_pdf(
-                                map_hfhw=maps[head],
+                                map_hfhw=(
+                                    _normalize_wan21_t2v_attention_map_per_frame(maps[head])
+                                    if attention_pdf_per_frame_normalize
+                                    else maps[head]
+                                ),
                                 frame_indices=attention_frame_indices,
                                 frame_labels=video_frame_labels,
                                 save_file=map_pdf_path,
                                 title=f"step={step} layer={layer} head={head} token={word}",
+                                share_color_scale=attention_pdf_share_color_scale,
                             )
                         if pbar is not None:
                             pbar.update(1)
@@ -353,11 +361,16 @@ def run_wan21_t2v_cross_attention_token_viz(
                     if plot_attention_now:
                         if (not skip_existing_pdfs) or (not os.path.exists(mean_map_pdf_path)):
                             _save_wan21_t2v_cross_attention_pdf(
-                                map_hfhw=mean_map,
+                                map_hfhw=(
+                                    _normalize_wan21_t2v_attention_map_per_frame(mean_map)
+                                    if attention_pdf_per_frame_normalize
+                                    else mean_map
+                                ),
                                 frame_indices=attention_frame_indices,
                                 frame_labels=video_frame_labels,
                                 save_file=mean_map_pdf_path,
                                 title=f"step={step} layer={layer} head=mean token={word}",
+                                share_color_scale=attention_pdf_share_color_scale,
                             )
                         if pbar is not None:
                             pbar.update(1)
@@ -594,6 +607,8 @@ def run_wan21_t2v_cross_attention_token_viz(
             "trajectory_timeline_num_frames": int(trajectory_timeline_num_frames),
             "trajectory_num_points_rows": len(trajectory_rows),
             "save_attention_pdfs": bool(save_attention_pdfs),
+            "attention_pdf_per_frame_normalize": bool(attention_pdf_per_frame_normalize),
+            "attention_pdf_share_color_scale": bool(attention_pdf_share_color_scale),
             "skip_existing_pdfs": bool(skip_existing_pdfs),
             "save_trajectory_pdfs": bool(save_trajectory_pdfs),
             "save_video": bool(save_video),

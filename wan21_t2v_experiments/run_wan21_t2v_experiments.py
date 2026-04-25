@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
             "head_evolution",
             "head_trajectory_dynamics",
             "self_attention_temporal_kernel",
+            "self_attention_distribution",
             "seed_to_trajectory_predictability",
             "event_token_value",
             "motion_aligned_attention",
@@ -227,6 +228,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--traj_include_head_mean", type=_str2bool, default=True)
     parser.add_argument("--save_attention_pdfs", type=_str2bool, default=True)
     parser.add_argument(
+        "--attention_pdf_per_frame_normalize",
+        type=_str2bool,
+        default=False,
+        help="If true, normalize each cross-attention map frame over H*W before drawing attention PDFs.",
+    )
+    parser.add_argument(
+        "--attention_pdf_share_color_scale",
+        type=_str2bool,
+        default=False,
+        help="If true, all displayed frames in one attention PDF share the same vmin/vmax color scale.",
+    )
+    parser.add_argument(
         "--skip_existing_pdfs",
         type=_str2bool,
         default=True,
@@ -362,10 +375,64 @@ def build_parser() -> argparse.ArgumentParser:
         "--head_trajectory_dynamics_distance_metrics",
         type=str,
         default="",
-        help="CSV distance metrics for head_trajectory_dynamics: js,wasserstein. Empty means both.",
+        help=(
+            "CSV distance metrics for head_trajectory_dynamics: "
+            "js,hellinger,wasserstein_map,support_overlap,center_l2 "
+            "(legacy alias: wasserstein->center_l2). Empty means all default metrics."
+        ),
     )
     parser.add_argument("--head_trajectory_dynamics_reference_step", type=int, default=50)
     parser.add_argument("--head_trajectory_dynamics_reference_layer", type=int, default=27)
+    parser.add_argument("--head_trajectory_dynamics_support_quantile", type=float, default=0.9)
+    parser.add_argument("--head_trajectory_dynamics_attractor_window", type=int, default=3)
+    parser.add_argument(
+        "--head_trajectory_dynamics_center_method",
+        type=str,
+        default="region_centroid",
+        choices=["region_centroid", "preprocessed_component_center"],
+        help=(
+            "Center-extraction method for head_trajectory_dynamics. "
+            "`region_centroid` matches the localized region-center logic used by cross_attention_token_viz; "
+            "`preprocessed_component_center` applies preprocessing and extracts "
+            "peak / centroid / geometric_center from the dominant component."
+        ),
+    )
+    parser.add_argument("--head_trajectory_dynamics_center_power", type=float, default=1.5)
+    parser.add_argument("--head_trajectory_dynamics_center_quantile", type=float, default=0.8)
+    parser.add_argument(
+        "--head_trajectory_dynamics_preprocessed_center_mode",
+        type=str,
+        default="geometric_center",
+        choices=["peak", "centroid", "geometric_center"],
+        help="Center type used when center_method=preprocessed_component_center.",
+    )
+    parser.add_argument("--head_trajectory_dynamics_preprocess_winsorize_quantile", type=float, default=0.995)
+    parser.add_argument("--head_trajectory_dynamics_preprocess_despike_quantile", type=float, default=0.98)
+    parser.add_argument("--head_trajectory_dynamics_preprocess_min_component_area", type=int, default=2)
+    parser.add_argument(
+        "--head_trajectory_dynamics_center_viz_step",
+        type=int,
+        default=-1,
+        help="If >= 1, render center-overlay PDFs for one selected step in head_trajectory_dynamics.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_center_viz_layer",
+        type=int,
+        default=-1,
+        help="If >= 0, render center-overlay PDFs for one selected layer in head_trajectory_dynamics.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_center_viz_heads",
+        type=str,
+        default="",
+        help="CSV head specs `LxHy` for center-overlay PDFs. Empty means all heads in the selected step/layer.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_center_viz_num_frames",
+        type=int,
+        default=10,
+        help="Number of frames shown in each head_trajectory_dynamics center-overlay PDF.",
+    )
 
     # Self-attention temporal-kernel intervention options
     parser.add_argument(
@@ -381,14 +448,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="CSV layer ids for self_attention_temporal_kernel. Empty means all layers.",
     )
     parser.add_argument(
+        "--self_attn_kernel_heads",
+        type=str,
+        default="",
+        help="CSV head specs `LxHy` for self_attention_temporal_kernel. Empty means all heads in selected layers.",
+    )
+    parser.add_argument(
         "--self_attn_kernel_branch",
         type=str,
         default="cond",
         choices=["cond", "uncond", "both"],
     )
+    parser.add_argument(
+        "--self_attn_temporal_intervention_mode",
+        type=str,
+        default="postoutput_same_position_kernel",
+        choices=["postoutput_same_position_kernel", "prelogit_token_temperature"],
+        help=(
+            "Self-attention intervention mode. "
+            "`postoutput_same_position_kernel` smooths selected head outputs over latent frames; "
+            "`prelogit_token_temperature` directly flattens selected heads' token-level attention "
+            "distribution with an exact softmax temperature."
+        ),
+    )
     parser.add_argument("--self_attn_kernel_radius", type=int, default=2)
     parser.add_argument("--self_attn_kernel_sigma", type=float, default=1.0)
     parser.add_argument("--self_attn_kernel_mix_alpha", type=float, default=0.25)
+    parser.add_argument("--self_attn_token_temperature", type=float, default=1.0)
+
+    # Self-attention distribution options
+    parser.add_argument(
+        "--self_attention_distribution_steps",
+        type=str,
+        default="1,2,3",
+        help="CSV diffusion steps for self_attention_distribution.",
+    )
+    parser.add_argument(
+        "--self_attention_distribution_layers",
+        type=str,
+        default="",
+        help="CSV layer ids for self_attention_distribution. Empty means all layers.",
+    )
+    parser.add_argument(
+        "--self_attention_distribution_branch",
+        type=str,
+        default="cond",
+        choices=["cond", "uncond", "both"],
+    )
+    parser.add_argument("--self_attention_distribution_reference_step", type=int, default=50)
+    parser.add_argument("--self_attention_distribution_reference_layer", type=int, default=27)
+    parser.add_argument(
+        "--self_attention_distribution_reference_center_mode",
+        type=str,
+        default="geometric_center",
+        choices=["peak", "centroid", "geometric_center"],
+    )
+    parser.add_argument("--self_attention_distribution_reference_center_power", type=float, default=1.5)
+    parser.add_argument("--self_attention_distribution_reference_center_quantile", type=float, default=0.8)
+    parser.add_argument(
+        "--self_attention_distribution_support_radius_mode",
+        type=str,
+        default="adaptive_area",
+        choices=["fixed", "adaptive_area"],
+    )
+    parser.add_argument("--self_attention_distribution_support_radius_fixed", type=float, default=2.0)
+    parser.add_argument("--self_attention_distribution_support_radius_alpha", type=float, default=1.5)
+    parser.add_argument("--self_attention_distribution_support_radius_min", type=float, default=1.0)
+    parser.add_argument("--self_attention_distribution_support_radius_max_ratio", type=float, default=0.25)
+    parser.add_argument("--self_attention_distribution_query_frame_count", type=int, default=8)
+    parser.add_argument("--self_attention_distribution_global_query_tokens_per_frame", type=int, default=64)
+    parser.add_argument("--self_attention_distribution_object_query_token_limit_per_frame", type=int, default=0)
 
     # Seed-to-trajectory predictability options
     parser.add_argument(
@@ -466,6 +595,7 @@ def main():
         run_wan21_t2v_rope_axis_ablation,
         run_wan21_t2v_cross_attn_head_ablation,
         run_wan21_t2v_seed_to_trajectory_predictability,
+        run_wan21_t2v_self_attention_distribution,
         run_wan21_t2v_self_attention_temporal_kernel,
         run_wan21_t2v_step_window_cross_attn_off,
         run_wan21_t2v_step_window_ffn_off,
@@ -490,6 +620,9 @@ def main():
     head_trajectory_dynamics_distance_metrics = _parse_csv_strs(args.head_trajectory_dynamics_distance_metrics)
     self_attn_kernel_steps = _parse_csv_ints(args.self_attn_kernel_steps)
     self_attn_kernel_layers = _parse_csv_ints(args.self_attn_kernel_layers)
+    self_attn_kernel_heads = _parse_csv_strs(args.self_attn_kernel_heads)
+    self_attention_distribution_steps = _parse_csv_ints(args.self_attention_distribution_steps)
+    self_attention_distribution_layers = _parse_csv_ints(args.self_attention_distribution_layers)
     seed_to_trajectory_early_steps = _parse_csv_ints(args.seed_to_trajectory_early_steps)
     event_token_value_words = _parse_csv_strs(args.event_token_value_words)
     event_token_value_steps = _parse_csv_ints(args.event_token_value_steps)
@@ -614,6 +747,19 @@ def main():
             head_trajectory_dynamics_distance_metrics=head_trajectory_dynamics_distance_metrics,
             head_trajectory_dynamics_reference_step=args.head_trajectory_dynamics_reference_step,
             head_trajectory_dynamics_reference_layer=args.head_trajectory_dynamics_reference_layer,
+            head_trajectory_dynamics_support_quantile=args.head_trajectory_dynamics_support_quantile,
+            head_trajectory_dynamics_attractor_window=args.head_trajectory_dynamics_attractor_window,
+            head_trajectory_dynamics_center_method=args.head_trajectory_dynamics_center_method,
+            head_trajectory_dynamics_center_power=args.head_trajectory_dynamics_center_power,
+            head_trajectory_dynamics_center_quantile=args.head_trajectory_dynamics_center_quantile,
+            head_trajectory_dynamics_preprocessed_center_mode=args.head_trajectory_dynamics_preprocessed_center_mode,
+            head_trajectory_dynamics_preprocess_winsorize_quantile=args.head_trajectory_dynamics_preprocess_winsorize_quantile,
+            head_trajectory_dynamics_preprocess_despike_quantile=args.head_trajectory_dynamics_preprocess_despike_quantile,
+            head_trajectory_dynamics_preprocess_min_component_area=args.head_trajectory_dynamics_preprocess_min_component_area,
+            head_trajectory_dynamics_center_viz_step=args.head_trajectory_dynamics_center_viz_step,
+            head_trajectory_dynamics_center_viz_layer=args.head_trajectory_dynamics_center_viz_layer,
+            head_trajectory_dynamics_center_viz_heads=_parse_csv_strs(args.head_trajectory_dynamics_center_viz_heads),
+            head_trajectory_dynamics_center_viz_num_frames=args.head_trajectory_dynamics_center_viz_num_frames,
             reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
         )
     elif experiment_name == "self_attention_temporal_kernel":
@@ -621,10 +767,41 @@ def main():
             **common_kwargs,
             self_attn_kernel_steps=self_attn_kernel_steps,
             self_attn_kernel_layers=self_attn_kernel_layers,
+            self_attn_kernel_heads=self_attn_kernel_heads,
             self_attn_kernel_branch=args.self_attn_kernel_branch,
+            self_attn_temporal_intervention_mode=args.self_attn_temporal_intervention_mode,
             self_attn_kernel_radius=args.self_attn_kernel_radius,
             self_attn_kernel_sigma=args.self_attn_kernel_sigma,
             self_attn_kernel_mix_alpha=args.self_attn_kernel_mix_alpha,
+            self_attn_token_temperature=args.self_attn_token_temperature,
+        )
+    elif experiment_name == "self_attention_distribution":
+        if not target_object_words:
+            raise ValueError("--target_object_words is required for self_attention_distribution.")
+        if not args.reuse_cross_attention_dir.strip():
+            raise ValueError("--reuse_cross_attention_dir is required for self_attention_distribution.")
+        run_wan21_t2v_self_attention_distribution(
+            **common_kwargs,
+            target_object_words=target_object_words,
+            target_verb_words=target_verb_words,
+            reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip(),
+            self_attention_distribution_steps=self_attention_distribution_steps,
+            self_attention_distribution_layers=self_attention_distribution_layers,
+            self_attention_distribution_branch=args.self_attention_distribution_branch,
+            self_attention_distribution_reference_step=args.self_attention_distribution_reference_step,
+            self_attention_distribution_reference_layer=args.self_attention_distribution_reference_layer,
+            self_attention_distribution_reference_center_mode=args.self_attention_distribution_reference_center_mode,
+            self_attention_distribution_reference_center_power=args.self_attention_distribution_reference_center_power,
+            self_attention_distribution_reference_center_quantile=args.self_attention_distribution_reference_center_quantile,
+            self_attention_distribution_support_radius_mode=args.self_attention_distribution_support_radius_mode,
+            self_attention_distribution_support_radius_fixed=args.self_attention_distribution_support_radius_fixed,
+            self_attention_distribution_support_radius_alpha=args.self_attention_distribution_support_radius_alpha,
+            self_attention_distribution_support_radius_min=args.self_attention_distribution_support_radius_min,
+            self_attention_distribution_support_radius_max_ratio=args.self_attention_distribution_support_radius_max_ratio,
+            self_attention_distribution_query_frame_count=args.self_attention_distribution_query_frame_count,
+            self_attention_distribution_global_query_tokens_per_frame=args.self_attention_distribution_global_query_tokens_per_frame,
+            self_attention_distribution_object_query_token_limit_per_frame=args.self_attention_distribution_object_query_token_limit_per_frame,
+            save_video=args.save_video,
         )
     elif experiment_name == "seed_to_trajectory_predictability":
         if not target_object_words:
@@ -742,6 +919,8 @@ def main():
             trajectory_arrow_stride=args.traj_arrow_stride,
             trajectory_include_head_mean=args.traj_include_head_mean,
             save_attention_pdfs=args.save_attention_pdfs,
+            attention_pdf_per_frame_normalize=args.attention_pdf_per_frame_normalize,
+            attention_pdf_share_color_scale=args.attention_pdf_share_color_scale,
             skip_existing_pdfs=args.skip_existing_pdfs,
             save_trajectory_pdfs=args.save_trajectory_pdfs,
             save_trajectory_timeline_pdfs=args.save_trajectory_timeline_pdfs,

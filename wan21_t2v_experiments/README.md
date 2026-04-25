@@ -14,6 +14,7 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - `head_evolution`
 - `head_trajectory_dynamics`
 - `self_attention_temporal_kernel`
+- `self_attention_distribution`
 - `seed_to_trajectory_predictability`
 - `event_token_value`
 - `motion_aligned_attention`
@@ -40,7 +41,10 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - 动机：分析扩散早期 self-attention 的时间偏移分布 \(P(|\Delta t|)\)。
 - Input: probe steps, query sampling mode (`center/multi_anchor/object_guided`), probe branch (`uncond/cond/both`).
 - Output: generated video + `attention_dt_histograms.pt` + summary + dt visualization PDFs.
-- Key readout: near-frame mass vs far-frame mass.
+- Key readout:
+  - near-frame mass vs far-frame mass
+  - whether self-attention is temporally local or already reaches farther latent frames
+  - see detailed note: `docs/attention_dt_profile.md`
 
 ### 3) `motion_aligned_attention`
 - Motivation: measure whether next-frame attention mass lands near motion target positions (MAAS).
@@ -52,6 +56,7 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - Key readout:
   - `maas_local_ratio` (higher means better spatial alignment)
   - layer/time curves and next-frame map overlays.
+  - see detailed note: `docs/motion_aligned_attention.md`
 
 ### 4) `causal_schedule`
 - Motivation: compare bidirectional vs causal masks in early steps.
@@ -68,6 +73,8 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - `viz_num_frames`: uniform frame count for map panels
   - `viz_frame_indices`: optional explicit frame index list; overrides uniform sampling
   - `skip_existing_pdfs`: if `true`, skip already-generated PDFs (attention map + trajectory + timeline)
+  - `attention_pdf_per_frame_normalize`: if `true`, normalize each frame over \(H \times W\) before drawing the attention-map PDFs
+  - `attention_pdf_share_color_scale`: if `true`, all displayed frames in one attention-map PDF share the same color scale; if `false`, matplotlib autoscale is applied panel by panel
   - `stream_flush_per_step`: flush one completed diffusion step to disk and free memory
   - `plot_during_sampling`: if `true`, render PDFs during sampling; if `false`, defer plotting
   - `draw_attention_map_only`: redraw mode from saved map tensors without rerunning sampling
@@ -209,29 +216,44 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - Meaning: larger MSS indicates stronger head-specific residual dynamics relative to layer-level average dynamics across diffusion steps.
 
 ### 14) `head_trajectory_dynamics`
-- Motivation: test whether heads that show object-token trajectories become mutually consistent over early denoising, and whether some heads behave like attractors that pull other heads' soft trajectories closer over subsequent steps.
-- 动机：分析多个 cross-attention heads 的 object-token 轨迹是否在扩散早期形成共识，以及是否存在“吸引子头”使其他 head 的软轨迹逐步靠近。
+- Motivation: test whether heads that show object-token trajectories become mutually consistent over early denoising, and whether some heads behave like attractors that pull other heads' center trajectories closer over subsequent steps.
+- 动机：分析多个 cross-attention heads 的 object-token 轨迹是否在扩散早期形成共识，以及是否存在“吸引子头”使其他 head 的中心轨迹逐步靠近。
 - Type: offline analysis. It reuses saved maps from an existing `cross_attention_token_viz` directory and does not resample video.
 - Input:
   - `reuse_cross_attention_dir` (required): existing `cross_attention_token_viz` output directory
   - `target_object_words`: object words to aggregate into object-token maps
   - `head_trajectory_dynamics_heads`: optional head list such as `L4H1,L7H8`; empty means all heads
   - `head_trajectory_dynamics_steps`: optional diffusion-step list; empty means all steps available in reused maps
-  - `head_trajectory_dynamics_distance_metrics`: `js`, `wasserstein`, or empty for both
-  - `head_trajectory_dynamics_reference_step/layer`: final reference map used for distance-to-final-soft-center
+  - `head_trajectory_dynamics_distance_metrics`: any subset of `js`, `hellinger`, `wasserstein_map`, `support_overlap`, `center_l2`
+  - `head_trajectory_dynamics_reference_step/layer`: reference head-mean map used to build the final reference trajectory
+  - `head_trajectory_dynamics_support_quantile`: support-mask quantile for support-overlap
+  - `head_trajectory_dynamics_attractor_window`: future-step window used by multi-step attractor metrics
+  - `head_trajectory_dynamics_center_method`: `region_centroid` or `preprocessed_component_center`
+  - `head_trajectory_dynamics_center_power`, `head_trajectory_dynamics_center_quantile`: center extraction parameters
+  - `head_trajectory_dynamics_preprocessed_center_mode`: `peak`, `centroid`, or `geometric_center`
+  - `head_trajectory_dynamics_preprocess_winsorize_quantile`, `head_trajectory_dynamics_preprocess_despike_quantile`, `head_trajectory_dynamics_preprocess_min_component_area`: preprocessing parameters used by `preprocessed_component_center`
+  - `head_trajectory_dynamics_center_viz_step/layer/heads`: optional selection for per-head center-overlay PDFs
+  - If `head_trajectory_dynamics_center_viz_step/layer` are left at default `-1/-1` and `head_trajectory_dynamics_heads` is non-empty, the experiment will automatically render center-overlay PDFs for all analyzed heads.
 - Output:
   - `head_trajectory_dynamics_head_maps.csv`: map inventory after filtering
   - `head_trajectory_dynamics_pairwise.csv`: pairwise head trajectory distances within each step/layer
   - `head_trajectory_dynamics_consensus.csv`: consensus score per step/layer
-  - `head_trajectory_dynamics_attractor.csv`: attractor score for each candidate leader head
-  - `head_trajectory_dynamics_final_distance.csv`: distance from each head's soft trajectory to final reference soft trajectory
-  - `head_trajectory_dynamics_soft_centers.csv`: per-frame soft centers for each step/layer/head
-  - `head_trajectory_dynamics_plots/`: consensus heatmaps, consensus curves, attractor curves, and soft-center spaghetti plots.
+  - `head_trajectory_dynamics_attractor.csv`: one-step + multi-step attractor scores for each candidate leader head
+  - `head_trajectory_dynamics_reference_distance.csv`: per-step distance from each head to the reference trajectory / reference map
+  - `head_trajectory_dynamics_convergence.csv`: AUC + lock-in summaries of reference-distance curves
+  - `head_trajectory_dynamics_trajectory_centers.csv`: per-frame centers for each step/layer/head
+  - `head_trajectory_dynamics_soft_centers.csv`: legacy alias of the same per-frame center table
+  - `head_trajectory_dynamics_trajectory_cache_*.json`: cached center trajectories keyed by center algorithm and parameter values
+  - `head_trajectory_dynamics_plots/`: consensus curves/heatmaps, attractor curves by method, reference-distance heatmaps, reference-distance multi-head curves, and convergence heatmaps
+  - `head_trajectory_dynamics_head_center_overlays/`: per-head cross-attention center-overlay PDFs, stored separately by `step_xxx/layer_xx/`.
 - Metrics:
   - `js_distance`: Jensen-Shannon distance between per-frame spatial probability maps.
-  - `wasserstein_distance`: approximate Wasserstein-like distance computed by soft-center displacement, not full 2D optimal transport.
+  - `hellinger_distance`: Hellinger distance between per-frame spatial probability maps.
+  - `wasserstein_map_distance`: efficient map-level Wasserstein proxy from row/column marginals.
+  - `support_overlap_distance`: \(1-\mathrm{IoU}\) of high-response support masks.
+  - `center_l2_distance`: mean per-frame Euclidean distance between extracted center trajectories.
   - `consensus = 1 / (1 + mean_pairwise_distance)`: larger means heads in the same layer/step are more similar.
-  - `attractor_score_mean`: average decrease in follower-head distance to a leader head from one selected step to the next selected step; positive means followers move closer.
+  - `attractor_score_mean`: reported for `one_step`, `window_mean`, and `best_future`; positive means followers move closer to the leader prototype.
 
 ### 15) `self_attention_temporal_kernel`
 - Motivation: intervene on self-attention's temporal coherence path and test whether smoother longer-range temporal mixing improves or disrupts motion planning.
@@ -239,23 +261,54 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - Type: online monkey patch. It does not modify Wan source files.
 - Important implementation detail:
   - The experiment does not materialize full `[heads, L, L]` attention matrices, because that is too expensive for long video sequences.
-  - Instead, Wan self-attention is computed normally, then its output `y` is mixed along the latent-frame axis for the same spatial token position:
-    `y' = (1 - alpha) * y + alpha * temporal_kernel(y)`.
-  - The temporal kernel is normalized, so the intervention is a residual output smoothing operation rather than an unnormalized attention rewrite.
+  - It currently supports two modes:
+    - `postoutput_same_position_kernel`: post-attention proxy intervention on selected head outputs
+    - `prelogit_token_temperature`: exact token-level softmax temperature on selected heads, implemented by scaling `q/k` before flash attention so that logits are divided by `T`
 - Input:
   - `self_attn_kernel_steps`: 1-based diffusion steps; empty means all steps
   - `self_attn_kernel_layers`: DiT layer list; empty means all layers
+  - `self_attn_kernel_heads`: optional head list such as `L27H7,L27H8`; empty means all heads inside selected layers
   - `self_attn_kernel_branch`: `cond`, `uncond`, or `both`
-  - `self_attn_kernel_radius`: frame radius in latent-token time
-  - `self_attn_kernel_sigma`: Gaussian kernel width
-  - `self_attn_kernel_mix_alpha`: mixing coefficient in `[0,1]`
+  - `self_attn_temporal_intervention_mode`: `postoutput_same_position_kernel` or `prelogit_token_temperature`
+  - `self_attn_kernel_radius`, `self_attn_kernel_sigma`, `self_attn_kernel_mix_alpha`: used by `postoutput_same_position_kernel`
+  - `self_attn_token_temperature`: used by `prelogit_token_temperature`
 - Output:
   - generated video
   - `self_attention_temporal_kernel_calls.csv`
   - `self_attention_temporal_kernel_summary.json`.
 - Key readout:
   - qualitative video motion changes vs baseline
-  - whether increasing temporal smoothing stabilizes trajectory, over-smooths motion, or introduces artifacts.
+  - whether flattening self-attention sharpness stabilizes trajectory, over-smooths motion, or introduces artifacts
+  - see detailed note: `docs/self_attention_temporal_kernel.md`
+
+### 15b) `self_attention_distribution`
+- Motivation: probe where self-attention from object-region tokens and global tokens actually goes in time and space.
+- 动机：直接分析 self-attention 的分布本身，研究 object 区域 query token 与全局 query token 分别把注意力分配到了哪里。
+- Type: online probe with reused cross-attention reference support. It reuses `cross_attention_token_viz` output only to build the reference object support mask, then runs one new generation to collect self-attention distributions from q/k.
+- Input:
+  - `reuse_cross_attention_dir`: existing `cross_attention_token_viz` directory used to build the reference object support mask
+  - `target_object_words`: object words used to build the reference support region
+  - `self_attention_distribution_steps`: diffusion steps to probe
+  - `self_attention_distribution_layers`: optional layer list; empty means all layers
+  - `self_attention_distribution_branch`: `cond`, `uncond`, or `both`
+  - `self_attention_distribution_reference_step/layer`: location of the reused reference cross-attention map
+  - `self_attention_distribution_reference_center_mode`: `peak`, `centroid`, or `geometric_center`
+  - `self_attention_distribution_support_radius_mode`: `fixed` or `adaptive_area`
+  - `self_attention_distribution_query_frame_count`: how many token frames are sampled as query frames
+  - `self_attention_distribution_global_query_tokens_per_frame`: how many global query tokens are sampled per selected frame
+  - `self_attention_distribution_object_query_token_limit_per_frame`: optional cap on the number of object-region query tokens per frame; `0` means keep all
+- Output:
+  - `self_attention_distribution_object_rows.csv`
+  - `self_attention_distribution_object_dt_rows.csv`
+  - `self_attention_distribution_global_dt_rows.csv`
+  - `self_attention_distribution_reference_support.csv`
+  - `self_attention_distribution_plots/`: object query-key heatmaps, object dt curves, and global dt curves
+  - `self_attention_distribution_summary.json`
+- Key readout:
+  - whether object-region self-attention actually lands on object regions in other frames
+  - how object vs non-object mass changes with signed `dt`
+  - how global self-attention differs for early / middle / late query frames
+  - see detailed note: `docs/self_attention_distribution.md`
 
 ### 16) `seed_to_trajectory_predictability`
 - Motivation: test whether the selected reference object trajectory is predictable from the initial latent noise and/or early cross-attention trajectories.
@@ -529,6 +582,9 @@ python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
   --head_trajectory_dynamics_distance_metrics "" \
   --head_trajectory_dynamics_reference_step 50 \
   --head_trajectory_dynamics_reference_layer 27 \
+  --head_trajectory_dynamics_center_method region_centroid \
+  --head_trajectory_dynamics_center_power 1.5 \
+  --head_trajectory_dynamics_center_quantile 0.8 \
   --reuse_cross_attention_dir /path/to/previous/cross_attention_token_viz
 ```
 
@@ -542,9 +598,8 @@ python wan21_t2v_experiments/run_wan21_t2v_experiments.py \
   --self_attn_kernel_steps 1,2,3,4,5,6 \
   --self_attn_kernel_layers "" \
   --self_attn_kernel_branch cond \
-  --self_attn_kernel_radius 2 \
-  --self_attn_kernel_sigma 1.0 \
-  --self_attn_kernel_mix_alpha 0.25
+  --self_attn_temporal_intervention_mode prelogit_token_temperature \
+  --self_attn_token_temperature 1.25
 ```
 
 ### Seed-To-Trajectory Predictability
@@ -848,26 +903,83 @@ For `head_evolution`:
 - 中文：指定分析哪些扩散步。留空表示使用复用 map 里的所有可用 steps；若只关心 motion plan，建议先用 `1,2,3,4,5,6`。
 
 - `head_trajectory_dynamics_distance_metrics`:
-- Values: `js`, `wasserstein`, `js,wasserstein`, or empty string `""`.
-- 中文：head 轨迹距离度量。`wasserstein` 当前是 soft-center displacement 近似，不是完整二维最优传输。
+- Values: any subset of `js`, `hellinger`, `wasserstein_map`, `support_overlap`, `center_l2`, or empty string `""`.
+- 中文：head 轨迹距离度量。`wasserstein_map` 是基于行/列边缘分布的一维 Wasserstein 代理，不是完整二维最优传输；`center_l2` 是中心轨迹的欧氏距离。
 
 - `head_trajectory_dynamics_reference_step` / `head_trajectory_dynamics_reference_layer`:
-- 中文：用于构造最终参考软轨迹的位置，默认 `step=50, layer=27`。
+- 中文：用于构造最终参考轨迹的位置，默认 `step=50, layer=27`。
+
+- `head_trajectory_dynamics_support_quantile`:
+- 中文：support-overlap 指标中，高响应支撑区域的分位数阈值。
+
+- `head_trajectory_dynamics_attractor_window`:
+- 中文：多步 attractor 指标向未来看的窗口长度。
+
+- `head_trajectory_dynamics_center_method`:
+- Values: `region_centroid`, `preprocessed_component_center`.
+- 中文：中心点提取方法。`region_centroid` 复用 `cross_attention_token_viz` 的局部区域质心逻辑；`preprocessed_component_center` 则先做 winsorize + despike 预处理，再从主连通域中取 `peak/centroid/geometric_center`。
+
+- `head_trajectory_dynamics_center_power` / `head_trajectory_dynamics_center_quantile`:
+- 中文：中心点提取时使用的幂次增强与分位数阈值参数。
+
+- `head_trajectory_dynamics_preprocessed_center_mode`:
+- Values: `peak`, `centroid`, `geometric_center`.
+- 中文：当 `head_trajectory_dynamics_center_method=preprocessed_component_center` 时，指定使用峰值点、质心还是几何中心。
+
+- `head_trajectory_dynamics_preprocess_winsorize_quantile` / `head_trajectory_dynamics_preprocess_despike_quantile` / `head_trajectory_dynamics_preprocess_min_component_area`:
+- 中文：预处理参数，分别控制截尾分位点、去尖刺分位点，以及保留连通域的最小面积。
 
 - `self_attn_kernel_steps`:
 - Values: CSV steps or empty string `""`.
-- 中文：在哪些扩散步对 self-attention 输出做时间核混合。留空表示所有 steps。
+- 中文：在哪些扩散步对 self-attention 做干预。留空表示所有 steps。
 
 - `self_attn_kernel_layers`:
 - Values: CSV layer ids or empty string `""`.
-- 中文：在哪些 DiT 层做时间核混合。留空表示所有层。
+- 中文：在哪些 DiT 层做干预。留空表示所有层。
 
 - `self_attn_kernel_branch`:
 - Values: `cond` / `uncond` / `both`.
 - 中文：指定干预 CFG 的哪个分支。Wan T2V 中每个 step 先跑 cond，再跑 uncond。
 
+- `self_attn_temporal_intervention_mode`:
+- Values: `postoutput_same_position_kernel`, `prelogit_token_temperature`.
+- 中文：self-attention 干预模式。前者是后验输出平滑代理实验；后者是直接对 selected heads 的 token-level attention logits 加温度系数。
+
 - `self_attn_kernel_radius` / `self_attn_kernel_sigma` / `self_attn_kernel_mix_alpha`:
-- 中文：时间核半径、核宽度、残差混合强度。`mix_alpha=0` 是 no-op，`mix_alpha=1` 完全使用平滑后的 self-attention 输出。
+- 中文：仅用于 `postoutput_same_position_kernel` 的时间核半径、核宽度、残差混合强度。
+
+- `self_attn_token_temperature`:
+- 中文：仅用于 `prelogit_token_temperature`。`1.0` 表示不变，`>1` 会使 token-level self-attention 分布更平缓。
+
+- `self_attention_distribution_steps` / `self_attention_distribution_layers`:
+- 中文：`self_attention_distribution` 里采集 self-attention 分布的 step 和 layer。layers 留空表示所有层。
+
+- `self_attention_distribution_branch`:
+- Values: `cond` / `uncond` / `both`.
+- 中文：指定采集 CFG 的哪个分支。
+
+- `self_attention_distribution_reference_step` / `self_attention_distribution_reference_layer`:
+- 中文：从复用的 `cross_attention_token_viz` 输出里取哪个 reference map 来构建 object support。
+
+- `self_attention_distribution_reference_center_mode`:
+- Values: `peak`, `centroid`, `geometric_center`.
+- 中文：reference support 的中心点构造方式。
+
+- `self_attention_distribution_support_radius_mode`:
+- Values: `fixed`, `adaptive_area`.
+- 中文：reference support 半径模式。`adaptive_area` 会按参考高亮区域面积自适应半径。
+
+- `self_attention_distribution_query_frame_count`:
+- Values: integer.
+- 中文：均匀抽取多少个 token frames 作为 query frames。
+
+- `self_attention_distribution_global_query_tokens_per_frame`:
+- Values: integer.
+- 中文：global 分析里，每个 query frame 采样多少个全局 query tokens。
+
+- `self_attention_distribution_object_query_token_limit_per_frame`:
+- Values: integer.
+- 中文：object-region 分析里，每帧最多保留多少个 object query tokens。`0` 表示不设上限，保留该帧 support 内所有 tokens。
 
 - `seed_to_trajectory_early_steps`:
 - Values: CSV steps.

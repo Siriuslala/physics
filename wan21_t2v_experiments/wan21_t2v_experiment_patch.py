@@ -13,7 +13,7 @@ All patches are applied at runtime and can be fully restored.
 import math
 from dataclasses import dataclass, field
 from types import MethodType
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -59,11 +59,19 @@ class Wan21T2VAttentionProbeConfig:
     probe_branch: str = "uncond"  # uncond, cond, both
     use_abs_dt: bool = True
     object_token_trajectory: Optional[Dict[int, Tuple[float, float]]] = None
+    collect_dt_histograms: bool = True
 
     collect_maas_maps: bool = False
     maas_steps: Tuple[int, ...] = (1, 2, 3)
     maas_layers: Tuple[int, ...] = tuple()
     maas_radius: int = 1
+
+    collect_distribution: bool = False
+    distribution_layers: Tuple[int, ...] = tuple()
+    distribution_query_frame_count: int = 8
+    distribution_global_query_tokens_per_frame: int = 64
+    distribution_object_query_token_limit_per_frame: int = 0
+    distribution_object_support_mask: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -118,6 +126,14 @@ class Wan21T2VProbeState:
         self.maas_maps_sum: Dict[Tuple[int, int, int], torch.Tensor] = {}
         self.maas_maps_count: Dict[Tuple[int, int, int], int] = {}
         self.maas_grid_size: Optional[Tuple[int, int, int]] = None
+
+        self.distribution_object_sum: Dict[Tuple[int, int, int], torch.Tensor] = {}
+        self.distribution_object_count: Dict[Tuple[int, int, int], int] = {}
+        self.distribution_object_dt_sum: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.distribution_object_dt_count: Dict[Tuple[int, int], int] = {}
+        self.distribution_global_dt_sum: Dict[Tuple[int, int, str], torch.Tensor] = {}
+        self.distribution_global_dt_count: Dict[Tuple[int, int, str], int] = {}
+        self.distribution_grid_size: Optional[Tuple[int, int, int]] = None
 
     def on_forward_start(self, t_tensor):
         """Track diffusion step based on timestep tensor and CFG forward index."""
@@ -221,6 +237,105 @@ class Wan21T2VProbeState:
             self.cached_query_indices[(mode, f, h, w, frame_count, device)] = (query_indices_t, query_frames_t)
         return query_indices_t, query_frames_t
 
+    def _get_distribution_query_frames(self, f: int, device: torch.device) -> torch.Tensor:
+        """Return evenly spaced token-frame ids used by self-attention distribution probes."""
+        frame_count = min(max(1, self.config.probe.distribution_query_frame_count), f)
+        return torch.linspace(0, f - 1, steps=frame_count, device=device).round().long().unique(sorted=True)
+
+    def _sample_evenly_from_indices(self, indices: torch.Tensor, limit: int) -> torch.Tensor:
+        """Subsample 1D indices deterministically with near-uniform spacing."""
+        if int(limit) <= 0 or int(indices.numel()) <= int(limit):
+            return indices
+        sample_positions = torch.linspace(
+            0,
+            int(indices.numel()) - 1,
+            steps=int(limit),
+            device=indices.device,
+        ).round().long()
+        return indices[sample_positions]
+
+    def _distribution_query_bucket(self, frame_id: int, frame_count: int) -> str:
+        """Bucket query frames into coarse temporal regions to expose edge effects."""
+        if frame_count <= 1:
+            return "middle"
+        normalized_position = float(frame_id) / float(max(1, frame_count - 1))
+        if normalized_position < (1.0 / 3.0):
+            return "early"
+        if normalized_position > (2.0 / 3.0):
+            return "late"
+        return "middle"
+
+    def _get_distribution_object_query_indices(
+        self,
+        f: int,
+        h: int,
+        w: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return query-token indices inside the reference object support mask."""
+        support_mask = self.config.probe.distribution_object_support_mask
+        if support_mask is None:
+            return (
+                torch.empty(0, device=device, dtype=torch.long),
+                torch.empty(0, device=device, dtype=torch.long),
+            )
+        if support_mask.dim() != 3:
+            raise ValueError(
+                "distribution_object_support_mask must have shape [F, H, W], "
+                f"got {tuple(support_mask.shape)}."
+            )
+        if tuple(int(v) for v in support_mask.shape) != (int(f), int(h), int(w)):
+            raise ValueError(
+                "distribution_object_support_mask shape does not match current token grid: "
+                f"mask={tuple(int(v) for v in support_mask.shape)} vs grid={(int(f), int(h), int(w))}."
+            )
+
+        query_indices: List[torch.Tensor] = []
+        query_frames: List[torch.Tensor] = []
+        query_frame_ids = self._get_distribution_query_frames(f, device)
+        token_limit = int(self.config.probe.distribution_object_query_token_limit_per_frame)
+        for frame_id in query_frame_ids.tolist():
+            frame_mask = support_mask[int(frame_id)].reshape(-1).to(device=device) > 0.5
+            frame_indices = torch.nonzero(frame_mask, as_tuple=False).flatten()
+            if frame_indices.numel() == 0:
+                continue
+            frame_indices = self._sample_evenly_from_indices(frame_indices, token_limit)
+            query_indices.append(frame_indices + int(frame_id) * (h * w))
+            query_frames.append(torch.full_like(frame_indices, int(frame_id)))
+
+        if not query_indices:
+            return (
+                torch.empty(0, device=device, dtype=torch.long),
+                torch.empty(0, device=device, dtype=torch.long),
+            )
+        return torch.cat(query_indices, dim=0), torch.cat(query_frames, dim=0)
+
+    def _get_distribution_global_query_indices(
+        self,
+        f: int,
+        h: int,
+        w: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return uniformly sampled query-token indices over all spatial positions."""
+        query_indices: List[torch.Tensor] = []
+        query_frames: List[torch.Tensor] = []
+        tokens_per_frame = int(h * w)
+        sample_count = max(1, int(self.config.probe.distribution_global_query_tokens_per_frame))
+        query_frame_ids = self._get_distribution_query_frames(f, device)
+        for frame_id in query_frame_ids.tolist():
+            frame_positions = torch.arange(tokens_per_frame, device=device, dtype=torch.long)
+            frame_positions = self._sample_evenly_from_indices(frame_positions, sample_count)
+            query_indices.append(frame_positions + int(frame_id) * tokens_per_frame)
+            query_frames.append(torch.full_like(frame_positions, int(frame_id)))
+
+        if not query_indices:
+            return (
+                torch.empty(0, device=device, dtype=torch.long),
+                torch.empty(0, device=device, dtype=torch.long),
+            )
+        return torch.cat(query_indices, dim=0), torch.cat(query_frames, dim=0)
+
     def _ensure_dt_storage(self, bins: int):
         if self.dt_bins is None:
             self.dt_bins = bins
@@ -237,6 +352,20 @@ class Wan21T2VProbeState:
         if not self.should_collect_layer(layer_idx):
             return
 
+        need_dt_histograms = bool(self.config.probe.collect_dt_histograms)
+        need_distribution = bool(self.config.probe.collect_distribution) and (
+            (not self.config.probe.distribution_layers)
+            or (int(layer_idx) in self.config.probe.distribution_layers)
+        )
+        need_maas = bool(self.config.probe.collect_maas_maps) and (
+            self.current_step in self.config.probe.maas_steps
+        ) and (
+            (not self.config.probe.maas_layers) or (int(layer_idx) in self.config.probe.maas_layers)
+        )
+
+        if not (need_dt_histograms or need_distribution or need_maas):
+            return
+
         bsz = q.size(0)
         for b in range(bsz):
             seq_len = int(seq_lens[b].item())
@@ -246,53 +375,146 @@ class Wan21T2VProbeState:
             f, h, w = [int(v) for v in grid_sizes[b].tolist()]
             q_i = q[b, :seq_len]
             k_i = k[b, :seq_len]
-
-            query_indices, query_frames = self._get_query_indices(f, h, w, q.device)
-            keep = query_indices < seq_len
-            if not bool(keep.any().item()):
-                continue
-            query_indices = query_indices[keep]
-            query_frames = query_frames[keep]
-            q_sel = q_i[query_indices]
-
             scale = 1.0 / math.sqrt(q_i.size(-1))
-            logits = torch.einsum("qhd,khd->hqk", q_sel.float(), k_i.float()) * scale
-            probs = torch.softmax(logits, dim=-1)
 
-            key_frames = torch.arange(f, device=q.device).repeat_interleave(h * w)
-            bins = f if self.config.probe.use_abs_dt else (2 * f - 1)
-            self._ensure_dt_storage(bins)
+            if need_dt_histograms or need_maas:
+                query_indices, query_frames = self._get_query_indices(f, h, w, q.device)
+                keep = query_indices < seq_len
+                if bool(keep.any().item()):
+                    query_indices = query_indices[keep]
+                    query_frames = query_frames[keep]
+                    q_sel = q_i[query_indices]
+                    logits = torch.einsum("qhd,khd->hqk", q_sel.float(), k_i.float()) * scale
+                    probs = torch.softmax(logits, dim=-1)
 
-            for q_idx, qf in enumerate(query_frames.tolist()):
-                if self.config.probe.use_abs_dt:
-                    dt_index = (key_frames - qf).abs()
-                else:
-                    dt_index = (key_frames - qf) + (f - 1)
+                    key_frames = torch.arange(f, device=q.device).repeat_interleave(h * w)
+                    bins = f if self.config.probe.use_abs_dt else (2 * f - 1)
+                    if need_dt_histograms:
+                        self._ensure_dt_storage(bins)
 
-                hist = torch.zeros((self.num_heads, bins), device=q.device, dtype=torch.float32)
-                for h_idx in range(self.num_heads):
-                    hist[h_idx].scatter_add_(0, dt_index, probs[h_idx, q_idx])
+                    for q_idx, qf in enumerate(query_frames.tolist()):
+                        if self.config.probe.use_abs_dt:
+                            dt_index = (key_frames - qf).abs()
+                        else:
+                            dt_index = (key_frames - qf) + (f - 1)
 
-                self.dt_hist_sum[self.current_step][layer_idx] += hist.detach().cpu().double()
-                self.dt_hist_count[self.current_step][layer_idx] += 1.0
+                        if need_dt_histograms:
+                            hist = torch.zeros((self.num_heads, bins), device=q.device, dtype=torch.float32)
+                            for h_idx in range(self.num_heads):
+                                hist[h_idx].scatter_add_(0, dt_index, probs[h_idx, q_idx])
 
-                if (
-                    self.config.probe.collect_maas_maps
-                    and self.current_step in self.config.probe.maas_steps
-                    and (not self.config.probe.maas_layers or layer_idx in self.config.probe.maas_layers)
-                    and qf + 1 < f
-                ):
-                    probs_map = probs[:, q_idx, :seq_len].reshape(self.num_heads, f, h, w)
-                    next_frame_map = probs_map[:, qf + 1].detach().cpu().float()
-                    map_key = (self.current_step, layer_idx, qf)
+                            self.dt_hist_sum[self.current_step][layer_idx] += hist.detach().cpu().double()
+                            self.dt_hist_count[self.current_step][layer_idx] += 1.0
 
-                    if map_key not in self.maas_maps_sum:
-                        self.maas_maps_sum[map_key] = torch.zeros_like(next_frame_map)
-                        self.maas_maps_count[map_key] = 0
+                        if need_maas and qf + 1 < f:
+                            probs_map = probs[:, q_idx, :seq_len].reshape(self.num_heads, f, h, w)
+                            next_frame_map = probs_map[:, qf + 1].detach().cpu().float()
+                            map_key = (self.current_step, layer_idx, qf)
 
-                    self.maas_maps_sum[map_key] += next_frame_map
-                    self.maas_maps_count[map_key] += 1
-                    self.maas_grid_size = (f, h, w)
+                            if map_key not in self.maas_maps_sum:
+                                self.maas_maps_sum[map_key] = torch.zeros_like(next_frame_map)
+                                self.maas_maps_count[map_key] = 0
+
+                            self.maas_maps_sum[map_key] += next_frame_map
+                            self.maas_maps_count[map_key] += 1
+                            self.maas_grid_size = (f, h, w)
+
+            if need_distribution:
+                object_support_mask = self.config.probe.distribution_object_support_mask
+                if object_support_mask is None:
+                    raise ValueError("collect_distribution=True requires distribution_object_support_mask.")
+                object_support_mask_device = object_support_mask.to(device=q.device, dtype=torch.float32)
+                object_query_indices, object_query_frames = self._get_distribution_object_query_indices(
+                    f=f,
+                    h=h,
+                    w=w,
+                    device=q.device,
+                )
+                object_keep = object_query_indices < seq_len
+                object_query_indices = object_query_indices[object_keep]
+                object_query_frames = object_query_frames[object_keep]
+
+                if int(object_query_indices.numel()) > 0:
+                    object_queries = q_i[object_query_indices]
+                    object_logits = torch.einsum("qhd,khd->hqk", object_queries.float(), k_i.float()) * scale
+                    object_probs = torch.softmax(object_logits, dim=-1)
+                    signed_dt_bins = 2 * f - 1
+                    signed_key_frame_indices = torch.arange(f, device=q.device, dtype=torch.long) + (f - 1)
+                    for query_position, query_frame in enumerate(object_query_frames.tolist()):
+                        probability_map = object_probs[:, query_position, :seq_len].reshape(self.num_heads, f, h, w)
+                        frame_mass = probability_map.sum(dim=(-1, -2))
+                        object_mass = (probability_map * object_support_mask_device.unsqueeze(0)).sum(dim=(-1, -2))
+                        nonobject_mass = frame_mass - object_mass
+
+                        object_key = (self.current_step, int(layer_idx), int(query_frame))
+                        if object_key not in self.distribution_object_sum:
+                            self.distribution_object_sum[object_key] = torch.zeros(
+                                (self.num_heads, f, 3),
+                                dtype=torch.float64,
+                            )
+                            self.distribution_object_count[object_key] = 0
+                        stacked_mass = torch.stack([frame_mass, object_mass, nonobject_mass], dim=-1)
+                        self.distribution_object_sum[object_key] += stacked_mass.detach().cpu().double()
+                        self.distribution_object_count[object_key] += 1
+
+                        object_dt_key = (self.current_step, int(layer_idx))
+                        if object_dt_key not in self.distribution_object_dt_sum:
+                            self.distribution_object_dt_sum[object_dt_key] = torch.zeros(
+                                (self.num_heads, signed_dt_bins, 3),
+                                dtype=torch.float64,
+                            )
+                            self.distribution_object_dt_count[object_dt_key] = 0
+                        signed_dt_index = signed_key_frame_indices - int(query_frame)
+                        signed_dt_index_cpu = signed_dt_index.detach().cpu()
+                        object_dt_sum = self.distribution_object_dt_sum[object_dt_key]
+                        frame_mass_cpu = frame_mass.detach().cpu().double()
+                        object_mass_cpu = object_mass.detach().cpu().double()
+                        nonobject_mass_cpu = nonobject_mass.detach().cpu().double()
+                        for head_index in range(self.num_heads):
+                            object_dt_sum[head_index, signed_dt_index_cpu, 0] += frame_mass_cpu[head_index]
+                            object_dt_sum[head_index, signed_dt_index_cpu, 1] += object_mass_cpu[head_index]
+                            object_dt_sum[head_index, signed_dt_index_cpu, 2] += nonobject_mass_cpu[head_index]
+                        self.distribution_object_dt_count[object_dt_key] += 1
+
+                global_query_indices, global_query_frames = self._get_distribution_global_query_indices(
+                    f=f,
+                    h=h,
+                    w=w,
+                    device=q.device,
+                )
+                global_keep = global_query_indices < seq_len
+                global_query_indices = global_query_indices[global_keep]
+                global_query_frames = global_query_frames[global_keep]
+                if int(global_query_indices.numel()) > 0:
+                    global_queries = q_i[global_query_indices]
+                    global_logits = torch.einsum("qhd,khd->hqk", global_queries.float(), k_i.float()) * scale
+                    global_probs = torch.softmax(global_logits, dim=-1)
+                    signed_dt_bins = 2 * f - 1
+                    signed_key_frame_indices = torch.arange(f, device=q.device, dtype=torch.long) + (f - 1)
+                    for query_position, query_frame in enumerate(global_query_frames.tolist()):
+                        probability_map = global_probs[:, query_position, :seq_len].reshape(self.num_heads, f, h, w)
+                        frame_mass = probability_map.sum(dim=(-1, -2))
+                        bucket_names = [
+                            "all",
+                            self._distribution_query_bucket(int(query_frame), int(f)),
+                        ]
+                        signed_dt_index = signed_key_frame_indices - int(query_frame)
+                        signed_dt_index_cpu = signed_dt_index.detach().cpu()
+                        frame_mass_cpu = frame_mass.detach().cpu().double()
+                        for bucket_name in bucket_names:
+                            global_dt_key = (self.current_step, int(layer_idx), str(bucket_name))
+                            if global_dt_key not in self.distribution_global_dt_sum:
+                                self.distribution_global_dt_sum[global_dt_key] = torch.zeros(
+                                    (self.num_heads, signed_dt_bins),
+                                    dtype=torch.float64,
+                                )
+                                self.distribution_global_dt_count[global_dt_key] = 0
+                            global_dt_sum = self.distribution_global_dt_sum[global_dt_key]
+                            for head_index in range(self.num_heads):
+                                global_dt_sum[head_index, signed_dt_index_cpu] += frame_mass_cpu[head_index]
+                            self.distribution_global_dt_count[global_dt_key] += 1
+
+                self.distribution_grid_size = (f, h, w)
 
     def export_dt_histograms(self) -> Dict[str, torch.Tensor]:
         """Export normalized dt histograms as tensors."""
@@ -302,6 +524,84 @@ class Wan21T2VProbeState:
             out[f"dt_hist_step_{step}"] = (self.dt_hist_sum[step] / denom).float()
             out[f"dt_count_step_{step}"] = self.dt_hist_count[step].float()
         return out
+
+    def export_distribution_rows(self) -> Dict[str, List[Dict[str, float]]]:
+        """Export self-attention distribution statistics as flat row dictionaries."""
+        object_rows: List[Dict[str, float]] = []
+        for (step, layer, query_frame), mass_sum in sorted(self.distribution_object_sum.items()):
+            count = max(1, int(self.distribution_object_count[(step, layer, query_frame)]))
+            mean_mass = (mass_sum / float(count)).float()
+            frame_count = int(mean_mass.size(1))
+            for head_index in range(int(mean_mass.size(0))):
+                for key_frame in range(frame_count):
+                    frame_mass = float(mean_mass[head_index, key_frame, 0].item())
+                    object_mass = float(mean_mass[head_index, key_frame, 1].item())
+                    nonobject_mass = float(mean_mass[head_index, key_frame, 2].item())
+                    object_rows.append(
+                        {
+                            "step": int(step),
+                            "layer": int(layer),
+                            "head": int(head_index),
+                            "query_frame": int(query_frame),
+                            "key_frame": int(key_frame),
+                            "frame_mass": frame_mass,
+                            "object_mass": object_mass,
+                            "nonobject_mass": nonobject_mass,
+                            "object_fraction": float(object_mass / max(1e-8, frame_mass)),
+                            "num_query_tokens": int(count),
+                        }
+                    )
+
+        object_dt_rows: List[Dict[str, float]] = []
+        for (step, layer), mass_sum in sorted(self.distribution_object_dt_sum.items()):
+            count = max(1, int(self.distribution_object_dt_count[(step, layer)]))
+            mean_mass = (mass_sum / float(count)).float()
+            frame_count = int((mean_mass.size(1) + 1) // 2)
+            for head_index in range(int(mean_mass.size(0))):
+                for dt_index in range(int(mean_mass.size(1))):
+                    dt_value = int(dt_index - (frame_count - 1))
+                    frame_mass = float(mean_mass[head_index, dt_index, 0].item())
+                    object_mass = float(mean_mass[head_index, dt_index, 1].item())
+                    nonobject_mass = float(mean_mass[head_index, dt_index, 2].item())
+                    object_dt_rows.append(
+                        {
+                            "step": int(step),
+                            "layer": int(layer),
+                            "head": int(head_index),
+                            "dt": int(dt_value),
+                            "frame_mass": frame_mass,
+                            "object_mass": object_mass,
+                            "nonobject_mass": nonobject_mass,
+                            "object_fraction": float(object_mass / max(1e-8, frame_mass)),
+                            "num_query_tokens": int(count),
+                        }
+                    )
+
+        global_dt_rows: List[Dict[str, float]] = []
+        for (step, layer, bucket_name), mass_sum in sorted(self.distribution_global_dt_sum.items()):
+            count = max(1, int(self.distribution_global_dt_count[(step, layer, bucket_name)]))
+            mean_mass = (mass_sum / float(count)).float()
+            frame_count = int((mean_mass.size(1) + 1) // 2)
+            for head_index in range(int(mean_mass.size(0))):
+                for dt_index in range(int(mean_mass.size(1))):
+                    dt_value = int(dt_index - (frame_count - 1))
+                    global_dt_rows.append(
+                        {
+                            "step": int(step),
+                            "layer": int(layer),
+                            "head": int(head_index),
+                            "query_bucket": str(bucket_name),
+                            "dt": int(dt_value),
+                            "attention_mass": float(mean_mass[head_index, dt_index].item()),
+                            "num_query_tokens": int(count),
+                        }
+                    )
+
+        return {
+            "object_rows": object_rows,
+            "object_dt_rows": object_dt_rows,
+            "global_dt_rows": global_dt_rows,
+        }
 
     def compute_maas(self, token_trajectory: Dict[int, Tuple[int, int]], radius: Optional[int] = None):
         """Compute MAAS rows and summary given token-space trajectory targets."""

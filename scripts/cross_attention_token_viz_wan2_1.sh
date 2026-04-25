@@ -50,7 +50,7 @@ SAMPLE_GUIDE_SCALE=5.0
 # SAMPLE_GUIDE_SCALE=5.0
 
 # ==============================
-SEEDS=(20)
+SEEDS=(26)
 # SEEDS=($(seq 1 32))
 
 PROMPTS=(
@@ -83,9 +83,12 @@ SAVE_TRAJECTORY_PDFS=True  # save trajectory (in one picture) for each timestep 
 SAVE_TRAJECTORY_TIMELINE_PDFS=True  # save trajectory timeline for each timestep -> layer -> head
 TRAJECTORY_TIMELINE_NUM_FRAMES=10  # number of frames for trajectory timeline (default: fps=2)
 
+ATTENTION_PDF_PER_FRAME_NORMALIZE=False  # whether to normalize each frame over H*W before drawing attention PDFs
+ATTENTION_PDF_SHARE_COLOR_SCALE=True  # if True, all frames in one attention PDF share one vmin/vmax
+
 DRAW_ATTENTION_MAP_ONLY=True  # whether to only visualize attention & trajectory via the saved attention maps
 DRAW_ATTENTION_MAPS_PATH=""  # the path to the saved attention maps (.pt) for re-drawing; if empty, use the attention maps in the standard output dir
-DRAW_ATTENTION_MAPS_PATH="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_20_shift_5.0_guide_5.0/old/cross_attention_maps.pt"
+DRAW_ATTENTION_MAPS_PATH="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/cross_attention_maps.pt"
 
 # VISUALIZATION_OUTPUT_DIR="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw"  # "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw1"  # for re-drawing
 VISUALIZATION_OUTPUT_DIR=""
@@ -99,9 +102,18 @@ for SEED in "${SEEDS[@]}"; do
     echo "=================================================================================="
     echo "Running cross_attention_token_viz | prompt: $PROMPT | seed: $SEED"
     echo "=================================================================================="
-
+    
     PROMPT_TAG=$(build_prompt_tag "$PROMPT")
-    SAVE_DIR="$WORK_DIR/outputs_wan_2_1_${task}/cross_attention_token_viz/${PROMPT_TAG}/seed_${SEED}_shift_${SAMPLE_SHIFT}_guide_${SAMPLE_GUIDE_SCALE}"
+
+    if [ "$ATTENTION_PDF_PER_FRAME_NORMALIZE" = "True" ]; then
+        EXP_NAME="cross_attention_token_viz_per_frame_norm"
+    else
+        EXP_NAME="cross_attention_token_viz"
+    fi
+    if [ "$ATTENTION_PDF_SHARE_COLOR_SCALE" = "True" ]; then
+        EXP_NAME="${EXP_NAME}_shared_color_scale"
+    fi
+    SAVE_DIR="$WORK_DIR/outputs_wan_2_1_${task}/${EXP_NAME}/${PROMPT_TAG}/seed_${SEED}_shift_${SAMPLE_SHIFT}_guide_${SAMPLE_GUIDE_SCALE}"
     SUMMARY_FILE="$SAVE_DIR/cross_attention_token_viz_summary.json"
     if [ -f "$SUMMARY_FILE" ] && [ "${DRAW_ATTENTION_MAP_ONLY,,}" = "false" ]; then
         echo "Summary already exists: $SUMMARY_FILE"
@@ -140,6 +152,8 @@ for SEED in "${SEEDS[@]}"; do
         --traj_arrow_stride $TRAJ_ARROW_STRIDE \
         --traj_include_head_mean True \
         --save_attention_pdfs $SAVE_ATTENTION_PDFS \
+        --attention_pdf_per_frame_normalize $ATTENTION_PDF_PER_FRAME_NORMALIZE \
+        --attention_pdf_share_color_scale $ATTENTION_PDF_SHARE_COLOR_SCALE \
         --skip_existing_pdfs $SKIP_EXISTING_PDFS \
         --save_trajectory_pdfs $SAVE_TRAJECTORY_PDFS \
         --save_trajectory_timeline_pdfs $SAVE_TRAJECTORY_TIMELINE_PDFS \

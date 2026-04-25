@@ -15,6 +15,7 @@ from .step_window_ffn_off import *  # noqa: F401,F403
 from .cross_attn_head_ablation import *  # noqa: F401,F403
 from .step_window_prompt_replace import *  # noqa: F401,F403
 from .self_attention_temporal_kernel import *  # noqa: F401,F403
+from .self_attention_distribution import *  # noqa: F401,F403
 from .event_token_value import *  # noqa: F401,F403
 from .cross_attention_token_viz import *  # noqa: F401,F403
 from .trajectory_entropy import *  # noqa: F401,F403
