@@ -9,6 +9,7 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 ## Implemented Experiments
 
 - `rope_axis_ablation`
+- `rope_decay_curve`
 - `attention_dt_profile`
 - `trajectory_entropy`
 - `head_evolution`
@@ -35,6 +36,23 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - Input: prompt + rope modes (`full/no_f/no_h/no_w/only_f/only_hw`).
 - Output: one video per mode + summary CSV/JSON.
 - Key readout: qualitative motion collapse patterns across modes.
+
+### 1b) `rope_decay_curve`
+- Motivation: visualize the intrinsic long-range decorrelation induced by Wan2.1's RoPE parameterization itself, without loading model weights.
+- 动机：不依赖模型权重，直接从 Wan2.1 官方 RoPE 定义出发，可视化其自带的长距离去相干/衰减趋势。
+- Type: lightweight offline visualization. It only reads Wan config values and reproduces the official RoPE formula.
+- Input:
+  - `task`: use `t2v-1.3B` here
+  - `size`: e.g. `832*480`
+  - `frame_num`: e.g. `81`
+- Output:
+  - `rope_decay_curve_frame_level.pdf`
+  - `rope_decay_curve_token_level.pdf`
+  - `rope_decay_curve_summary.json`
+- Key readout:
+  - frame-level RoPE kernel decay vs latent frame distance
+  - flattened token-level RoPE kernel decay vs relative video-token distance
+  - see detailed note: `docs/rope_decay_curve.md`
 
 ### 2) `attention_dt_profile`
 - Motivation: profile temporal distance preference \(P(|\Delta t|)\) in early denoising steps.
@@ -216,43 +234,59 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - Meaning: larger MSS indicates stronger head-specific residual dynamics relative to layer-level average dynamics across diffusion steps.
 
 ### 14) `head_trajectory_dynamics`
-- Motivation: test whether heads that show object-token trajectories become mutually consistent over early denoising, and whether some heads behave like attractors that pull other heads' center trajectories closer over subsequent steps.
-- 动机：分析多个 cross-attention heads 的 object-token 轨迹是否在扩散早期形成共识，以及是否存在“吸引子头”使其他 head 的中心轨迹逐步靠近。
+- Motivation: study whether object-related heads become mutually consistent during early denoising, whether some heads behave as leader-like attractors, and how quickly each head aligns with a final reference object.
 - Type: offline analysis. It reuses saved maps from an existing `cross_attention_token_viz` directory and does not resample video.
-- Input:
+- Core inputs:
   - `reuse_cross_attention_dir` (required): existing `cross_attention_token_viz` output directory
-  - `target_object_words`: object words to aggregate into object-token maps
-  - `head_trajectory_dynamics_heads`: optional head list such as `L4H1,L7H8`; empty means all heads
-  - `head_trajectory_dynamics_steps`: optional diffusion-step list; empty means all steps available in reused maps
-  - `head_trajectory_dynamics_distance_metrics`: any subset of `js`, `hellinger`, `wasserstein_map`, `support_overlap`, `center_l2`
-  - `head_trajectory_dynamics_reference_step/layer`: reference head-mean map used to build the final reference trajectory
-  - `head_trajectory_dynamics_support_quantile`: support-mask quantile for support-overlap
-  - `head_trajectory_dynamics_attractor_window`: future-step window used by multi-step attractor metrics
+  - `target_object_words`: object words aggregated into object-token maps
+  - `head_trajectory_dynamics_heads`: optional head list such as `L4H1,L7H8`; empty string means all heads in the reused maps
+  - `head_trajectory_dynamics_steps`: optional diffusion-step list; empty string means all available steps in the reused maps
+  - `head_trajectory_dynamics_distance_metrics`: any subset of `js`, `hellinger`, `wasserstein_map`, `support_overlap`, `center_l2`; empty string means all of them
+  - `head_trajectory_dynamics_reference_step` / `head_trajectory_dynamics_reference_layer`: location used to build the reference head-mean map
+  - `head_trajectory_dynamics_support_quantile`: quantile threshold for the raw support set used by `support_overlap`
+  - `head_trajectory_dynamics_attractor_window`: future-step window used by attractor metrics
+  - `head_trajectory_dynamics_attractor_distance_metric`: metric list for attractor analysis; empty string means all supported metrics
+  - `head_trajectory_dynamics_hypothesis`: output-label suffix such as `attractor`, `reference-leading`, or `cross-layer-transmission`
+  - `head_trajectory_dynamics_use_motion_planning_region_before_metrics`: whether to zero out and renormalize attention outside the contour-filtered motion-planning region before computing metrics
+- Center extraction:
   - `head_trajectory_dynamics_center_method`: `region_centroid` or `preprocessed_component_center`
-  - `head_trajectory_dynamics_center_power`, `head_trajectory_dynamics_center_quantile`: center extraction parameters
+  - `head_trajectory_dynamics_center_power`, `head_trajectory_dynamics_center_quantile`: center extraction parameters for `region_centroid`
   - `head_trajectory_dynamics_preprocessed_center_mode`: `peak`, `centroid`, or `geometric_center`
   - `head_trajectory_dynamics_preprocess_winsorize_quantile`, `head_trajectory_dynamics_preprocess_despike_quantile`, `head_trajectory_dynamics_preprocess_min_component_area`: preprocessing parameters used by `preprocessed_component_center`
-  - `head_trajectory_dynamics_center_viz_step/layer/heads`: optional selection for per-head center-overlay PDFs
-  - If `head_trajectory_dynamics_center_viz_step/layer` are left at default `-1/-1` and `head_trajectory_dynamics_heads` is non-empty, the experiment will automatically render center-overlay PDFs for all analyzed heads.
+  - `head_trajectory_dynamics_reference_center_method`: reference-only center method; `same_as_head` reuses the ordinary-head setting
+  - `head_trajectory_dynamics_reference_center_power`, `head_trajectory_dynamics_reference_center_quantile`: reference-only center parameters
+  - `head_trajectory_dynamics_reference_preprocessed_center_mode`: reference-only preprocessing-center mode
+  - `head_trajectory_dynamics_reference_preprocess_winsorize_quantile`, `head_trajectory_dynamics_reference_preprocess_despike_quantile`, `head_trajectory_dynamics_reference_preprocess_min_component_area`: reference-only preprocessing parameters
+- Overlays and caches:
+  - `head_trajectory_dynamics_center_viz_enable`: render per-head center-overlay PDFs
+  - `head_trajectory_dynamics_center_viz_step` / `head_trajectory_dynamics_center_viz_layer` / `head_trajectory_dynamics_center_viz_heads`: optional overlay selection
+  - `head_trajectory_dynamics_support_viz_enable`: render support-overlap contour PDFs
+  - `head_trajectory_dynamics_support_viz_step` / `head_trajectory_dynamics_support_viz_layer` / `head_trajectory_dynamics_support_viz_heads`: optional support-overlay selection
+  - `head_trajectory_dynamics_support_viz_num_frames`: number of timeline frames shown in each support-overlay PDF
+  - `head_trajectory_dynamics_support_viz_contour_min_component_area`: minimum connected-component area before a green contour is drawn
+  - `head_trajectory_dynamics_plot_only_from_csv`: reuse existing metric CSVs and only redraw plots
+  - `head_trajectory_dynamics_overlay_only`: reuse cached maps and only redraw overlays
+  - `head_trajectory_dynamics_skip_existing_plots`: keep existing plot files and do not overwrite them
 - Output:
-  - `head_trajectory_dynamics_head_maps.csv`: map inventory after filtering
-  - `head_trajectory_dynamics_pairwise.csv`: pairwise head trajectory distances within each step/layer
-  - `head_trajectory_dynamics_consensus.csv`: consensus score per step/layer
-  - `head_trajectory_dynamics_attractor.csv`: one-step + multi-step attractor scores for each candidate leader head
-  - `head_trajectory_dynamics_reference_distance.csv`: per-step distance from each head to the reference trajectory / reference map
-  - `head_trajectory_dynamics_convergence.csv`: AUC + lock-in summaries of reference-distance curves
-  - `head_trajectory_dynamics_trajectory_centers.csv`: per-frame centers for each step/layer/head
-  - `head_trajectory_dynamics_soft_centers.csv`: legacy alias of the same per-frame center table
-  - `head_trajectory_dynamics_trajectory_cache_*.json`: cached center trajectories keyed by center algorithm and parameter values
-  - `head_trajectory_dynamics_plots/`: consensus curves/heatmaps, attractor curves by method, reference-distance heatmaps, reference-distance multi-head curves, and convergence heatmaps
-  - `head_trajectory_dynamics_head_center_overlays/`: per-head cross-attention center-overlay PDFs, stored separately by `step_xxx/layer_xx/`.
+  - Shared outputs in `output_dir/`: center trajectory cache JSON, motion-planning-region cache JSON, center-overlay PDFs, support-overlay PDFs
+  - Metric outputs in `output_dir/head_trajectory_dynamics_metrics_hypothesis_<name>_motion_planning_region_<on|off>/`
+    - `head_trajectory_dynamics_head_maps.csv`
+    - `head_trajectory_dynamics_pairwise.csv`
+    - `head_trajectory_dynamics_consensus.csv`
+    - `head_trajectory_dynamics_attractor.csv`
+    - `head_trajectory_dynamics_reference_distance.csv`
+    - `head_trajectory_dynamics_convergence.csv`
+    - `head_trajectory_dynamics_trajectory_centers.csv`
+    - `head_trajectory_dynamics_soft_centers.csv`
+    - `head_trajectory_dynamics_plots/`
+    - `head_trajectory_dynamics_summary.json`
 - Metrics:
   - `js_distance`: Jensen-Shannon distance between per-frame spatial probability maps.
   - `hellinger_distance`: Hellinger distance between per-frame spatial probability maps.
-  - `wasserstein_map_distance`: efficient map-level Wasserstein proxy from row/column marginals.
+  - `wasserstein_map_distance`: project-specific row/column-marginal Wasserstein proxy.
   - `support_overlap_distance`: \(1-\mathrm{IoU}\) of high-response support masks.
   - `center_l2_distance`: mean per-frame Euclidean distance between extracted center trajectories.
-  - `consensus = 1 / (1 + mean_pairwise_distance)`: larger means heads in the same layer/step are more similar.
+  - `consensus = 1 / (1 + mean_pairwise_distance)`: larger means heads in the same layer-step group are more similar.
   - `attractor_score_mean`: reported for `one_step`, `window_mean`, and `best_future`; positive means followers move closer to the leader prototype.
 
 ### 15) `self_attention_temporal_kernel`
@@ -297,12 +331,17 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - `self_attention_distribution_query_frame_count`: how many token frames are sampled as query frames
   - `self_attention_distribution_global_query_tokens_per_frame`: how many global query tokens are sampled per selected frame
   - `self_attention_distribution_object_query_token_limit_per_frame`: optional cap on the number of object-region query tokens per frame; `0` means keep all
+  - `self_attention_distribution_plot_per_head`: if true, additionally export per-head plots under `self_attention_distribution_plots/step_xxx/layer_xx/head_xx/`
+  - `self_attention_distribution_stop_after_last_probe_step`: if true, stop diffusion immediately after the last requested probe step and skip final full-video generation
+  - `self_attention_distribution_plot_only_from_csv`: if true, reuse existing CSV outputs in `output_dir` and only redraw plots
+  - `self_attention_distribution_skip_existing_plots`: if true, existing plot files are kept and not overwritten
 - Output:
   - `self_attention_distribution_object_rows.csv`
   - `self_attention_distribution_object_dt_rows.csv`
   - `self_attention_distribution_global_dt_rows.csv`
   - `self_attention_distribution_reference_support.csv`
   - `self_attention_distribution_plots/`: object query-key heatmaps, object dt curves, and global dt curves
+  - default plot location is `output_dir/self_attention_distribution_plots/step_xxx/layer_xx/`; per-head plots, if enabled, are written under `.../head_xx/`
   - `self_attention_distribution_summary.json`
 - Key readout:
   - whether object-region self-attention actually lands on object regions in other frames
@@ -896,38 +935,99 @@ For `head_evolution`:
 
 - `head_trajectory_dynamics_heads`:
 - Values: CSV `LxHy` specs or empty string `""`.
-- 中文：指定参与共识/吸引子动态分析的 heads。留空表示使用复用 map 里的所有 heads。
+- Description: selects the heads included in the trajectory analysis. An empty string means all heads available in the reused maps.
 
 - `head_trajectory_dynamics_steps`:
 - Values: CSV steps or empty string `""`.
-- 中文：指定分析哪些扩散步。留空表示使用复用 map 里的所有可用 steps；若只关心 motion plan，建议先用 `1,2,3,4,5,6`。
+- Description: selects the diffusion steps included in the analysis. An empty string means all steps available in the reused maps.
 
 - `head_trajectory_dynamics_distance_metrics`:
 - Values: any subset of `js`, `hellinger`, `wasserstein_map`, `support_overlap`, `center_l2`, or empty string `""`.
-- 中文：head 轨迹距离度量。`wasserstein_map` 是基于行/列边缘分布的一维 Wasserstein 代理，不是完整二维最优传输；`center_l2` 是中心轨迹的欧氏距离。
+- Description: map-level or center-level distance metrics used for pairwise head comparisons. `wasserstein_map` is a row/column-marginal Wasserstein proxy, not full 2D optimal transport. `center_l2` measures Euclidean distance between extracted center trajectories.
 
 - `head_trajectory_dynamics_reference_step` / `head_trajectory_dynamics_reference_layer`:
-- 中文：用于构造最终参考轨迹的位置，默认 `step=50, layer=27`。
+- Description: selects the step/layer location used to build the reference head-mean map.
 
 - `head_trajectory_dynamics_support_quantile`:
-- 中文：support-overlap 指标中，高响应支撑区域的分位数阈值。
+- Description: quantile threshold used to define the raw support set for `support_overlap`. It does not affect center extraction.
 
 - `head_trajectory_dynamics_attractor_window`:
-- 中文：多步 attractor 指标向未来看的窗口长度。
+- Description: future-step window used by attractor-style leader-follower analysis.
 
 - `head_trajectory_dynamics_center_method`:
 - Values: `region_centroid`, `preprocessed_component_center`.
-- 中文：中心点提取方法。`region_centroid` 复用 `cross_attention_token_viz` 的局部区域质心逻辑；`preprocessed_component_center` 则先做 winsorize + despike 预处理，再从主连通域中取 `peak/centroid/geometric_center`。
+- Description: center extraction method for ordinary heads. `region_centroid` reuses the localized region-center logic from `cross_attention_token_viz`. `preprocessed_component_center` first denoises the frame and then extracts the dominant connected component.
 
 - `head_trajectory_dynamics_center_power` / `head_trajectory_dynamics_center_quantile`:
-- 中文：中心点提取时使用的幂次增强与分位数阈值参数。
+- Description: parameters for `region_centroid`. `center_quantile` sets the quantile threshold for the peak-containing region. `center_power` applies power weighting inside that region.
 
 - `head_trajectory_dynamics_preprocessed_center_mode`:
 - Values: `peak`, `centroid`, `geometric_center`.
-- 中文：当 `head_trajectory_dynamics_center_method=preprocessed_component_center` 时，指定使用峰值点、质心还是几何中心。
+- Description: when `head_trajectory_dynamics_center_method=preprocessed_component_center`, selects whether the extracted center is the peak, the weighted centroid, or the geometric center of the cleaned component.
 
 - `head_trajectory_dynamics_preprocess_winsorize_quantile` / `head_trajectory_dynamics_preprocess_despike_quantile` / `head_trajectory_dynamics_preprocess_min_component_area`:
-- 中文：预处理参数，分别控制截尾分位点、去尖刺分位点，以及保留连通域的最小面积。
+- Description: preprocessing parameters used by `preprocessed_component_center`. They control winsorization, despiking, and the minimum connected-component area.
+
+- `head_trajectory_dynamics_reference_center_method`:
+- Values: `same_as_head`, `region_centroid`, `preprocessed_component_center`.
+- Description: reference-only center extraction method. `same_as_head` reuses the ordinary-head configuration.
+
+- `head_trajectory_dynamics_reference_center_power` / `head_trajectory_dynamics_reference_center_quantile`:
+- Description: reference-only parameters for the `region_centroid` family. Negative values fall back to the ordinary-head settings.
+
+- `head_trajectory_dynamics_reference_preprocessed_center_mode`:
+- Values: `same_as_head`, `peak`, `centroid`, `geometric_center`.
+- Description: reference-only mode used when `head_trajectory_dynamics_reference_center_method=preprocessed_component_center`. `same_as_head` reuses the ordinary-head mode.
+
+- `head_trajectory_dynamics_reference_preprocess_winsorize_quantile` / `head_trajectory_dynamics_reference_preprocess_despike_quantile` / `head_trajectory_dynamics_reference_preprocess_min_component_area`:
+- Description: reference-only preprocessing parameters. Negative values fall back to the ordinary-head settings.
+
+- `head_trajectory_dynamics_hypothesis`:
+- Values: `attractor`, `reference-leading`, `cross-layer-transmission`, or another hypothesis label used by future variants.
+- Description: names the metrics-output subdirectory so different hypothesis variants can coexist in the same `output_dir`.
+
+- `head_trajectory_dynamics_use_motion_planning_region_before_metrics`:
+- Values: `True` / `False`.
+- Description: if enabled, each map is restricted to the contour-filtered motion-planning region and renormalized before metric computation.
+
+- `head_trajectory_dynamics_support_viz_enable`:
+- Values: `True` / `False`.
+- Description: whether to render support-overlap contour visualizations for selected heads.
+
+- `head_trajectory_dynamics_support_viz_step` / `head_trajectory_dynamics_support_viz_layer` / `head_trajectory_dynamics_support_viz_heads`:
+- Description: selects which `(step, layer, head)` triples are rendered in support-overlay visualizations.
+
+- `head_trajectory_dynamics_support_viz_num_frames`:
+- Description: number of timeline frames shown in each support-overlay PDF.
+
+- `head_trajectory_dynamics_support_viz_contour_min_component_area`:
+- Description: minimum connected-component area required before a green contour is drawn.
+
+- `head_trajectory_dynamics_support_cache_num_workers`:
+- Values: integer `>= 0`.
+- Description: number of CPU worker processes used to build missing support / motion-planning-region caches. A non-positive value means use `os.cpu_count()`.
+
+- `head_trajectory_dynamics_center_viz_enable`:
+- Values: `True` / `False`.
+- Description: whether to render per-head center-overlay PDFs.
+
+- `head_trajectory_dynamics_center_viz_step` / `head_trajectory_dynamics_center_viz_layer` / `head_trajectory_dynamics_center_viz_heads`:
+- Description: selects which `(step, layer, head)` triples are rendered in center-overlay visualizations.
+
+- `head_trajectory_dynamics_center_viz_num_frames`:
+- Description: number of timeline frames shown in each center-overlay PDF.
+
+- `head_trajectory_dynamics_plot_only_from_csv`:
+- Values: `True` / `False`.
+- Description: if enabled, the experiment reuses an existing metric CSV bundle and redraws plots without recomputing the metrics.
+
+- `head_trajectory_dynamics_overlay_only`:
+- Values: `True` / `False`.
+- Description: if enabled, the experiment reuses cached maps and only redraws center/support overlays.
+
+- `head_trajectory_dynamics_skip_existing_plots`:
+- Values: `True` / `False`.
+- Description: if enabled, existing plot files are left untouched instead of being overwritten.
 
 - `self_attn_kernel_steps`:
 - Values: CSV steps or empty string `""`.
@@ -965,21 +1065,24 @@ For `head_evolution`:
 - Values: `peak`, `centroid`, `geometric_center`.
 - 中文：reference support 的中心点构造方式。
 
+- `self_attention_distribution_reference_preprocess_winsorize_quantile` / `self_attention_distribution_reference_preprocess_despike_quantile` / `self_attention_distribution_reference_preprocess_min_component_area`:
+- 中文：reference support 构造前的预处理参数。`self_attention_distribution` 现在默认与 `head_evolution` 一致，先做 winsorize + despike，再提参考中心。
+
 - `self_attention_distribution_support_radius_mode`:
 - Values: `fixed`, `adaptive_area`.
 - 中文：reference support 半径模式。`adaptive_area` 会按参考高亮区域面积自适应半径。
 
 - `self_attention_distribution_query_frame_count`:
 - Values: integer.
-- 中文：均匀抽取多少个 token frames 作为 query frames。
+- 中文：从全部 latent token frames 中均匀抽取多少个 query frames。它决定 object query-key heatmap 的行数上限。
 
 - `self_attention_distribution_global_query_tokens_per_frame`:
 - Values: integer.
-- 中文：global 分析里，每个 query frame 采样多少个全局 query tokens。
+- 中文：只用于 global 分析。每个 query frame 在全图 \(H \times W\) 上均匀采样多少个 query tokens。
 
 - `self_attention_distribution_object_query_token_limit_per_frame`:
 - Values: integer.
-- 中文：object-region 分析里，每帧最多保留多少个 object query tokens。`0` 表示不设上限，保留该帧 support 内所有 tokens。
+- 中文：只用于 object-region 分析。每帧最多保留多少个 object query tokens。`0` 表示不设上限，保留该帧 support 内所有 tokens。
 
 - `seed_to_trajectory_early_steps`:
 - Values: CSV steps.

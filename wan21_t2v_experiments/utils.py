@@ -41,6 +41,7 @@ from dotenv import load_dotenv
 from .wan21_t2v_experiment_patch import (
     Wan21T2VAttentionProbeConfig,
     Wan21T2VCausalAttentionConfig,
+    Wan21T2VEarlyStopRequested,
     Wan21T2VPatchBundleConfig,
     Wan21T2VRopePatchConfig,
     install_wan21_t2v_dit_patch_stack,
@@ -573,6 +574,7 @@ def _run_wan21_t2v_once_with_patch(
 ):
     """Apply patch stack, run one generation, then restore patches."""
     handle = install_wan21_t2v_dit_patch_stack(pipeline.model, patch_cfg)
+    video = None
     try:
         video = _generate_wan21_t2v_video(
             pipeline=pipeline,
@@ -586,6 +588,8 @@ def _run_wan21_t2v_once_with_patch(
             seed=seed,
             offload_model=offload_model,
         )
+    except Wan21T2VEarlyStopRequested:
+        video = None
     finally:
         handle.restore()
 
@@ -1615,10 +1619,14 @@ def _extract_wan21_t2v_attention_region_center_trajectory(
         peak_x = peak_idx % w
 
         if q > 0.0:
-            thresh = float(torch.quantile(flat, q).item())
-            mask = attn >= thresh
+            positive_flat = flat[flat > 0.0]
+            if positive_flat.numel() > 0:
+                thresh = float(torch.quantile(positive_flat, q).item())
+                mask = (attn > 0.0) & (attn >= thresh)
+            else:
+                mask = torch.zeros_like(attn, dtype=torch.bool)
         else:
-            mask = torch.ones_like(attn, dtype=torch.bool)
+            mask = attn > 0.0
 
         # Ensure peak is in mask.
         if not bool(mask[peak_y, peak_x].item()):

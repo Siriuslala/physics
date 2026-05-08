@@ -11,6 +11,8 @@ It reuses the existing q/k probe stack from wan21_t2v_experiment_patch.py and
 the reference-trajectory construction used by head_evolution.py.
 """
 
+import csv
+import json
 import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -36,6 +38,7 @@ from .utils import (
 from .head_evolution import (
     _build_wan21_t2v_trajectory_support_mask_from_centers,
     _extract_wan21_t2v_reference_peak_and_centroid_trajectory,
+    _preprocess_wan21_t2v_attention_map_fhw,
 )
 from .wan21_t2v_experiment_patch import (
     Wan21T2VAttentionProbeConfig,
@@ -54,6 +57,9 @@ def _build_wan21_t2v_self_attention_distribution_reference_support(
     center_mode: str,
     center_power: float,
     center_quantile: float,
+    preprocess_winsorize_quantile: float,
+    preprocess_despike_quantile: float,
+    preprocess_min_component_area: int,
     support_radius_mode: str,
     support_radius_fixed: float,
     support_radius_alpha: float,
@@ -88,8 +94,15 @@ def _build_wan21_t2v_self_attention_distribution_reference_support(
             f"step={int(reference_step)} layer={int(reference_layer)} words={object_words_in_maps}"
         )
 
-    reference_trajectory_data = _extract_wan21_t2v_reference_peak_and_centroid_trajectory(
+    reference_preprocessed_map, reference_preprocess_stats = _preprocess_wan21_t2v_attention_map_fhw(
         map_fhw=reference_map,
+        winsorize_quantile=float(preprocess_winsorize_quantile),
+        despike_quantile=float(preprocess_despike_quantile),
+        min_component_area=int(preprocess_min_component_area),
+    )
+
+    reference_trajectory_data = _extract_wan21_t2v_reference_peak_and_centroid_trajectory(
+        map_fhw=reference_preprocessed_map,
         power=float(center_power),
         quantile=float(center_quantile),
     )
@@ -122,6 +135,8 @@ def _build_wan21_t2v_self_attention_distribution_reference_support(
         "reference_map_path": loaded_map_path,
         "object_words_in_maps": object_words_in_maps,
         "reference_map": reference_map,
+        "reference_preprocessed_map": reference_preprocessed_map,
+        "reference_preprocess_stats": reference_preprocess_stats,
         "center_trajectory": center_trajectory,
         "support_mask_fhw": support_mask_fhw,
         "support_radius_per_frame": support_radius_per_frame,
@@ -273,6 +288,193 @@ def _plot_wan21_t2v_self_attention_distribution_global_dt_curves(
     return save_file
 
 
+def _load_wan21_t2v_self_attention_distribution_csv_rows(csv_path: str) -> List[Dict[str, str]]:
+    """Load one CSV file into a list of row dictionaries."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Missing CSV required for plotting: {csv_path}")
+    with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            return []
+        return [dict(row) for row in reader]
+
+
+def _load_wan21_t2v_self_attention_distribution_json_if_exists(json_path: str) -> Dict[str, object]:
+    """Load one JSON file if present, otherwise return an empty dict."""
+    if not os.path.exists(json_path):
+        return {}
+    with open(json_path, "r", encoding="utf-8") as handle:
+        loaded = json.load(handle)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _should_skip_wan21_t2v_self_attention_distribution_plot(save_file: str, skip_existing_plots: bool) -> bool:
+    """Return True when one plot should be skipped because it already exists."""
+    return bool(skip_existing_plots) and os.path.exists(save_file)
+
+
+def _render_wan21_t2v_self_attention_distribution_plots(
+    object_rows: Sequence[Dict[str, object]],
+    object_dt_rows: Sequence[Dict[str, object]],
+    global_dt_rows: Sequence[Dict[str, object]],
+    output_dir: str,
+    plot_per_head: bool,
+    skip_existing_plots: bool = False,
+) -> List[str]:
+    """Render plots that depend only on saved self-attention-distribution CSV rows."""
+    plot_paths: List[str] = []
+    plots_dir = os.path.join(output_dir, "self_attention_distribution_plots")
+    object_rows_by_step_layer: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+    object_dt_rows_by_step_layer: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+    global_dt_rows_by_step_layer: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+    object_rows_by_step_layer_head: Dict[Tuple[int, int, int], List[Dict[str, object]]] = defaultdict(list)
+    object_dt_rows_by_step_layer_head: Dict[Tuple[int, int, int], List[Dict[str, object]]] = defaultdict(list)
+    global_dt_rows_by_step_layer_head: Dict[Tuple[int, int, int], List[Dict[str, object]]] = defaultdict(list)
+    for row in object_rows:
+        object_rows_by_step_layer[(int(row["step"]), int(row["layer"]))].append(row)
+        object_rows_by_step_layer_head[(int(row["step"]), int(row["layer"]), int(row["head"]))].append(row)
+    for row in object_dt_rows:
+        object_dt_rows_by_step_layer[(int(row["step"]), int(row["layer"]))].append(row)
+        object_dt_rows_by_step_layer_head[(int(row["step"]), int(row["layer"]), int(row["head"]))].append(row)
+    for row in global_dt_rows:
+        global_dt_rows_by_step_layer[(int(row["step"]), int(row["layer"]))].append(row)
+        global_dt_rows_by_step_layer_head[(int(row["step"]), int(row["layer"]), int(row["head"]))].append(row)
+
+    all_step_layers = sorted(
+        set(object_rows_by_step_layer.keys()) | set(object_dt_rows_by_step_layer.keys()) | set(global_dt_rows_by_step_layer.keys())
+    )
+    for step_index, layer_index in all_step_layers:
+        object_heatmap_rows = object_rows_by_step_layer.get((int(step_index), int(layer_index)), [])
+        if object_heatmap_rows:
+            for value_key in ("object_fraction", "object_mass"):
+                save_file = os.path.join(
+                    plots_dir,
+                    f"step_{int(step_index):03d}",
+                    f"layer_{int(layer_index):02d}",
+                    f"object_query_key_heatmap_{value_key}.pdf",
+                )
+                if _should_skip_wan21_t2v_self_attention_distribution_plot(save_file, skip_existing_plots):
+                    plot_paths.append(save_file)
+                else:
+                    plot_path = _plot_wan21_t2v_self_attention_distribution_object_heatmap(
+                        rows=object_heatmap_rows,
+                        save_file=save_file,
+                        title=(
+                            f"Object-Region Self-Attention Heatmap ({value_key}) | "
+                            f"step={int(step_index)} layer={int(layer_index)}"
+                        ),
+                        value_key=value_key,
+                    )
+                    if plot_path:
+                        plot_paths.append(plot_path)
+
+        object_dt_plot_rows = object_dt_rows_by_step_layer.get((int(step_index), int(layer_index)), [])
+        if object_dt_plot_rows:
+            save_file = os.path.join(
+                plots_dir,
+                f"step_{int(step_index):03d}",
+                f"layer_{int(layer_index):02d}",
+                "object_dt_curves.pdf",
+            )
+            if _should_skip_wan21_t2v_self_attention_distribution_plot(save_file, skip_existing_plots):
+                plot_paths.append(save_file)
+            else:
+                plot_path = _plot_wan21_t2v_self_attention_distribution_object_dt_curves(
+                    rows=object_dt_plot_rows,
+                    save_file=save_file,
+                    title=f"Object-Region Self-Attention vs Signed dt | step={int(step_index)} layer={int(layer_index)}",
+                )
+                if plot_path:
+                    plot_paths.append(plot_path)
+
+        global_dt_plot_rows = global_dt_rows_by_step_layer.get((int(step_index), int(layer_index)), [])
+        if global_dt_plot_rows:
+            save_file = os.path.join(
+                plots_dir,
+                f"step_{int(step_index):03d}",
+                f"layer_{int(layer_index):02d}",
+                "global_dt_curves.pdf",
+            )
+            if _should_skip_wan21_t2v_self_attention_distribution_plot(save_file, skip_existing_plots):
+                plot_paths.append(save_file)
+            else:
+                plot_path = _plot_wan21_t2v_self_attention_distribution_global_dt_curves(
+                    rows=global_dt_plot_rows,
+                    save_file=save_file,
+                    title=f"Global Self-Attention vs Signed dt | step={int(step_index)} layer={int(layer_index)}",
+                )
+                if plot_path:
+                    plot_paths.append(plot_path)
+
+    if bool(plot_per_head):
+        all_step_layer_heads = sorted(
+            set(object_rows_by_step_layer_head.keys())
+            | set(object_dt_rows_by_step_layer_head.keys())
+            | set(global_dt_rows_by_step_layer_head.keys())
+        )
+        for step_index, layer_index, head_index in all_step_layer_heads:
+            head_dir = os.path.join(
+                plots_dir,
+                f"step_{int(step_index):03d}",
+                f"layer_{int(layer_index):02d}",
+                f"head_{int(head_index):02d}",
+            )
+            object_heatmap_rows = object_rows_by_step_layer_head.get((int(step_index), int(layer_index), int(head_index)), [])
+            if object_heatmap_rows:
+                for value_key in ("object_fraction", "object_mass"):
+                    save_file = os.path.join(head_dir, f"object_query_key_heatmap_{value_key}.pdf")
+                    if _should_skip_wan21_t2v_self_attention_distribution_plot(save_file, skip_existing_plots):
+                        plot_paths.append(save_file)
+                    else:
+                        plot_path = _plot_wan21_t2v_self_attention_distribution_object_heatmap(
+                            rows=object_heatmap_rows,
+                            save_file=save_file,
+                            title=(
+                                f"Object-Region Self-Attention Heatmap ({value_key}) | "
+                                f"step={int(step_index)} layer={int(layer_index)} head={int(head_index)}"
+                            ),
+                            value_key=value_key,
+                        )
+                        if plot_path:
+                            plot_paths.append(plot_path)
+
+            object_dt_plot_rows = object_dt_rows_by_step_layer_head.get((int(step_index), int(layer_index), int(head_index)), [])
+            if object_dt_plot_rows:
+                save_file = os.path.join(head_dir, "object_dt_curves.pdf")
+                if _should_skip_wan21_t2v_self_attention_distribution_plot(save_file, skip_existing_plots):
+                    plot_paths.append(save_file)
+                else:
+                    plot_path = _plot_wan21_t2v_self_attention_distribution_object_dt_curves(
+                        rows=object_dt_plot_rows,
+                        save_file=save_file,
+                        title=(
+                            "Object-Region Self-Attention vs Signed dt | "
+                            f"step={int(step_index)} layer={int(layer_index)} head={int(head_index)}"
+                        ),
+                    )
+                    if plot_path:
+                        plot_paths.append(plot_path)
+
+            global_dt_plot_rows = global_dt_rows_by_step_layer_head.get((int(step_index), int(layer_index), int(head_index)), [])
+            if global_dt_plot_rows:
+                save_file = os.path.join(head_dir, "global_dt_curves.pdf")
+                if _should_skip_wan21_t2v_self_attention_distribution_plot(save_file, skip_existing_plots):
+                    plot_paths.append(save_file)
+                else:
+                    plot_path = _plot_wan21_t2v_self_attention_distribution_global_dt_curves(
+                        rows=global_dt_plot_rows,
+                        save_file=save_file,
+                        title=(
+                            "Global Self-Attention vs Signed dt | "
+                            f"step={int(step_index)} layer={int(layer_index)} head={int(head_index)}"
+                        ),
+                    )
+                    if plot_path:
+                        plot_paths.append(plot_path)
+
+    return plot_paths
+
+
 def run_wan21_t2v_self_attention_distribution(
     wan21_root: str,
     ckpt_dir: str,
@@ -299,6 +501,9 @@ def run_wan21_t2v_self_attention_distribution(
     self_attention_distribution_reference_center_mode: str = "geometric_center",
     self_attention_distribution_reference_center_power: float = 1.5,
     self_attention_distribution_reference_center_quantile: float = 0.8,
+    self_attention_distribution_reference_preprocess_winsorize_quantile: float = 0.995,
+    self_attention_distribution_reference_preprocess_despike_quantile: float = 0.98,
+    self_attention_distribution_reference_preprocess_min_component_area: int = 2,
     self_attention_distribution_support_radius_mode: str = "adaptive_area",
     self_attention_distribution_support_radius_fixed: float = 2.0,
     self_attention_distribution_support_radius_alpha: float = 1.5,
@@ -307,14 +512,65 @@ def run_wan21_t2v_self_attention_distribution(
     self_attention_distribution_query_frame_count: int = 8,
     self_attention_distribution_global_query_tokens_per_frame: int = 64,
     self_attention_distribution_object_query_token_limit_per_frame: int = 0,
+    self_attention_distribution_plot_per_head: bool = False,
+    self_attention_distribution_stop_after_last_probe_step: bool = False,
+    self_attention_distribution_plot_only_from_csv: bool = False,
+    self_attention_distribution_skip_existing_plots: bool = True,
     save_video: bool = True,
     parallel_cfg: Optional[Wan21T2VParallelConfig] = None,
 ):
     """Run object-region and global self-attention distribution analysis."""
+    if bool(self_attention_distribution_plot_only_from_csv):
+        _ensure_dir(output_dir)
+        object_rows_path = os.path.join(output_dir, "self_attention_distribution_object_rows.csv")
+        object_dt_rows_path = os.path.join(output_dir, "self_attention_distribution_object_dt_rows.csv")
+        global_dt_rows_path = os.path.join(output_dir, "self_attention_distribution_global_dt_rows.csv")
+        summary_path = os.path.join(output_dir, "self_attention_distribution_summary.json")
+
+        object_rows = _load_wan21_t2v_self_attention_distribution_csv_rows(object_rows_path)
+        object_dt_rows = _load_wan21_t2v_self_attention_distribution_csv_rows(object_dt_rows_path)
+        global_dt_rows = _load_wan21_t2v_self_attention_distribution_csv_rows(global_dt_rows_path)
+
+        plot_paths = _render_wan21_t2v_self_attention_distribution_plots(
+            object_rows=object_rows,
+            object_dt_rows=object_dt_rows,
+            global_dt_rows=global_dt_rows,
+            output_dir=output_dir,
+            plot_per_head=bool(self_attention_distribution_plot_per_head),
+            skip_existing_plots=bool(self_attention_distribution_skip_existing_plots),
+        )
+
+        summary = _load_wan21_t2v_self_attention_distribution_json_if_exists(summary_path)
+        summary.update(
+            {
+                "experiment": "wan21_t2v_self_attention_distribution",
+                "self_attention_distribution_plot_only_from_csv": True,
+                "self_attention_distribution_skip_existing_plots": bool(self_attention_distribution_skip_existing_plots),
+                "self_attention_distribution_plot_per_head": bool(self_attention_distribution_plot_per_head),
+                "plot_paths": plot_paths,
+            }
+        )
+        _save_json(summary_path, summary)
+        if dist.is_initialized():
+            dist.barrier()
+        return summary
+
     if not reuse_cross_attention_dir:
         raise ValueError("self_attention_distribution requires reuse_cross_attention_dir.")
     if not target_object_words:
         raise ValueError("self_attention_distribution requires target_object_words.")
+
+    if self_attention_distribution_steps:
+        resolved_steps = sorted(set(int(step) for step in self_attention_distribution_steps))
+    else:
+        resolved_steps = list(range(1, int(sampling_steps) + 1))
+    if not resolved_steps:
+        raise ValueError("self_attention_distribution resolved to an empty step list.")
+
+    if self_attention_distribution_layers:
+        resolved_layers = sorted(set(int(layer) for layer in self_attention_distribution_layers))
+    else:
+        resolved_layers = []
 
     reference_support = _build_wan21_t2v_self_attention_distribution_reference_support(
         reuse_cross_attention_dir=reuse_cross_attention_dir,
@@ -325,6 +581,9 @@ def run_wan21_t2v_self_attention_distribution(
         center_mode=str(self_attention_distribution_reference_center_mode),
         center_power=float(self_attention_distribution_reference_center_power),
         center_quantile=float(self_attention_distribution_reference_center_quantile),
+        preprocess_winsorize_quantile=float(self_attention_distribution_reference_preprocess_winsorize_quantile),
+        preprocess_despike_quantile=float(self_attention_distribution_reference_preprocess_despike_quantile),
+        preprocess_min_component_area=int(self_attention_distribution_reference_preprocess_min_component_area),
         support_radius_mode=str(self_attention_distribution_support_radius_mode),
         support_radius_fixed=float(self_attention_distribution_support_radius_fixed),
         support_radius_alpha=float(self_attention_distribution_support_radius_alpha),
@@ -349,16 +608,17 @@ def run_wan21_t2v_self_attention_distribution(
         rope=Wan21T2VRopePatchConfig(enabled=True, mode="full"),
         probe=Wan21T2VAttentionProbeConfig(
             enabled=True,
-            probe_steps=tuple(self_attention_distribution_steps),
+            probe_steps=tuple(resolved_steps),
             probe_branch=str(self_attention_distribution_branch),
             collect_dt_histograms=False,
             collect_maas_maps=False,
             collect_distribution=True,
-            distribution_layers=tuple(int(layer) for layer in self_attention_distribution_layers),
+            distribution_layers=tuple(int(layer) for layer in resolved_layers),
             distribution_query_frame_count=int(self_attention_distribution_query_frame_count),
             distribution_global_query_tokens_per_frame=int(self_attention_distribution_global_query_tokens_per_frame),
             distribution_object_query_token_limit_per_frame=int(self_attention_distribution_object_query_token_limit_per_frame),
             distribution_object_support_mask=reference_support["support_mask_fhw"],
+            stop_after_last_probe_step=bool(self_attention_distribution_stop_after_last_probe_step),
         ),
         causal=Wan21T2VCausalAttentionConfig(enabled=False),
     )
@@ -384,8 +644,9 @@ def run_wan21_t2v_self_attention_distribution(
         return None
 
     _ensure_dir(output_dir)
+    early_stop_triggered = bool(getattr(state, "early_stop_triggered", False))
     video_path = ""
-    if bool(save_video):
+    if bool(save_video) and (not early_stop_triggered) and video is not None:
         video_path = os.path.join(output_dir, f"wan21_t2v_self_attention_distribution_seed_{seed}.mp4")
         _save_wan21_t2v_video(video, video_path, fps=cfg.sample_fps)
 
@@ -418,71 +679,26 @@ def run_wan21_t2v_self_attention_distribution(
     reference_rows_path = os.path.join(output_dir, "self_attention_distribution_reference_support.csv")
     _save_csv(reference_rows_path, reference_rows)
 
-    plot_paths: List[str] = []
-    plots_dir = os.path.join(output_dir, "self_attention_distribution_plots")
-    object_rows_by_step_layer: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
-    object_dt_rows_by_step_layer: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
-    global_dt_rows_by_step_layer: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
-    for row in object_rows:
-        object_rows_by_step_layer[(int(row["step"]), int(row["layer"]))].append(row)
-    for row in object_dt_rows:
-        object_dt_rows_by_step_layer[(int(row["step"]), int(row["layer"]))].append(row)
-    for row in global_dt_rows:
-        global_dt_rows_by_step_layer[(int(row["step"]), int(row["layer"]))].append(row)
-
-    all_step_layers = sorted(
-        set(object_rows_by_step_layer.keys()) | set(object_dt_rows_by_step_layer.keys()) | set(global_dt_rows_by_step_layer.keys())
+    plot_paths = _render_wan21_t2v_self_attention_distribution_plots(
+        object_rows=object_rows,
+        object_dt_rows=object_dt_rows,
+        global_dt_rows=global_dt_rows,
+        output_dir=output_dir,
+        plot_per_head=bool(self_attention_distribution_plot_per_head),
+        skip_existing_plots=bool(self_attention_distribution_skip_existing_plots),
     )
-    for step_index, layer_index in all_step_layers:
-        object_heatmap_rows = object_rows_by_step_layer.get((int(step_index), int(layer_index)), [])
-        if object_heatmap_rows:
-            for value_key in ("object_fraction", "object_mass"):
-                plot_path = _plot_wan21_t2v_self_attention_distribution_object_heatmap(
-                    rows=object_heatmap_rows,
-                    save_file=os.path.join(
-                        plots_dir,
-                        f"step_{int(step_index):03d}",
-                        f"layer_{int(layer_index):02d}",
-                        f"object_query_key_heatmap_{value_key}.pdf",
-                    ),
-                    title=(
-                        f"Object-Region Self-Attention Heatmap ({value_key}) | "
-                        f"step={int(step_index)} layer={int(layer_index)}"
-                    ),
-                    value_key=value_key,
-                )
-                if plot_path:
-                    plot_paths.append(plot_path)
-
-        object_dt_plot_rows = object_dt_rows_by_step_layer.get((int(step_index), int(layer_index)), [])
-        if object_dt_plot_rows:
-            plot_path = _plot_wan21_t2v_self_attention_distribution_object_dt_curves(
-                rows=object_dt_plot_rows,
-                save_file=os.path.join(
-                    plots_dir,
-                    f"step_{int(step_index):03d}",
-                    f"layer_{int(layer_index):02d}",
-                    "object_dt_curves.pdf",
-                ),
-                title=f"Object-Region Self-Attention vs Signed dt | step={int(step_index)} layer={int(layer_index)}",
-            )
-            if plot_path:
-                plot_paths.append(plot_path)
-
-        global_dt_plot_rows = global_dt_rows_by_step_layer.get((int(step_index), int(layer_index)), [])
-        if global_dt_plot_rows:
-            plot_path = _plot_wan21_t2v_self_attention_distribution_global_dt_curves(
-                rows=global_dt_plot_rows,
-                save_file=os.path.join(
-                    plots_dir,
-                    f"step_{int(step_index):03d}",
-                    f"layer_{int(layer_index):02d}",
-                    "global_dt_curves.pdf",
-                ),
-                title=f"Global Self-Attention vs Signed dt | step={int(step_index)} layer={int(layer_index)}",
-            )
-            if plot_path:
-                plot_paths.append(plot_path)
+    all_step_layers = sorted(
+        {
+            (int(row["step"]), int(row["layer"]))
+            for row in list(object_rows) + list(object_dt_rows) + list(global_dt_rows)
+        }
+    )
+    all_step_layer_heads = sorted(
+        {
+            (int(row["step"]), int(row["layer"]), int(row["head"]))
+            for row in list(object_rows) + list(object_dt_rows) + list(global_dt_rows)
+        }
+    )
 
     summary = {
         "experiment": "wan21_t2v_self_attention_distribution",
@@ -495,15 +711,34 @@ def run_wan21_t2v_self_attention_distribution(
         "reference_map_path": reference_support["reference_map_path"],
         "target_object_words": list(target_object_words),
         "target_verb_words": list(target_verb_words),
-        "self_attention_distribution_steps": list(self_attention_distribution_steps),
-        "self_attention_distribution_layers": list(self_attention_distribution_layers),
+        "self_attention_distribution_steps_input": [int(step) for step in self_attention_distribution_steps],
+        "self_attention_distribution_steps_resolved": [int(step) for step in resolved_steps],
+        "self_attention_distribution_layers_input": [int(layer) for layer in self_attention_distribution_layers],
+        "self_attention_distribution_layers_resolved": [int(layer) for layer in resolved_layers],
         "self_attention_distribution_branch": str(self_attention_distribution_branch),
         "self_attention_distribution_reference_step": int(self_attention_distribution_reference_step),
         "self_attention_distribution_reference_layer": int(self_attention_distribution_reference_layer),
         "self_attention_distribution_reference_center_mode": str(self_attention_distribution_reference_center_mode),
+        "self_attention_distribution_reference_center_power": float(self_attention_distribution_reference_center_power),
+        "self_attention_distribution_reference_center_quantile": float(self_attention_distribution_reference_center_quantile),
+        "self_attention_distribution_reference_preprocess_winsorize_quantile": float(self_attention_distribution_reference_preprocess_winsorize_quantile),
+        "self_attention_distribution_reference_preprocess_despike_quantile": float(self_attention_distribution_reference_preprocess_despike_quantile),
+        "self_attention_distribution_reference_preprocess_min_component_area": int(self_attention_distribution_reference_preprocess_min_component_area),
+        "reference_preprocess_stats": reference_support["reference_preprocess_stats"],
         "self_attention_distribution_query_frame_count": int(self_attention_distribution_query_frame_count),
         "self_attention_distribution_global_query_tokens_per_frame": int(self_attention_distribution_global_query_tokens_per_frame),
         "self_attention_distribution_object_query_token_limit_per_frame": int(self_attention_distribution_object_query_token_limit_per_frame),
+        "self_attention_distribution_plot_per_head": bool(self_attention_distribution_plot_per_head),
+        "self_attention_distribution_stop_after_last_probe_step": bool(self_attention_distribution_stop_after_last_probe_step),
+        "self_attention_distribution_plot_only_from_csv": False,
+        "self_attention_distribution_skip_existing_plots": bool(self_attention_distribution_skip_existing_plots),
+        "early_stop_triggered": bool(early_stop_triggered),
+        "early_stop_completed_step": int(getattr(state, "early_stop_completed_step", 0)),
+        "early_stop_reason": str(getattr(state, "early_stop_reason", "")),
+        "num_step_layer_groups": int(len(all_step_layers)),
+        "num_step_layer_head_groups": int(len(all_step_layer_heads)),
+        "estimated_layer_mean_plot_files": int(4 * len(all_step_layers)),
+        "estimated_per_head_plot_files": int(4 * len(all_step_layer_heads)),
         "num_object_rows": int(len(object_rows)),
         "num_object_dt_rows": int(len(object_dt_rows)),
         "num_global_dt_rows": int(len(global_dt_rows)),

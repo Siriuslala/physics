@@ -24,3 +24,4 @@ from .seed_to_trajectory_predictability import *  # noqa: F401,F403
 from .token_trajectory_seed_stability import *  # noqa: F401,F403
 from .joint_attention_suite import *  # noqa: F401,F403
 from .head_evolution import *  # noqa: F401,F403
+from .rope_decay_curve import *  # noqa: F401,F403

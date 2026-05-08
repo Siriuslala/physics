@@ -72,6 +72,7 @@ class Wan21T2VAttentionProbeConfig:
     distribution_global_query_tokens_per_frame: int = 64
     distribution_object_query_token_limit_per_frame: int = 0
     distribution_object_support_mask: Optional[torch.Tensor] = None
+    stop_after_last_probe_step: bool = False
 
 
 @dataclass
@@ -134,6 +135,10 @@ class Wan21T2VProbeState:
         self.distribution_global_dt_sum: Dict[Tuple[int, int, str], torch.Tensor] = {}
         self.distribution_global_dt_count: Dict[Tuple[int, int, str], int] = {}
         self.distribution_grid_size: Optional[Tuple[int, int, int]] = None
+        self.last_requested_probe_step = max(config.probe.probe_steps) if config.probe.probe_steps else 0
+        self.early_stop_triggered = False
+        self.early_stop_completed_step = 0
+        self.early_stop_reason = ""
 
     def on_forward_start(self, t_tensor):
         """Track diffusion step based on timestep tensor and CFG forward index."""
@@ -145,6 +150,24 @@ class Wan21T2VProbeState:
             self.forward_call_index_in_step = 0
         else:
             self.forward_call_index_in_step += 1
+
+        if (
+            self.config.probe.enabled
+            and self.config.probe.stop_after_last_probe_step
+            and int(self.last_requested_probe_step) >= 1
+            and int(self.current_step) > int(self.last_requested_probe_step)
+        ):
+            self.collect_this_forward = False
+            self.early_stop_triggered = True
+            self.early_stop_completed_step = int(self.current_step) - 1
+            self.early_stop_reason = (
+                "Stopped immediately after completing the last requested probe step: "
+                f"{int(self.last_requested_probe_step)}."
+            )
+            raise Wan21T2VEarlyStopRequested(
+                completed_step=int(self.early_stop_completed_step),
+                requested_last_step=int(self.last_requested_probe_step),
+            )
 
         if not self.config.probe.enabled or self.current_step not in self.config.probe.probe_steps:
             self.collect_this_forward = False
@@ -689,6 +712,18 @@ class Wan21T2VPatchHandle:
                 block.self_attn.forward = self.original_attn_forwards[idx]
         for obj, name, value in self.restore_items:
             setattr(obj, name, value)
+
+
+class Wan21T2VEarlyStopRequested(RuntimeError):
+    """Signal that probing work is complete and diffusion can stop early."""
+
+    def __init__(self, completed_step: int, requested_last_step: int):
+        super().__init__(
+            "Wan2.1 experiment early stop requested after the final probe step "
+            f"(completed_step={int(completed_step)}, requested_last_step={int(requested_last_step)})."
+        )
+        self.completed_step = int(completed_step)
+        self.requested_last_step = int(requested_last_step)
 
 
 def _axis_enabled(mode: str) -> Tuple[bool, bool, bool]:

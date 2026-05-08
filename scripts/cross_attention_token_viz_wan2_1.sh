@@ -50,7 +50,7 @@ SAMPLE_GUIDE_SCALE=5.0
 # SAMPLE_GUIDE_SCALE=5.0
 
 # ==============================
-SEEDS=(26)
+SEEDS=(8)
 # SEEDS=($(seq 1 32))
 
 PROMPTS=(
@@ -79,16 +79,16 @@ TRAJ_ARROW_STRIDE=4
 
 SKIP_EXISTING_PDFS=True  # resume mode: if target pdf already exists (map/trajectory/timeline), skip drawing
 SAVE_ATTENTION_PDFS=True  # save attention maps for each timestep -> layer -> head
-SAVE_TRAJECTORY_PDFS=True  # save trajectory (in one picture) for each timestep -> layer -> head
+SAVE_TRAJECTORY_PDFS=False  # save trajectory (in one picture) for each timestep -> layer -> head
 SAVE_TRAJECTORY_TIMELINE_PDFS=True  # save trajectory timeline for each timestep -> layer -> head
 TRAJECTORY_TIMELINE_NUM_FRAMES=10  # number of frames for trajectory timeline (default: fps=2)
 
 ATTENTION_PDF_PER_FRAME_NORMALIZE=False  # whether to normalize each frame over H*W before drawing attention PDFs
-ATTENTION_PDF_SHARE_COLOR_SCALE=True  # if True, all frames in one attention PDF share one vmin/vmax
+ATTENTION_PDF_SHARE_COLOR_SCALE=False  # if True, all frames in one attention PDF share one vmin/vmax
 
 DRAW_ATTENTION_MAP_ONLY=True  # whether to only visualize attention & trajectory via the saved attention maps
 DRAW_ATTENTION_MAPS_PATH=""  # the path to the saved attention maps (.pt) for re-drawing; if empty, use the attention maps in the standard output dir
-DRAW_ATTENTION_MAPS_PATH="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/cross_attention_maps.pt"
+DRAW_ATTENTION_MAPS_PATH="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_8_shift_5.0_guide_5.0/cross_attention_maps.pt"
 
 # VISUALIZATION_OUTPUT_DIR="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw"  # "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw1"  # for re-drawing
 VISUALIZATION_OUTPUT_DIR=""

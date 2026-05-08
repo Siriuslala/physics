@@ -582,6 +582,7 @@ def run_wan21_t2v_cross_attention_token_viz(
         summary = {
             "experiment": "wan21_t2v_cross_attention_token_viz",
             "prompt": prompt,
+            "frame_num": int(frame_num),
             "prompt_tokens": prompt_tokens,
             "token_positions": word_to_positions,
             "token_types": word_to_type,

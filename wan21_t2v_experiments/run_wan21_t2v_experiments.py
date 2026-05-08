@@ -55,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
             "trajectory_entropy",
             "head_evolution",
             "head_trajectory_dynamics",
+            "rope_decay_curve",
             "self_attention_temporal_kernel",
             "self_attention_distribution",
             "seed_to_trajectory_predictability",
@@ -386,6 +387,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head_trajectory_dynamics_support_quantile", type=float, default=0.9)
     parser.add_argument("--head_trajectory_dynamics_attractor_window", type=int, default=3)
     parser.add_argument(
+        "--head_trajectory_dynamics_attractor_distance_metric",
+        type=str,
+        default="",
+        help=(
+            "CSV distance metrics used by attractor analysis when asking whether follower heads "
+            "move closer to the current leader head. "
+            "Allowed: js,hellinger,wasserstein_map,support_overlap,center_l2. "
+            "Empty means all supported metrics."
+        ),
+    )
+    parser.add_argument(
         "--head_trajectory_dynamics_center_method",
         type=str,
         default="region_centroid",
@@ -410,6 +422,62 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head_trajectory_dynamics_preprocess_despike_quantile", type=float, default=0.98)
     parser.add_argument("--head_trajectory_dynamics_preprocess_min_component_area", type=int, default=2)
     parser.add_argument(
+        "--head_trajectory_dynamics_reference_center_method",
+        type=str,
+        default="same_as_head",
+        choices=["same_as_head", "region_centroid", "preprocessed_component_center"],
+        help=(
+            "Reference-trajectory center method. `same_as_head` reuses the ordinary-head center method; "
+            "otherwise this setting applies only to the reference trajectory."
+        ),
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_reference_center_power",
+        type=float,
+        default=-1.0,
+        help="Reference-trajectory center power. Negative values fall back to head_trajectory_dynamics_center_power.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_reference_center_quantile",
+        type=float,
+        default=-1.0,
+        help="Reference-trajectory center quantile. Negative values fall back to head_trajectory_dynamics_center_quantile.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_reference_preprocessed_center_mode",
+        type=str,
+        default="same_as_head",
+        choices=["same_as_head", "peak", "centroid", "geometric_center"],
+        help=(
+            "Reference-only center mode used when the reference method is preprocessed_component_center. "
+            "`same_as_head` reuses the ordinary-head preprocessed mode."
+        ),
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_reference_preprocess_winsorize_quantile",
+        type=float,
+        default=-1.0,
+        help="Reference-only winsorize quantile. Negative values fall back to the ordinary-head setting.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_reference_preprocess_despike_quantile",
+        type=float,
+        default=-1.0,
+        help="Reference-only despike quantile. Negative values fall back to the ordinary-head setting.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_reference_preprocess_min_component_area",
+        type=int,
+        default=-1,
+        help="Reference-only minimum connected-component area. Negative values fall back to the ordinary-head setting.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_center_viz_enable",
+        type=_str2bool,
+        default=False,
+        help="If true, render center-overlay PDFs for selected heads.",
+    )
+    parser.add_argument(
         "--head_trajectory_dynamics_center_viz_step",
         type=int,
         default=-1,
@@ -432,6 +500,100 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="Number of frames shown in each head_trajectory_dynamics center-overlay PDF.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_support_viz_enable",
+        type=_str2bool,
+        default=False,
+        help="If true, render support-overlap binary-mask PDFs and contour PDFs for selected heads.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_support_viz_step",
+        type=int,
+        default=-1,
+        help="If >= 1, render support-overlap mask PDFs for one selected step.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_support_viz_layer",
+        type=int,
+        default=-1,
+        help="If >= 0, render support-overlap mask PDFs for one selected layer.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_support_viz_heads",
+        type=str,
+        default="",
+        help="CSV head specs `LxHy` for support-overlap mask PDFs. Empty means all heads in the selected scope.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_support_viz_num_frames",
+        type=int,
+        default=10,
+        help="Number of frames shown in each support-overlap mask PDF.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_support_viz_contour_min_component_area",
+        type=int,
+        default=4,
+        help="Minimum connected-component area required before drawing a green contour on support-overlap masks.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_support_cache_num_workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of CPU worker processes used to build missing support/motion-planning-region caches. "
+            "A non-positive value means use os.cpu_count()."
+        ),
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_cache_save_interval",
+        type=int,
+        default=512,
+        help=(
+            "Flush head_trajectory_dynamics caches every N new entries. Larger values reduce disk writes "
+            "but lose more work if the run is interrupted."
+        ),
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_hypothesis",
+        type=str,
+        default="attractor",
+        choices=["attractor", "reference-leading", "cross-layer-transmission"],
+        help="Hypothesis label used to organize head_trajectory_dynamics metric outputs into a dedicated subdirectory.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_traj_type",
+        type=str,
+        default="",
+        help="Trajectory subset label used to identify which heads are analyzed; written into output metadata.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_use_motion_planning_region_before_metrics",
+        type=_str2bool,
+        default=False,
+        help=(
+            "If true, use the contour-filtered support region as a motion-planning mask before computing "
+            "head_trajectory_dynamics metrics. Maps are zeroed outside the region and renormalized per frame."
+        ),
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_plot_only_from_csv",
+        type=_str2bool,
+        default=False,
+        help="If true, reuse existing head_trajectory_dynamics CSV outputs in output_dir and only redraw plots.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_overlay_only",
+        type=_str2bool,
+        default=False,
+        help="If true, reuse saved cross-attention maps and center cache to render overlays only, without recomputing metrics or redrawing CSV-based plots.",
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_skip_existing_plots",
+        type=_str2bool,
+        default=True,
+        help="If true, head_trajectory_dynamics plotting skips plot files that already exist.",
     )
 
     # Self-attention temporal-kernel intervention options
@@ -481,7 +643,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--self_attention_distribution_steps",
         type=str,
         default="1,2,3",
-        help="CSV diffusion steps for self_attention_distribution.",
+        help="CSV diffusion steps for self_attention_distribution. Empty means all steps [1..sampling_steps].",
     )
     parser.add_argument(
         "--self_attention_distribution_layers",
@@ -505,6 +667,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--self_attention_distribution_reference_center_power", type=float, default=1.5)
     parser.add_argument("--self_attention_distribution_reference_center_quantile", type=float, default=0.8)
+    parser.add_argument("--self_attention_distribution_reference_preprocess_winsorize_quantile", type=float, default=0.995)
+    parser.add_argument("--self_attention_distribution_reference_preprocess_despike_quantile", type=float, default=0.98)
+    parser.add_argument("--self_attention_distribution_reference_preprocess_min_component_area", type=int, default=2)
     parser.add_argument(
         "--self_attention_distribution_support_radius_mode",
         type=str,
@@ -518,6 +683,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--self_attention_distribution_query_frame_count", type=int, default=8)
     parser.add_argument("--self_attention_distribution_global_query_tokens_per_frame", type=int, default=64)
     parser.add_argument("--self_attention_distribution_object_query_token_limit_per_frame", type=int, default=0)
+    parser.add_argument(
+        "--self_attention_distribution_plot_per_head",
+        type=_str2bool,
+        default=False,
+        help="If true, export per-head self_attention_distribution plots in addition to layer-level head-mean plots.",
+    )
+    parser.add_argument(
+        "--self_attention_distribution_stop_after_last_probe_step",
+        type=_str2bool,
+        default=False,
+        help="If true, stop diffusion immediately after the last requested self_attention_distribution probe step.",
+    )
+    parser.add_argument(
+        "--self_attention_distribution_plot_only_from_csv",
+        type=_str2bool,
+        default=False,
+        help="If true, reuse existing self_attention_distribution CSV outputs in output_dir and only redraw plots.",
+    )
+    parser.add_argument(
+        "--self_attention_distribution_skip_existing_plots",
+        type=_str2bool,
+        default=True,
+        help="If true, self_attention_distribution plotting skips plot files that already exist.",
+    )
 
     # Seed-to-trajectory predictability options
     parser.add_argument(
@@ -593,6 +782,7 @@ def main():
         run_wan21_t2v_joint_attention_suite,
         run_wan21_t2v_motion_aligned_attention,
         run_wan21_t2v_rope_axis_ablation,
+        run_wan21_t2v_rope_decay_curve,
         run_wan21_t2v_cross_attn_head_ablation,
         run_wan21_t2v_seed_to_trajectory_predictability,
         run_wan21_t2v_self_attention_distribution,
@@ -618,6 +808,7 @@ def main():
     head_trajectory_dynamics_heads = _parse_csv_strs(args.head_trajectory_dynamics_heads)
     head_trajectory_dynamics_steps = _parse_csv_ints(args.head_trajectory_dynamics_steps)
     head_trajectory_dynamics_distance_metrics = _parse_csv_strs(args.head_trajectory_dynamics_distance_metrics)
+    head_trajectory_dynamics_attractor_distance_metrics = _parse_csv_strs(args.head_trajectory_dynamics_attractor_distance_metric)
     self_attn_kernel_steps = _parse_csv_ints(args.self_attn_kernel_steps)
     self_attn_kernel_layers = _parse_csv_ints(args.self_attn_kernel_layers)
     self_attn_kernel_heads = _parse_csv_strs(args.self_attn_kernel_heads)
@@ -734,9 +925,9 @@ def main():
             reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
         )
     elif experiment_name == "head_trajectory_dynamics":
-        if not target_object_words:
+        if (not args.head_trajectory_dynamics_plot_only_from_csv) and (not target_object_words):
             raise ValueError("--target_object_words is required for head_trajectory_dynamics.")
-        if not args.reuse_cross_attention_dir.strip():
+        if (not args.head_trajectory_dynamics_plot_only_from_csv) and (not args.reuse_cross_attention_dir.strip()):
             raise ValueError("--reuse_cross_attention_dir is required for head_trajectory_dynamics.")
         run_wan21_t2v_head_trajectory_dynamics(
             **common_kwargs,
@@ -749,6 +940,7 @@ def main():
             head_trajectory_dynamics_reference_layer=args.head_trajectory_dynamics_reference_layer,
             head_trajectory_dynamics_support_quantile=args.head_trajectory_dynamics_support_quantile,
             head_trajectory_dynamics_attractor_window=args.head_trajectory_dynamics_attractor_window,
+            head_trajectory_dynamics_attractor_distance_metrics=head_trajectory_dynamics_attractor_distance_metrics,
             head_trajectory_dynamics_center_method=args.head_trajectory_dynamics_center_method,
             head_trajectory_dynamics_center_power=args.head_trajectory_dynamics_center_power,
             head_trajectory_dynamics_center_quantile=args.head_trajectory_dynamics_center_quantile,
@@ -756,11 +948,45 @@ def main():
             head_trajectory_dynamics_preprocess_winsorize_quantile=args.head_trajectory_dynamics_preprocess_winsorize_quantile,
             head_trajectory_dynamics_preprocess_despike_quantile=args.head_trajectory_dynamics_preprocess_despike_quantile,
             head_trajectory_dynamics_preprocess_min_component_area=args.head_trajectory_dynamics_preprocess_min_component_area,
+            head_trajectory_dynamics_reference_center_method=args.head_trajectory_dynamics_reference_center_method,
+            head_trajectory_dynamics_reference_center_power=args.head_trajectory_dynamics_reference_center_power,
+            head_trajectory_dynamics_reference_center_quantile=args.head_trajectory_dynamics_reference_center_quantile,
+            head_trajectory_dynamics_reference_preprocessed_center_mode=args.head_trajectory_dynamics_reference_preprocessed_center_mode,
+            head_trajectory_dynamics_reference_preprocess_winsorize_quantile=args.head_trajectory_dynamics_reference_preprocess_winsorize_quantile,
+            head_trajectory_dynamics_reference_preprocess_despike_quantile=args.head_trajectory_dynamics_reference_preprocess_despike_quantile,
+            head_trajectory_dynamics_reference_preprocess_min_component_area=args.head_trajectory_dynamics_reference_preprocess_min_component_area,
+            head_trajectory_dynamics_center_viz_enable=args.head_trajectory_dynamics_center_viz_enable,
             head_trajectory_dynamics_center_viz_step=args.head_trajectory_dynamics_center_viz_step,
             head_trajectory_dynamics_center_viz_layer=args.head_trajectory_dynamics_center_viz_layer,
             head_trajectory_dynamics_center_viz_heads=_parse_csv_strs(args.head_trajectory_dynamics_center_viz_heads),
             head_trajectory_dynamics_center_viz_num_frames=args.head_trajectory_dynamics_center_viz_num_frames,
+            head_trajectory_dynamics_support_viz_enable=args.head_trajectory_dynamics_support_viz_enable,
+            head_trajectory_dynamics_support_viz_step=args.head_trajectory_dynamics_support_viz_step,
+            head_trajectory_dynamics_support_viz_layer=args.head_trajectory_dynamics_support_viz_layer,
+            head_trajectory_dynamics_support_viz_heads=_parse_csv_strs(args.head_trajectory_dynamics_support_viz_heads),
+            head_trajectory_dynamics_support_viz_num_frames=args.head_trajectory_dynamics_support_viz_num_frames,
+            head_trajectory_dynamics_support_viz_contour_min_component_area=(
+                args.head_trajectory_dynamics_support_viz_contour_min_component_area
+            ),
+            head_trajectory_dynamics_support_cache_num_workers=(
+                args.head_trajectory_dynamics_support_cache_num_workers
+            ),
+            head_trajectory_dynamics_cache_save_interval=(
+                args.head_trajectory_dynamics_cache_save_interval
+            ),
+            head_trajectory_dynamics_hypothesis=args.head_trajectory_dynamics_hypothesis,
+            head_trajectory_dynamics_traj_type=args.head_trajectory_dynamics_traj_type,
+            head_trajectory_dynamics_use_motion_planning_region_before_metrics=(
+                args.head_trajectory_dynamics_use_motion_planning_region_before_metrics
+            ),
+            head_trajectory_dynamics_plot_only_from_csv=args.head_trajectory_dynamics_plot_only_from_csv,
+            head_trajectory_dynamics_overlay_only=args.head_trajectory_dynamics_overlay_only,
+            head_trajectory_dynamics_skip_existing_plots=args.head_trajectory_dynamics_skip_existing_plots,
             reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
+        )
+    elif experiment_name == "rope_decay_curve":
+        run_wan21_t2v_rope_decay_curve(
+            **common_kwargs,
         )
     elif experiment_name == "self_attention_temporal_kernel":
         run_wan21_t2v_self_attention_temporal_kernel(
@@ -776,9 +1002,9 @@ def main():
             self_attn_token_temperature=args.self_attn_token_temperature,
         )
     elif experiment_name == "self_attention_distribution":
-        if not target_object_words:
+        if (not args.self_attention_distribution_plot_only_from_csv) and (not target_object_words):
             raise ValueError("--target_object_words is required for self_attention_distribution.")
-        if not args.reuse_cross_attention_dir.strip():
+        if (not args.self_attention_distribution_plot_only_from_csv) and (not args.reuse_cross_attention_dir.strip()):
             raise ValueError("--reuse_cross_attention_dir is required for self_attention_distribution.")
         run_wan21_t2v_self_attention_distribution(
             **common_kwargs,
@@ -793,6 +1019,9 @@ def main():
             self_attention_distribution_reference_center_mode=args.self_attention_distribution_reference_center_mode,
             self_attention_distribution_reference_center_power=args.self_attention_distribution_reference_center_power,
             self_attention_distribution_reference_center_quantile=args.self_attention_distribution_reference_center_quantile,
+            self_attention_distribution_reference_preprocess_winsorize_quantile=args.self_attention_distribution_reference_preprocess_winsorize_quantile,
+            self_attention_distribution_reference_preprocess_despike_quantile=args.self_attention_distribution_reference_preprocess_despike_quantile,
+            self_attention_distribution_reference_preprocess_min_component_area=args.self_attention_distribution_reference_preprocess_min_component_area,
             self_attention_distribution_support_radius_mode=args.self_attention_distribution_support_radius_mode,
             self_attention_distribution_support_radius_fixed=args.self_attention_distribution_support_radius_fixed,
             self_attention_distribution_support_radius_alpha=args.self_attention_distribution_support_radius_alpha,
@@ -801,6 +1030,10 @@ def main():
             self_attention_distribution_query_frame_count=args.self_attention_distribution_query_frame_count,
             self_attention_distribution_global_query_tokens_per_frame=args.self_attention_distribution_global_query_tokens_per_frame,
             self_attention_distribution_object_query_token_limit_per_frame=args.self_attention_distribution_object_query_token_limit_per_frame,
+            self_attention_distribution_plot_per_head=args.self_attention_distribution_plot_per_head,
+            self_attention_distribution_stop_after_last_probe_step=args.self_attention_distribution_stop_after_last_probe_step,
+            self_attention_distribution_plot_only_from_csv=args.self_attention_distribution_plot_only_from_csv,
+            self_attention_distribution_skip_existing_plots=args.self_attention_distribution_skip_existing_plots,
             save_video=args.save_video,
         )
     elif experiment_name == "seed_to_trajectory_predictability":

@@ -18,10 +18,8 @@ import random
 import re
 import sys
 from collections import defaultdict, deque
-from contextlib import contextmanager
-from dataclasses import dataclass
-from types import MethodType
 from typing import Dict, List, Optional, Sequence, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
 import torch.cuda.amp as amp
@@ -36,18 +34,62 @@ from .utils import (
     _js_wan21_t2v_distance_per_frame,
     _load_wan21_t2v_cross_attention_mean_maps_from_disk,
     _load_wan21_t2v_cross_attention_token_meta,
+    _map_wan21_t2v_token_frame_to_video_frame_label,
     _mean_wan21_t2v_head_maps_for_words,
     _normalize_wan21_t2v_attention_map_per_frame,
     _parse_wan21_t2v_layer_head_specs,
+    _resolve_wan21_t2v_viz_frame_indices,
     _save_csv,
     _save_json,
     _trajectory_distance_wan21_t2v_soft_centers,
 )
 
 from .head_evolution import (
+    _extract_wan21_t2v_connected_components,
     _extract_wan21_t2v_reference_peak_and_centroid_trajectory,
     _preprocess_wan21_t2v_attention_map_fhw,
 )
+
+def _get_wan21_t2v_visible_line_colors(num_colors: int) -> List[str]:
+    """Return a clean bright palette based on gist_ncar, guaranteed to have `num_colors` entries."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
+
+    if int(num_colors) <= 0:
+        return []
+
+    color_map = plt.get_cmap("gist_ncar")
+    def _adjust_gist_ncar_rgb(red: float, green: float, blue: float) -> Tuple[float, float, float]:
+        """Keep gist_ncar's vivid hue structure while avoiding near-white and near-black colors."""
+        hue, sat, val = mcolors.rgb_to_hsv((red, green, blue))
+        sat = max(0.58, float(sat))
+        val = min(max(0.72, float(val)), 0.95)
+        red_adj, green_adj, blue_adj = mcolors.hsv_to_rgb((hue, sat, val))
+
+        luminance = 0.2126 * red_adj + 0.7152 * green_adj + 0.0722 * blue_adj
+        if luminance > 0.80:
+            scale = 0.80 / max(luminance, 1e-8)
+            red_adj *= scale
+            green_adj *= scale
+            blue_adj *= scale
+        elif luminance < 0.22:
+            mix = (0.22 - luminance) / max(1e-8, 1.0 - luminance)
+            red_adj = red_adj + (1.0 - red_adj) * mix
+            green_adj = green_adj + (1.0 - green_adj) * mix
+            blue_adj = blue_adj + (1.0 - blue_adj) * mix
+        return float(red_adj), float(green_adj), float(blue_adj)
+
+    colors: List[str] = []
+    # Sample enough positions across the full map and adjust every sample instead of dropping many of them.
+    for idx in range(int(num_colors)):
+        position = (float(idx) + 0.5) / float(int(num_colors))
+        rgba = color_map(position)
+        red, green, blue = _adjust_gist_ncar_rgb(float(rgba[0]), float(rgba[1]), float(rgba[2]))
+        colors.append(mcolors.to_hex((red, green, blue)))
+    return colors
+
 
 def _plot_wan21_t2v_head_trajectory_dynamics_curve(
     rows: Sequence[Dict[str, object]],
@@ -150,7 +192,7 @@ def _plot_wan21_t2v_head_trajectory_dynamics_multihead_curve(
 
     head_tags = sorted(grouped_rows.keys())
     fig, axis = plt.subplots(1, 1, figsize=(8.6, 5.2))
-    color_map = plt.get_cmap("gist_ncar", max(1, len(head_tags)))
+    line_colors = _get_wan21_t2v_visible_line_colors(len(head_tags))
     for color_index, head_tag in enumerate(head_tags):
         head_rows = sorted(grouped_rows[head_tag], key=lambda row: int(row["step"]))
         x_steps = [int(row["step"]) for row in head_rows]
@@ -160,7 +202,7 @@ def _plot_wan21_t2v_head_trajectory_dynamics_multihead_curve(
             y_values,
             linewidth=1.35,
             alpha=0.92,
-            color=color_map(color_index),
+            color=line_colors[color_index],
             label=head_tag,
         )
 
@@ -200,13 +242,13 @@ def _plot_wan21_t2v_head_trajectory_centers(
         all_x.append(float(row["center_x"]))
 
     fig, axis = plt.subplots(1, 1, figsize=(7.2, 6.0))
-    color_map = plt.get_cmap("tab20", max(1, len(grouped)))
+    line_colors = _get_wan21_t2v_visible_line_colors(len(grouped))
     for color_index, head_tag in enumerate(sorted(grouped.keys())):
         rows_for_head = sorted(grouped[head_tag], key=lambda row: int(row["frame"]))
         ys = [float(row["center_y"]) for row in rows_for_head]
         xs = [float(row["center_x"]) for row in rows_for_head]
-        axis.plot(xs, ys, linewidth=1.8, alpha=0.92, color=color_map(color_index), label=head_tag)
-        axis.scatter([xs[0]], [ys[0]], s=18, color=color_map(color_index), alpha=0.95)
+        axis.plot(xs, ys, linewidth=1.8, alpha=0.92, color=line_colors[color_index], label=head_tag)
+        axis.scatter([xs[0]], [ys[0]], s=18, color=line_colors[color_index], alpha=0.95)
 
     axis.set_title(title)
     axis.set_xlabel("token-x")
@@ -232,6 +274,7 @@ def _plot_wan21_t2v_head_trajectory_center_overlay(
     save_file: str,
     title: str,
     num_frames: int = 10,
+    video_frame_count: Optional[int] = None,
 ):
     """Visualize per-frame probability maps with overlaid extracted centers."""
     import matplotlib
@@ -249,16 +292,35 @@ def _plot_wan21_t2v_head_trajectory_center_overlay(
 
     if int(num_frames) <= 0 or int(num_frames) >= frame_count:
         frame_indices = list(range(frame_count))
+        frame_labels = [
+            _map_wan21_t2v_token_frame_to_video_frame_label(
+                token_frame_idx=int(frame_index),
+                token_frame_count=int(frame_count),
+                video_frame_count=(
+                    int(video_frame_count)
+                    if video_frame_count is not None else int(frame_count)
+                ),
+            )
+            for frame_index in frame_indices
+        ]
     else:
-        frame_indices = (
-            torch.linspace(0, frame_count - 1, steps=int(num_frames))
-            .round()
-            .long()
-            .unique(sorted=True)
-            .tolist()
+        frame_indices, frame_labels = _resolve_wan21_t2v_viz_frame_indices(
+            attention_frame_count=int(frame_count),
+            video_frame_count=int(video_frame_count) if video_frame_count is not None else int(frame_count),
+            num_frames=int(num_frames),
+            explicit_indices=None,
         )
+        frame_pairs = [
+            (int(frame_index), int(frame_label))
+            for frame_index, frame_label in zip(frame_indices, frame_labels)
+            if 0 <= int(frame_index) < frame_count
+        ]
+        frame_indices = [int(frame_index) for frame_index, _ in frame_pairs]
+        frame_labels = [int(frame_label) for _, frame_label in frame_pairs]
 
     num_panels = len(frame_indices)
+    if num_panels <= 0:
+        return ""
     fig_width = max(2.8 * num_panels, 8.0)
     fig, axes = plt.subplots(1, num_panels, figsize=(fig_width, 3.2))
     if num_panels == 1:
@@ -267,21 +329,21 @@ def _plot_wan21_t2v_head_trajectory_center_overlay(
     global_max = float(probability_map_fhw.max().item()) if probability_map_fhw.numel() > 0 else 1.0
     global_max = max(global_max, 1e-8)
 
-    for axis, frame_index in zip(axes, frame_indices):
+    for axis, frame_index, frame_label in zip(axes, frame_indices, frame_labels):
         frame_map = probability_map_fhw[int(frame_index)].detach().cpu().float()
         center_y = float(center_f2[int(frame_index), 0].item())
         center_x = float(center_f2[int(frame_index), 1].item())
-        axis.imshow(frame_map.numpy(), cmap="viridis", vmin=0.0, vmax=global_max)
+        axis.imshow(frame_map.numpy(), cmap="magma", vmin=0.0, vmax=global_max, alpha=0.92)
         axis.scatter(
             [center_x],
             [center_y],
             s=36,
-            c=["#ff3b30"],
+            c=["#22c55e"],
             marker="o",
             edgecolors="white",
             linewidths=0.9,
         )
-        axis.set_title(f"frame={int(frame_index)}", fontsize=9)
+        axis.set_title(f"frame={int(frame_label)}", fontsize=9)
         axis.set_xticks([])
         axis.set_yticks([])
 
@@ -289,6 +351,588 @@ def _plot_wan21_t2v_head_trajectory_center_overlay(
     fig.tight_layout()
     _ensure_dir(os.path.dirname(save_file))
     fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _build_wan21_t2v_support_mask_fhw(
+    probability_map_fhw: torch.Tensor,
+    quantile: float,
+) -> torch.Tensor:
+    """Build the exact binary support masks used by support-overlap IoU."""
+    if probability_map_fhw.dim() != 3:
+        raise ValueError(f"Expected [F, H, W], got shape={tuple(probability_map_fhw.shape)}")
+    flat_map = probability_map_fhw.reshape(probability_map_fhw.size(0), -1)
+    threshold = torch.quantile(flat_map, q=float(quantile), dim=1, keepdim=True)
+    return (flat_map >= threshold).reshape_as(probability_map_fhw)
+
+
+def _build_wan21_t2v_motion_planning_region_mask_fhw(
+    probability_map_fhw: torch.Tensor,
+    quantile: float,
+    min_component_area: int,
+) -> torch.Tensor:
+    """Build the denoised support-region mask used as a motion-planning region."""
+    support_mask_fhw = _build_wan21_t2v_support_mask_fhw(
+        probability_map_fhw=probability_map_fhw,
+        quantile=float(quantile),
+    )
+    if support_mask_fhw.dim() != 3:
+        raise ValueError(f"Expected [F, H, W], got shape={tuple(support_mask_fhw.shape)}")
+
+    frame_count = int(support_mask_fhw.size(0))
+    filtered_mask = torch.zeros_like(support_mask_fhw, dtype=torch.bool)
+    area_threshold = max(1, int(min_component_area))
+    for frame_index in range(frame_count):
+        frame_mask = _build_wan21_t2v_filtered_support_mask_hw(
+            binary_mask_hw=support_mask_fhw[frame_index],
+            min_component_area=area_threshold,
+        )
+        if bool(frame_mask.any().item()):
+            filtered_mask[frame_index] = frame_mask
+        else:
+            filtered_mask[frame_index] = support_mask_fhw[frame_index]
+    return filtered_mask
+
+
+def _build_wan21_t2v_motion_planning_region_mask_task(
+    task: Tuple[int, int, int, torch.Tensor, float, int],
+) -> Tuple[Tuple[int, int, int], torch.Tensor]:
+    """Worker task used to build one motion-planning-region mask in parallel."""
+    step, layer, head, probability_map_fhw, quantile, min_component_area = task
+    key = (int(step), int(layer), int(head))
+    mask = _build_wan21_t2v_motion_planning_region_mask_fhw(
+        probability_map_fhw=probability_map_fhw,
+        quantile=float(quantile),
+        min_component_area=int(min_component_area),
+    )
+    return key, mask
+
+
+def _resolve_wan21_t2v_motion_planning_region_num_workers(requested_num_workers: int, task_count: int) -> int:
+    """Resolve the effective number of worker processes for support-cache building."""
+    if int(task_count) <= 0:
+        return 0
+    if int(requested_num_workers) <= 0:
+        requested_num_workers = int(os.cpu_count() or 1)
+    return max(1, min(int(requested_num_workers), int(task_count)))
+
+
+def _materialize_wan21_t2v_motion_planning_region_masks(
+    probability_maps_by_step_layer_head: Dict[Tuple[int, int, int], torch.Tensor],
+    cache_payload: Dict[str, object],
+    cache_path: str,
+    support_quantile: float,
+    min_component_area: int,
+    num_workers: int,
+    progress_desc: str,
+    cache_save_interval: int = 256,
+) -> Tuple[Dict[Tuple[int, int, int], torch.Tensor], int, int]:
+    """Load cached motion-planning masks and build the missing ones, optionally in parallel."""
+    mask_by_key: Dict[Tuple[int, int, int], torch.Tensor] = {}
+    cache_hits = 0
+    cache_misses = 0
+    pending_cache_writes = 0
+    keys = sorted(probability_maps_by_step_layer_head.keys())
+    if not keys:
+        return mask_by_key, cache_hits, cache_misses
+
+    progress_bar = None
+    try:
+        from tqdm import tqdm
+
+        progress_bar = tqdm(
+            total=int(len(keys)),
+            desc=str(progress_desc),
+            unit="head",
+            leave=True,
+        )
+    except Exception:
+        progress_bar = None
+
+    missing_tasks: List[Tuple[int, int, int, torch.Tensor, float, int]] = []
+    try:
+        for step_index, layer_index, head_index in keys:
+            cached_mask = _get_wan21_t2v_cached_motion_planning_region_mask(
+                cache_payload=cache_payload,
+                step=int(step_index),
+                layer=int(layer_index),
+                head=int(head_index),
+            )
+            if cached_mask is not None:
+                mask_by_key[(int(step_index), int(layer_index), int(head_index))] = cached_mask
+                cache_hits += 1
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                continue
+            missing_tasks.append(
+                (
+                    int(step_index),
+                    int(layer_index),
+                    int(head_index),
+                    probability_maps_by_step_layer_head[(int(step_index), int(layer_index), int(head_index))],
+                    float(support_quantile),
+                    int(min_component_area),
+                )
+            )
+
+        effective_num_workers = _resolve_wan21_t2v_motion_planning_region_num_workers(
+            requested_num_workers=int(num_workers),
+            task_count=int(len(missing_tasks)),
+        )
+        if effective_num_workers <= 1:
+            for task in missing_tasks:
+                key, mask = _build_wan21_t2v_motion_planning_region_mask_task(task)
+                mask_by_key[key] = mask
+                _set_wan21_t2v_cached_motion_planning_region_mask(
+                    cache_payload=cache_payload,
+                    step=int(key[0]),
+                    layer=int(key[1]),
+                    head=int(key[2]),
+                    mask_fhw=mask,
+                )
+                cache_misses += 1
+                pending_cache_writes += 1
+                if pending_cache_writes >= int(cache_save_interval):
+                    _save_wan21_t2v_motion_planning_region_cache(cache_path, cache_payload)
+                    pending_cache_writes = 0
+                if progress_bar is not None:
+                    progress_bar.update(1)
+        else:
+            with ProcessPoolExecutor(max_workers=int(effective_num_workers)) as executor:
+                futures = [
+                    executor.submit(_build_wan21_t2v_motion_planning_region_mask_task, task)
+                    for task in missing_tasks
+                ]
+                for future in as_completed(futures):
+                    key, mask = future.result()
+                    mask_by_key[key] = mask
+                    _set_wan21_t2v_cached_motion_planning_region_mask(
+                        cache_payload=cache_payload,
+                        step=int(key[0]),
+                        layer=int(key[1]),
+                        head=int(key[2]),
+                        mask_fhw=mask,
+                    )
+                    cache_misses += 1
+                    pending_cache_writes += 1
+                    if pending_cache_writes >= int(cache_save_interval):
+                        _save_wan21_t2v_motion_planning_region_cache(cache_path, cache_payload)
+                        pending_cache_writes = 0
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+        if pending_cache_writes > 0:
+            _save_wan21_t2v_motion_planning_region_cache(cache_path, cache_payload)
+            pending_cache_writes = 0
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+    return mask_by_key, cache_hits, cache_misses
+
+
+def _build_wan21_t2v_motion_planning_region_masks_with_progress(
+    probability_maps_by_step_layer_head: Dict[Tuple[int, int, int], torch.Tensor],
+    cache_payload: Dict[str, object],
+    cache_path: str,
+    support_quantile: float,
+    min_component_area: int,
+    num_workers: int,
+    cache_save_interval: int,
+):
+    """Wrapper used by the top-level stage to expose the exact user-facing progress-bar name."""
+    return _materialize_wan21_t2v_motion_planning_region_masks(
+        probability_maps_by_step_layer_head=probability_maps_by_step_layer_head,
+        cache_payload=cache_payload,
+        cache_path=cache_path,
+        support_quantile=float(support_quantile),
+        min_component_area=int(min_component_area),
+        num_workers=int(num_workers),
+        progress_desc="head_trajectory motion-planning regions",
+        cache_save_interval=int(cache_save_interval),
+    )
+
+
+def _materialize_wan21_t2v_motion_planning_filtered_maps(
+    probability_maps_by_step_layer_head: Dict[Tuple[int, int, int], torch.Tensor],
+    motion_planning_region_masks_by_step_layer_head: Dict[Tuple[int, int, int], torch.Tensor],
+    progress_desc: str,
+) -> Dict[Tuple[int, int, int], torch.Tensor]:
+    """Apply motion-planning masks to all heads with one visible progress bar."""
+    filtered_probability_maps_by_key: Dict[Tuple[int, int, int], torch.Tensor] = {}
+    keys = sorted(probability_maps_by_step_layer_head.keys())
+    if not keys:
+        return filtered_probability_maps_by_key
+
+    progress_bar = None
+    try:
+        from tqdm import tqdm
+
+        progress_bar = tqdm(
+            total=int(len(keys)),
+            desc=str(progress_desc),
+            unit="head",
+            leave=True,
+        )
+    except Exception:
+        progress_bar = None
+
+    try:
+        for key in keys:
+            raw_probability_map = probability_maps_by_step_layer_head[key]
+            motion_planning_region_mask = motion_planning_region_masks_by_step_layer_head[key]
+            filtered_probability_maps_by_key[key] = _apply_wan21_t2v_motion_planning_region_to_probability_map(
+                probability_map_fhw=raw_probability_map,
+                motion_planning_region_mask_fhw=motion_planning_region_mask,
+            )
+            if progress_bar is not None:
+                progress_bar.update(1)
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+    return filtered_probability_maps_by_key
+
+
+def _materialize_wan21_t2v_motion_planning_filtered_centers(
+    filtered_probability_maps_by_step_layer_head: Dict[Tuple[int, int, int], torch.Tensor],
+    filtered_center_cache_payload: Dict[str, object],
+    filtered_center_cache_path: str,
+    center_config: Dict[str, object],
+    progress_desc: str,
+    cache_save_interval: int = 256,
+) -> Tuple[Dict[Tuple[int, int, int], torch.Tensor], int, int]:
+    """Extract filtered centers from already-filtered maps with one visible progress bar."""
+    filtered_center_trajectories_by_key: Dict[Tuple[int, int, int], torch.Tensor] = {}
+    cache_hits = 0
+    cache_misses = 0
+    pending_cache_writes = 0
+    keys = sorted(filtered_probability_maps_by_step_layer_head.keys())
+    if not keys:
+        return filtered_center_trajectories_by_key, cache_hits, cache_misses
+
+    progress_bar = None
+    try:
+        from tqdm import tqdm
+
+        progress_bar = tqdm(
+            total=int(len(keys)),
+            desc=str(progress_desc),
+            unit="head",
+            leave=True,
+        )
+    except Exception:
+        progress_bar = None
+
+    try:
+        for step_index, layer_index, head_index in keys:
+            key = (int(step_index), int(layer_index), int(head_index))
+            cached_trajectory = _get_wan21_t2v_cached_center_trajectory(
+                cache_payload=filtered_center_cache_payload,
+                step=int(step_index),
+                layer=int(layer_index),
+                head=int(head_index),
+            )
+            if cached_trajectory is None:
+                filtered_center_trajectory, _ = _extract_wan21_t2v_head_trajectory_centers(
+                    map_fhw=filtered_probability_maps_by_step_layer_head[key],
+                    center_method=str(center_config["center_method"]),
+                    center_power=float(center_config["center_power"]),
+                    center_quantile=float(center_config["center_quantile"]),
+                    preprocessed_center_mode=str(center_config["preprocessed_center_mode"]),
+                    preprocess_winsorize_quantile=float(center_config["preprocess_winsorize_quantile"]),
+                    preprocess_despike_quantile=float(center_config["preprocess_despike_quantile"]),
+                    preprocess_min_component_area=int(center_config["preprocess_min_component_area"]),
+                )
+                _set_wan21_t2v_cached_center_trajectory(
+                    cache_payload=filtered_center_cache_payload,
+                    step=int(step_index),
+                    layer=int(layer_index),
+                    head=int(head_index),
+                    trajectory=filtered_center_trajectory,
+                )
+                filtered_center_trajectories_by_key[key] = _center_trajectory_wan21_t2v_to_tensor(
+                    filtered_center_trajectory
+                )
+                cache_misses += 1
+                pending_cache_writes += 1
+                if pending_cache_writes >= int(cache_save_interval):
+                    _save_wan21_t2v_head_trajectory_cache(
+                        filtered_center_cache_path,
+                        filtered_center_cache_payload,
+                    )
+                    pending_cache_writes = 0
+            else:
+                filtered_center_trajectories_by_key[key] = _center_trajectory_wan21_t2v_to_tensor(cached_trajectory)
+                cache_hits += 1
+            if progress_bar is not None:
+                progress_bar.update(1)
+        if pending_cache_writes > 0:
+            _save_wan21_t2v_head_trajectory_cache(
+                filtered_center_cache_path,
+                filtered_center_cache_payload,
+            )
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+    return filtered_center_trajectories_by_key, cache_hits, cache_misses
+
+
+def _extract_wan21_t2v_support_connected_components(
+    binary_mask_hw: torch.Tensor,
+) -> List[List[Tuple[int, int]]]:
+    """Extract 4-neighborhood connected components for support-mask contour filtering."""
+    if binary_mask_hw.dim() != 2:
+        raise ValueError(f"Expected [H, W], got shape={tuple(binary_mask_hw.shape)}")
+
+    token_grid_height, token_grid_width = binary_mask_hw.shape
+    visited_mask = torch.zeros_like(binary_mask_hw, dtype=torch.bool)
+    components: List[List[Tuple[int, int]]] = []
+    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    for y_index in range(int(token_grid_height)):
+        for x_index in range(int(token_grid_width)):
+            if not bool(binary_mask_hw[y_index, x_index].item()):
+                continue
+            if bool(visited_mask[y_index, x_index].item()):
+                continue
+            visited_mask[y_index, x_index] = True
+            queue = deque([(y_index, x_index)])
+            current_component: List[Tuple[int, int]] = []
+            while queue:
+                current_y, current_x = queue.popleft()
+                if not bool(binary_mask_hw[current_y, current_x].item()):
+                    continue
+                current_component.append((int(current_y), int(current_x)))
+                for delta_y, delta_x in neighbors:
+                    next_y = current_y + delta_y
+                    next_x = current_x + delta_x
+                    if next_y < 0 or next_y >= int(token_grid_height) or next_x < 0 or next_x >= int(token_grid_width):
+                        continue
+                    if bool(visited_mask[next_y, next_x].item()):
+                        continue
+                    visited_mask[next_y, next_x] = True
+                    queue.append((next_y, next_x))
+            if current_component:
+                components.append(current_component)
+    return components
+
+
+def _build_wan21_t2v_filtered_support_mask_hw(
+    binary_mask_hw: torch.Tensor,
+    min_component_area: int,
+) -> torch.Tensor:
+    """Keep only sufficiently large 4-connected support components for contour drawing."""
+    if binary_mask_hw.dim() != 2:
+        raise ValueError(f"Expected [H, W], got shape={tuple(binary_mask_hw.shape)}")
+    components = _extract_wan21_t2v_support_connected_components(binary_mask_hw.bool())
+    filtered_mask = torch.zeros_like(binary_mask_hw, dtype=torch.bool)
+    area_threshold = max(1, int(min_component_area))
+    for component in components:
+        if len(component) < area_threshold:
+            continue
+        for y_index, x_index in component:
+            filtered_mask[int(y_index), int(x_index)] = True
+    return filtered_mask
+
+
+def _build_wan21_t2v_motion_planning_region_cache_basename(
+    support_quantile: float,
+    contour_min_component_area: int,
+) -> str:
+    """Build a descriptive cache basename for support-region masks."""
+    return "_".join(
+        [
+            "head_trajectory_dynamics_motion_planning_region_cache",
+            f"q_{_format_wan21_t2v_value_for_filename(support_quantile)}",
+            f"mca_{int(contour_min_component_area)}",
+        ]
+    ) + ".json"
+
+
+def _load_wan21_t2v_motion_planning_region_cache(cache_path: str) -> Dict[str, object]:
+    """Load one motion-planning-region cache file if present."""
+    candidate_paths = [cache_path, f"{cache_path}.bak"]
+    for candidate_path in candidate_paths:
+        if not os.path.exists(candidate_path):
+            continue
+        try:
+            with open(candidate_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                loaded.setdefault("masks", {})
+                return loaded
+        except Exception:
+            continue
+    return {"masks": {}}
+
+
+def _save_wan21_t2v_motion_planning_region_cache(cache_path: str, payload: Dict[str, object]):
+    """Save one motion-planning-region cache file."""
+    _ensure_dir(os.path.dirname(cache_path))
+    tmp_path = f"{cache_path}.tmp"
+    bak_path = f"{cache_path}.bak"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if os.path.exists(cache_path):
+        try:
+            if os.path.exists(bak_path):
+                os.remove(bak_path)
+        except Exception:
+            pass
+        try:
+            os.replace(cache_path, bak_path)
+        except Exception:
+            pass
+    os.replace(tmp_path, cache_path)
+
+
+def _get_wan21_t2v_cached_motion_planning_region_mask(
+    cache_payload: Dict[str, object],
+    step: int,
+    layer: int,
+    head: int,
+) -> Optional[torch.Tensor]:
+    """Return cached motion-planning mask if present."""
+    masks = cache_payload.get("masks", {})
+    if not isinstance(masks, dict):
+        return None
+    step_payload = masks.get(str(int(step)), {})
+    layer_payload = step_payload.get(str(int(layer)), {}) if isinstance(step_payload, dict) else {}
+    head_payload = layer_payload.get(str(int(head))) if isinstance(layer_payload, dict) else None
+    if not isinstance(head_payload, dict):
+        return None
+
+    shape = head_payload.get("shape", [])
+    positive_indices_by_frame = head_payload.get("positive_indices_by_frame", [])
+    if not isinstance(shape, (list, tuple)) or len(shape) != 3:
+        return None
+    if not isinstance(positive_indices_by_frame, list):
+        return None
+
+    try:
+        frame_count = int(shape[0])
+        token_grid_height = int(shape[1])
+        token_grid_width = int(shape[2])
+    except Exception:
+        return None
+
+    mask = torch.zeros((frame_count, token_grid_height, token_grid_width), dtype=torch.bool)
+    for frame_index, positive_indices in enumerate(positive_indices_by_frame):
+        if not isinstance(positive_indices, list):
+            return None
+        flat = mask[frame_index].reshape(-1)
+        for flat_index in positive_indices:
+            try:
+                flat[int(flat_index)] = True
+            except Exception:
+                return None
+    return mask
+
+
+def _set_wan21_t2v_cached_motion_planning_region_mask(
+    cache_payload: Dict[str, object],
+    step: int,
+    layer: int,
+    head: int,
+    mask_fhw: torch.Tensor,
+):
+    """Insert or overwrite one cached motion-planning-region mask."""
+    if mask_fhw.dim() != 3:
+        raise ValueError(f"Expected [F, H, W], got shape={tuple(mask_fhw.shape)}")
+    masks = cache_payload.setdefault("masks", {})
+    step_payload = masks.setdefault(str(int(step)), {})
+    layer_payload = step_payload.setdefault(str(int(layer)), {})
+    layer_payload[str(int(head))] = {
+        "shape": [int(mask_fhw.size(0)), int(mask_fhw.size(1)), int(mask_fhw.size(2))],
+        "positive_indices_by_frame": [
+            [int(index) for index in torch.nonzero(mask_fhw[frame_index].reshape(-1), as_tuple=False).reshape(-1).tolist()]
+            for frame_index in range(int(mask_fhw.size(0)))
+        ],
+    }
+
+
+def _plot_wan21_t2v_support_overlap_mask_panels(
+    binary_mask_fhw: torch.Tensor,
+    save_file: str,
+    title: str,
+    num_frames: int = 10,
+    contour_min_component_area: int = 4,
+    draw_contours: bool = False,
+    video_frame_count: Optional[int] = None,
+) -> str:
+    """Visualize support-overlap binary masks with optional green connected-component contours."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if binary_mask_fhw.dim() != 3:
+        raise ValueError(f"Expected [F, H, W], got shape={tuple(binary_mask_fhw.shape)}")
+
+    frame_count = int(binary_mask_fhw.size(0))
+    if frame_count <= 0:
+        return ""
+
+    if int(num_frames) <= 0 or int(num_frames) >= frame_count:
+        frame_indices = list(range(frame_count))
+        frame_labels = [
+            _map_wan21_t2v_token_frame_to_video_frame_label(
+                token_frame_idx=int(frame_index),
+                token_frame_count=int(frame_count),
+                video_frame_count=(
+                    int(video_frame_count)
+                    if video_frame_count is not None else int(frame_count)
+                ),
+            )
+            for frame_index in frame_indices
+        ]
+    else:
+        frame_indices, frame_labels = _resolve_wan21_t2v_viz_frame_indices(
+            attention_frame_count=int(frame_count),
+            video_frame_count=int(video_frame_count) if video_frame_count is not None else int(frame_count),
+            num_frames=int(num_frames),
+            explicit_indices=None,
+        )
+        frame_pairs = [
+            (int(frame_index), int(frame_label))
+            for frame_index, frame_label in zip(frame_indices, frame_labels)
+            if 0 <= int(frame_index) < frame_count
+        ]
+        frame_indices = [int(frame_index) for frame_index, _ in frame_pairs]
+        frame_labels = [int(frame_label) for _, frame_label in frame_pairs]
+
+    num_panels = len(frame_indices)
+    if num_panels <= 0:
+        return ""
+    fig_width = max(2.75 * num_panels, 8.0)
+    fig, axes = plt.subplots(1, num_panels, figsize=(fig_width, 3.25), facecolor="white")
+    if num_panels == 1:
+        axes = [axes]
+
+    for axis, frame_index, frame_label in zip(axes, frame_indices, frame_labels):
+        frame_mask = binary_mask_fhw[int(frame_index)].detach().cpu().bool()
+        axis.imshow(frame_mask.float().numpy(), cmap="gray", vmin=0.0, vmax=1.0)
+        if bool(draw_contours):
+            filtered_mask = _build_wan21_t2v_filtered_support_mask_hw(
+                binary_mask_hw=frame_mask,
+                min_component_area=int(contour_min_component_area),
+            )
+            if bool(filtered_mask.any().item()):
+                axis.contour(
+                    filtered_mask.float().numpy(),
+                    levels=[0.5],
+                    colors=["#22c55e"],
+                    linewidths=1.6,
+                )
+        axis.set_title(f"frame={int(frame_label)}", fontsize=9)
+        axis.set_xticks([])
+        axis.set_yticks([])
+        axis.set_facecolor("white")
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf", facecolor="white")
     plt.close(fig)
     return save_file
 
@@ -335,21 +979,129 @@ def _build_wan21_t2v_head_trajectory_cache_basename(
         )
     return "_".join(parts) + ".json"
 
+
+def _build_wan21_t2v_filtered_center_cache_basename(
+    ordinary_center_config: Dict[str, object],
+    reference_center_config: Dict[str, object],
+    support_quantile: float,
+    support_viz_contour_min_component_area: int,
+    reference_step: int,
+    reference_layer: int,
+) -> str:
+    """Build a cache basename for motion-planning filtered center trajectories."""
+    ordinary_method = str(ordinary_center_config["center_method"]).strip().lower()
+    if ordinary_method == "region_centroid":
+        ordinary_part = "_".join(
+            [
+                "ordinary_head",
+                "region_centroid",
+                f"q_{_format_wan21_t2v_value_for_filename(ordinary_center_config['center_quantile'])}",
+                f"p_{_format_wan21_t2v_value_for_filename(ordinary_center_config['center_power'])}",
+            ]
+        )
+    elif ordinary_method == "preprocessed_component_center":
+        ordinary_part = "_".join(
+            [
+                "ordinary_head",
+                "preprocessed_component_center",
+                f"mode_{_format_wan21_t2v_value_for_filename(ordinary_center_config['preprocessed_center_mode'])}",
+                f"q_{_format_wan21_t2v_value_for_filename(ordinary_center_config['center_quantile'])}",
+                f"p_{_format_wan21_t2v_value_for_filename(ordinary_center_config['center_power'])}",
+                f"wq_{_format_wan21_t2v_value_for_filename(ordinary_center_config['preprocess_winsorize_quantile'])}",
+                f"dq_{_format_wan21_t2v_value_for_filename(ordinary_center_config['preprocess_despike_quantile'])}",
+                f"mca_{int(ordinary_center_config['preprocess_min_component_area'])}",
+            ]
+        )
+    else:
+        raise ValueError(
+            "ordinary_center_config['center_method'] must be one of "
+            "{'region_centroid', 'preprocessed_component_center'}, "
+            f"got: {ordinary_center_config['center_method']}"
+        )
+
+    parts = [
+        "head_trajectory_dynamics_filtered_trajectory_cache",
+        ordinary_part,
+        f"support_q_{_format_wan21_t2v_value_for_filename(support_quantile)}",
+        f"support_mca_{int(support_viz_contour_min_component_area)}",
+        f"ref_s_{int(reference_step)}",
+        f"ref_l_{int(reference_layer)}",
+    ]
+    return "_".join(parts) + ".json"
+
 def _load_wan21_t2v_head_trajectory_cache(cache_path: str) -> Dict[str, object]:
     """Load one trajectory-cache JSON file if it exists, otherwise create an empty cache payload."""
-    if os.path.exists(cache_path):
-        with open(cache_path, "r", encoding="utf-8") as handle:
-            loaded = json.load(handle)
-        if isinstance(loaded, dict):
-            loaded.setdefault("trajectories", {})
-            return loaded
+    candidate_paths = [cache_path, f"{cache_path}.bak"]
+    for candidate_path in candidate_paths:
+        if not os.path.exists(candidate_path):
+            continue
+        try:
+            with open(candidate_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                loaded.setdefault("trajectories", {})
+                return loaded
+        except Exception:
+            continue
     return {"trajectories": {}}
 
 def _save_wan21_t2v_head_trajectory_cache(cache_path: str, payload: Dict[str, object]):
     """Write one trajectory-cache JSON payload to disk."""
     _ensure_dir(os.path.dirname(cache_path))
-    with open(cache_path, "w", encoding="utf-8") as handle:
+    tmp_path = f"{cache_path}.tmp"
+    bak_path = f"{cache_path}.bak"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if os.path.exists(cache_path):
+        try:
+            if os.path.exists(bak_path):
+                os.remove(bak_path)
+        except Exception:
+            pass
+        try:
+            os.replace(cache_path, bak_path)
+        except Exception:
+            pass
+    os.replace(tmp_path, cache_path)
+
+
+def _build_wan21_t2v_head_trajectory_metrics_subdir(
+    hypothesis_name: str,
+    use_motion_planning_region_before_metrics: bool,
+) -> str:
+    """Build the metrics-output subdirectory name."""
+    return "_".join(
+        [
+            f"hypothesis_{_format_wan21_t2v_value_for_filename(hypothesis_name)}",
+            (
+                "motion_planning_region_on"
+                if bool(use_motion_planning_region_before_metrics)
+                else "motion_planning_region_off"
+            ),
+        ]
+    )
+
+
+def _apply_wan21_t2v_motion_planning_region_to_probability_map(
+    probability_map_fhw: torch.Tensor,
+    motion_planning_region_mask_fhw: torch.Tensor,
+) -> torch.Tensor:
+    """Zero out probabilities outside the motion-planning region and renormalize each frame."""
+    if tuple(probability_map_fhw.shape) != tuple(motion_planning_region_mask_fhw.shape):
+        raise ValueError(
+            "Motion-planning-region mask shape must match probability map shape, "
+            f"got {tuple(probability_map_fhw.shape)} vs {tuple(motion_planning_region_mask_fhw.shape)}"
+        )
+    filtered_map = probability_map_fhw.detach().float() * motion_planning_region_mask_fhw.detach().float()
+    frame_sums = filtered_map.reshape(filtered_map.size(0), -1).sum(dim=1)
+    if bool((frame_sums <= 1e-12).any().item()):
+        fallback = probability_map_fhw.detach().float()
+        empty_frames = (frame_sums <= 1e-12).nonzero(as_tuple=False).reshape(-1).tolist()
+        for frame_index in empty_frames:
+            filtered_map[int(frame_index)] = fallback[int(frame_index)]
+    return _normalize_wan21_t2v_attention_map_per_frame(filtered_map)
 
 def _get_wan21_t2v_cached_center_trajectory(
     cache_payload: Dict[str, object],
@@ -372,6 +1124,32 @@ def _get_wan21_t2v_cached_center_trajectory(
             return None
         out.append((float(point[0]), float(point[1])))
     return out
+
+
+def _get_wan21_t2v_cached_reference_center_trajectory(
+    cache_payload: Dict[str, object],
+) -> Optional[List[Tuple[float, float]]]:
+    """Return the cached filtered reference trajectory if present."""
+    payload = cache_payload.get("reference_center_trajectory", None)
+    if not isinstance(payload, list):
+        return None
+    out: List[Tuple[float, float]] = []
+    for point in payload:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            return None
+        out.append((float(point[0]), float(point[1])))
+    return out
+
+
+def _set_wan21_t2v_cached_reference_center_trajectory(
+    cache_payload: Dict[str, object],
+    trajectory: Sequence[Tuple[float, float]],
+):
+    """Insert or overwrite the cached filtered reference trajectory."""
+    cache_payload["reference_center_trajectory"] = [
+        [float(point_y), float(point_x)]
+        for point_y, point_x in trajectory
+    ]
 
 def _set_wan21_t2v_cached_center_trajectory(
     cache_payload: Dict[str, object],
@@ -459,6 +1237,105 @@ def _extract_wan21_t2v_head_trajectory_centers(
     )
     return trajectory, stats
 
+def _resolve_wan21_t2v_head_trajectory_center_config(
+    center_method: str,
+    center_power: float,
+    center_quantile: float,
+    preprocessed_center_mode: str,
+    preprocess_winsorize_quantile: float,
+    preprocess_despike_quantile: float,
+    preprocess_min_component_area: int,
+) -> Dict[str, object]:
+    """Normalize one center-extraction config into a validated dictionary."""
+    method_name = str(center_method).strip().lower()
+    if method_name not in {"region_centroid", "preprocessed_component_center"}:
+        raise ValueError(
+            "center_method must be one of {'region_centroid', 'preprocessed_component_center'}, "
+            f"got: {center_method}"
+        )
+
+    center_mode_name = str(preprocessed_center_mode).strip().lower()
+    if center_mode_name not in {"peak", "centroid", "geometric_center"}:
+        raise ValueError(
+            "preprocessed_center_mode must be one of {'peak', 'centroid', 'geometric_center'}, "
+            f"got: {preprocessed_center_mode}"
+        )
+
+    return {
+        "center_method": method_name,
+        "center_power": float(center_power),
+        "center_quantile": float(center_quantile),
+        "preprocessed_center_mode": center_mode_name,
+        "preprocess_winsorize_quantile": float(preprocess_winsorize_quantile),
+        "preprocess_despike_quantile": float(preprocess_despike_quantile),
+        "preprocess_min_component_area": int(preprocess_min_component_area),
+    }
+
+def _resolve_wan21_t2v_head_trajectory_reference_center_config(
+    ordinary_center_config: Dict[str, object],
+    reference_center_method: str,
+    reference_center_power: float,
+    reference_center_quantile: float,
+    reference_preprocessed_center_mode: str,
+    reference_preprocess_winsorize_quantile: float,
+    reference_preprocess_despike_quantile: float,
+    reference_preprocess_min_component_area: int,
+) -> Dict[str, object]:
+    """Resolve reference-center config with fallback to ordinary-head settings."""
+    method_raw = str(reference_center_method).strip().lower()
+    if method_raw in {"", "same_as_head"}:
+        method_name = str(ordinary_center_config["center_method"])
+    elif method_raw in {"region_centroid", "preprocessed_component_center"}:
+        method_name = method_raw
+    else:
+        raise ValueError(
+            "head_trajectory_dynamics_reference_center_method must be one of "
+            "{'same_as_head', 'region_centroid', 'preprocessed_component_center'}, "
+            f"got: {reference_center_method}"
+        )
+
+    mode_raw = str(reference_preprocessed_center_mode).strip().lower()
+    if mode_raw in {"", "same_as_head"}:
+        center_mode_name = str(ordinary_center_config["preprocessed_center_mode"])
+    elif mode_raw in {"peak", "centroid", "geometric_center"}:
+        center_mode_name = mode_raw
+    else:
+        raise ValueError(
+            "head_trajectory_dynamics_reference_preprocessed_center_mode must be one of "
+            "{'same_as_head', 'peak', 'centroid', 'geometric_center'}, "
+            f"got: {reference_preprocessed_center_mode}"
+        )
+
+    return {
+        "center_method": method_name,
+        "center_power": (
+            float(ordinary_center_config["center_power"])
+            if float(reference_center_power) < 0.0
+            else float(reference_center_power)
+        ),
+        "center_quantile": (
+            float(ordinary_center_config["center_quantile"])
+            if float(reference_center_quantile) < 0.0
+            else float(reference_center_quantile)
+        ),
+        "preprocessed_center_mode": center_mode_name,
+        "preprocess_winsorize_quantile": (
+            float(ordinary_center_config["preprocess_winsorize_quantile"])
+            if float(reference_preprocess_winsorize_quantile) < 0.0
+            else float(reference_preprocess_winsorize_quantile)
+        ),
+        "preprocess_despike_quantile": (
+            float(ordinary_center_config["preprocess_despike_quantile"])
+            if float(reference_preprocess_despike_quantile) < 0.0
+            else float(reference_preprocess_despike_quantile)
+        ),
+        "preprocess_min_component_area": (
+            int(ordinary_center_config["preprocess_min_component_area"])
+            if int(reference_preprocess_min_component_area) < 0
+            else int(reference_preprocess_min_component_area)
+        ),
+    }
+
 def _center_trajectory_wan21_t2v_to_tensor(
     trajectory: Sequence[Tuple[float, float]],
 ) -> torch.Tensor:
@@ -538,6 +1415,764 @@ def _support_overlap_iou_wan21_t2v_per_frame(
     union = (mask_a | mask_b).sum(dim=1).float().clamp_min(1.0)
     return intersection / union
 
+
+def _support_overlap_mask_iou_wan21_t2v_per_frame(
+    support_mask_a_fhw: torch.Tensor,
+    support_mask_b_fhw: torch.Tensor,
+) -> torch.Tensor:
+    """Compute frame-wise IoU between two binary motion-planning-region masks."""
+    if tuple(support_mask_a_fhw.shape) != tuple(support_mask_b_fhw.shape):
+        raise ValueError(
+            "Expected same shapes for support-overlap IoU, "
+            f"got {tuple(support_mask_a_fhw.shape)} vs {tuple(support_mask_b_fhw.shape)}"
+        )
+    flat_a = support_mask_a_fhw.reshape(support_mask_a_fhw.size(0), -1).bool()
+    flat_b = support_mask_b_fhw.reshape(support_mask_b_fhw.size(0), -1).bool()
+    intersection = (flat_a & flat_b).sum(dim=1).float()
+    union = (flat_a | flat_b).sum(dim=1).float().clamp_min(1.0)
+    return intersection / union
+
+
+def _compute_wan21_t2v_head_trajectory_distance(
+    metric_name: str,
+    probability_map_a_fhw: torch.Tensor,
+    probability_map_b_fhw: torch.Tensor,
+    center_traj_a: torch.Tensor,
+    center_traj_b: torch.Tensor,
+    support_quantile: float,
+    use_motion_planning_region_for_support_overlap: bool = False,
+    support_mask_a_fhw: Optional[torch.Tensor] = None,
+    support_mask_b_fhw: Optional[torch.Tensor] = None,
+) -> float:
+    """Compute one scalar head-to-head distance using the requested trajectory metric."""
+    metric_name = str(metric_name).strip().lower()
+    if metric_name == "js":
+        return float(_js_wan21_t2v_distance_per_frame(probability_map_a_fhw, probability_map_b_fhw).mean().item())
+    if metric_name == "hellinger":
+        return float(_hellinger_wan21_t2v_distance_per_frame(probability_map_a_fhw, probability_map_b_fhw).mean().item())
+    if metric_name == "wasserstein_map":
+        return float(
+            _marginal_wasserstein_wan21_t2v_distance_per_frame(probability_map_a_fhw, probability_map_b_fhw).mean().item()
+        )
+    if metric_name == "support_overlap":
+        if bool(use_motion_planning_region_for_support_overlap):
+            if support_mask_a_fhw is None or support_mask_b_fhw is None:
+                raise ValueError("support_overlap requires explicit motion-planning-region masks.")
+            support_iou = _support_overlap_mask_iou_wan21_t2v_per_frame(
+                support_mask_a_fhw,
+                support_mask_b_fhw,
+            )
+        else:
+            support_iou = _support_overlap_iou_wan21_t2v_per_frame(
+                probability_map_a_fhw,
+                probability_map_b_fhw,
+                quantile=float(support_quantile),
+            )
+        return float((1.0 - support_iou).mean().item())
+    if metric_name == "center_l2":
+        return float(_trajectory_distance_wan21_t2v_soft_centers(center_traj_a, center_traj_b))
+    raise ValueError(
+        "head_trajectory_dynamics_attractor_distance_metric must be one of "
+        "{'js', 'hellinger', 'wasserstein_map', 'support_overlap', 'center_l2'}."
+    )
+
+
+def _load_wan21_t2v_csv_rows(csv_path: str) -> List[Dict[str, str]]:
+    """Load one CSV file into a list of row dictionaries."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Missing CSV required for plotting: {csv_path}")
+    with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            return []
+        return [dict(row) for row in reader]
+
+
+def _load_wan21_t2v_json_if_exists(json_path: str) -> Dict[str, object]:
+    """Load one JSON file if present, otherwise return an empty dict."""
+    if not os.path.exists(json_path):
+        return {}
+    with open(json_path, "r", encoding="utf-8") as handle:
+        loaded = json.load(handle)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _maybe_skip_wan21_t2v_existing_plot(save_file: str, skip_existing_plots: bool) -> bool:
+    """Return True when one plot should be skipped because it already exists."""
+    return bool(skip_existing_plots) and os.path.exists(save_file)
+
+
+def _resolve_wan21_t2v_overlay_specs(
+    probability_maps_by_step_layer_head: Dict[Tuple[int, int, int], torch.Tensor],
+    requested_head_set: Sequence[Tuple[int, int]],
+    requested_center_viz_head_set: Sequence[Tuple[int, int]],
+    requested_support_viz_head_set: Sequence[Tuple[int, int]],
+    head_trajectory_dynamics_center_viz_enable: bool,
+    head_trajectory_dynamics_center_viz_step: int,
+    head_trajectory_dynamics_center_viz_layer: int,
+    head_trajectory_dynamics_support_viz_enable: bool,
+    head_trajectory_dynamics_support_viz_step: int,
+    head_trajectory_dynamics_support_viz_layer: int,
+) -> Tuple[List[Tuple[int, int, int]], List[Tuple[int, int, int]]]:
+    """Resolve which `(step, layer, head)` specs should be rendered for center/support overlays."""
+    requested_head_lookup = set((int(layer_idx), int(head_idx)) for layer_idx, head_idx in requested_head_set)
+    requested_center_lookup = set((int(layer_idx), int(head_idx)) for layer_idx, head_idx in requested_center_viz_head_set)
+    requested_support_lookup = set((int(layer_idx), int(head_idx)) for layer_idx, head_idx in requested_support_viz_head_set)
+
+    center_overlay_specs: List[Tuple[int, int, int]] = []
+    support_viz_specs: List[Tuple[int, int, int]] = []
+
+    if bool(head_trajectory_dynamics_center_viz_enable):
+        explicit_center_viz = (
+            int(head_trajectory_dynamics_center_viz_step) >= 1
+            and int(head_trajectory_dynamics_center_viz_layer) >= 0
+        )
+        if explicit_center_viz:
+            selected_step = int(head_trajectory_dynamics_center_viz_step)
+            selected_layer = int(head_trajectory_dynamics_center_viz_layer)
+            candidate_heads = sorted(
+                head_idx
+                for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
+                if int(step_idx) == selected_step and int(layer_idx) == selected_layer
+            )
+            if requested_center_lookup:
+                candidate_heads = [
+                    head_idx
+                    for head_idx in candidate_heads
+                    if (selected_layer, int(head_idx)) in requested_center_lookup
+                ]
+            center_overlay_specs = [
+                (selected_step, selected_layer, int(head_idx))
+                for head_idx in candidate_heads
+            ]
+        elif requested_center_lookup:
+            center_overlay_specs = sorted(
+                [
+                    (int(step_idx), int(layer_idx), int(head_idx))
+                    for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
+                    if (int(layer_idx), int(head_idx)) in requested_center_lookup
+                ]
+            )
+        elif requested_head_lookup:
+            center_overlay_specs = sorted(
+                [
+                    (int(step_idx), int(layer_idx), int(head_idx))
+                    for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
+                    if (int(layer_idx), int(head_idx)) in requested_head_lookup
+                ]
+            )
+
+    if bool(head_trajectory_dynamics_support_viz_enable):
+        explicit_support_viz = (
+            int(head_trajectory_dynamics_support_viz_step) >= 1
+            and int(head_trajectory_dynamics_support_viz_layer) >= 0
+        )
+        if explicit_support_viz:
+            selected_step = int(head_trajectory_dynamics_support_viz_step)
+            selected_layer = int(head_trajectory_dynamics_support_viz_layer)
+            candidate_heads = sorted(
+                head_idx
+                for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
+                if int(step_idx) == selected_step and int(layer_idx) == selected_layer
+            )
+            if requested_support_lookup:
+                candidate_heads = [
+                    head_idx
+                    for head_idx in candidate_heads
+                    if (selected_layer, int(head_idx)) in requested_support_lookup
+                ]
+            support_viz_specs = [
+                (selected_step, selected_layer, int(head_idx))
+                for head_idx in candidate_heads
+            ]
+        elif requested_support_lookup:
+            support_viz_specs = sorted(
+                [
+                    (int(step_idx), int(layer_idx), int(head_idx))
+                    for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
+                    if (int(layer_idx), int(head_idx)) in requested_support_lookup
+                ]
+            )
+        elif requested_head_lookup:
+            support_viz_specs = sorted(
+                [
+                    (int(step_idx), int(layer_idx), int(head_idx))
+                    for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
+                    if (int(layer_idx), int(head_idx)) in requested_head_lookup
+                ]
+            )
+
+    return center_overlay_specs, support_viz_specs
+
+
+def _render_wan21_t2v_head_trajectory_overlays(
+    *,
+    probability_maps_by_step_layer_head: Dict[Tuple[int, int, int], torch.Tensor],
+    center_trajectories_by_step_layer_head: Dict[Tuple[int, int, int], torch.Tensor],
+    output_dir: str,
+    requested_head_set: Sequence[Tuple[int, int]],
+    requested_center_viz_head_set: Sequence[Tuple[int, int]],
+    requested_support_viz_head_set: Sequence[Tuple[int, int]],
+    head_trajectory_dynamics_center_viz_enable: bool,
+    head_trajectory_dynamics_center_viz_step: int,
+    head_trajectory_dynamics_center_viz_layer: int,
+    head_trajectory_dynamics_center_viz_num_frames: int,
+    head_trajectory_dynamics_support_viz_enable: bool,
+    head_trajectory_dynamics_support_viz_step: int,
+    head_trajectory_dynamics_support_viz_layer: int,
+    head_trajectory_dynamics_support_viz_num_frames: int,
+    head_trajectory_dynamics_support_viz_contour_min_component_area: int,
+    head_trajectory_dynamics_support_quantile: float,
+    head_trajectory_dynamics_skip_existing_plots: bool,
+    reuse_video_frame_count: int,
+) -> Tuple[List[str], str, str, int, int]:
+    """Render center/support overlays from raw maps, raw centers, and precomputed support masks."""
+    center_overlay_dir = os.path.join(output_dir, "head_trajectory_dynamics_head_center_overlays")
+    support_overlap_mask_dir = os.path.join(output_dir, "head_trajectory_dynamics_support_overlap_masks")
+    center_overlay_specs, support_viz_specs = _resolve_wan21_t2v_overlay_specs(
+        probability_maps_by_step_layer_head=probability_maps_by_step_layer_head,
+        requested_head_set=requested_head_set,
+        requested_center_viz_head_set=requested_center_viz_head_set,
+        requested_support_viz_head_set=requested_support_viz_head_set,
+        head_trajectory_dynamics_center_viz_enable=bool(head_trajectory_dynamics_center_viz_enable),
+        head_trajectory_dynamics_center_viz_step=int(head_trajectory_dynamics_center_viz_step),
+        head_trajectory_dynamics_center_viz_layer=int(head_trajectory_dynamics_center_viz_layer),
+        head_trajectory_dynamics_support_viz_enable=bool(head_trajectory_dynamics_support_viz_enable),
+        head_trajectory_dynamics_support_viz_step=int(head_trajectory_dynamics_support_viz_step),
+        head_trajectory_dynamics_support_viz_layer=int(head_trajectory_dynamics_support_viz_layer),
+    )
+    plot_paths: List[str] = []
+    center_overlay_progress_bar = None
+    support_overlay_progress_bar = None
+    if int(len(center_overlay_specs)) > 0:
+        try:
+            from tqdm import tqdm
+            center_overlay_progress_bar = tqdm(
+                total=int(len(center_overlay_specs)),
+                desc="head_trajectory center overlays",
+                unit="plot",
+                leave=True,
+            )
+        except Exception:
+            center_overlay_progress_bar = None
+    if int(len(support_viz_specs)) > 0:
+        try:
+            from tqdm import tqdm
+            support_overlay_progress_bar = tqdm(
+                total=int(len(support_viz_specs)),
+                desc="head_trajectory support overlays",
+                unit="plot",
+                leave=True,
+            )
+        except Exception:
+            support_overlay_progress_bar = None
+
+    try:
+        for step_index, layer_index, head_idx in center_overlay_specs:
+            probability_map = probability_maps_by_step_layer_head[(int(step_index), int(layer_index), int(head_idx))]
+            center_trajectory = center_trajectories_by_step_layer_head[(int(step_index), int(layer_index), int(head_idx))]
+            save_file = os.path.join(
+                center_overlay_dir,
+                f"step_{int(step_index):03d}",
+                f"layer_{int(layer_index):02d}",
+                f"center_overlay_step_{int(step_index):03d}_layer_{int(layer_index):02d}_head_{int(head_idx):02d}.pdf",
+            )
+            if _maybe_skip_wan21_t2v_existing_plot(save_file, bool(head_trajectory_dynamics_skip_existing_plots)):
+                plot_paths.append(save_file)
+            else:
+                plot_path = _plot_wan21_t2v_head_trajectory_center_overlay(
+                    probability_map_fhw=probability_map,
+                    center_f2=center_trajectory,
+                    save_file=save_file,
+                    title=f"Center Overlay | step={int(step_index)} layer={int(layer_index)} head={int(head_idx)}",
+                    num_frames=head_trajectory_dynamics_center_viz_num_frames,
+                    video_frame_count=int(reuse_video_frame_count),
+                )
+                if plot_path:
+                    plot_paths.append(plot_path)
+            if center_overlay_progress_bar is not None:
+                center_overlay_progress_bar.update(1)
+
+        for step_index, layer_index, head_idx in support_viz_specs:
+            support_mask_fhw = _build_wan21_t2v_support_mask_fhw(
+                probability_maps_by_step_layer_head[(int(step_index), int(layer_index), int(head_idx))],
+                quantile=float(head_trajectory_dynamics_support_quantile),
+            )
+            mask_dir = os.path.join(
+                support_overlap_mask_dir,
+                f"step_{int(step_index):03d}",
+                f"layer_{int(layer_index):02d}",
+            )
+            contour_save_file = os.path.join(
+                mask_dir,
+                f"support_mask_contour_step_{int(step_index):03d}_layer_{int(layer_index):02d}_head_{int(head_idx):02d}.pdf",
+            )
+            if _maybe_skip_wan21_t2v_existing_plot(contour_save_file, bool(head_trajectory_dynamics_skip_existing_plots)):
+                plot_paths.append(contour_save_file)
+            else:
+                plot_path = _plot_wan21_t2v_support_overlap_mask_panels(
+                    binary_mask_fhw=support_mask_fhw,
+                    save_file=contour_save_file,
+                    title=(
+                        f"Support Mask + Contour | step={int(step_index)} layer={int(layer_index)} "
+                        f"head={int(head_idx)} q={float(head_trajectory_dynamics_support_quantile):.3f}"
+                    ),
+                    num_frames=int(head_trajectory_dynamics_support_viz_num_frames),
+                    contour_min_component_area=int(head_trajectory_dynamics_support_viz_contour_min_component_area),
+                    draw_contours=True,
+                    video_frame_count=int(reuse_video_frame_count),
+                )
+                if plot_path:
+                    plot_paths.append(plot_path)
+            if support_overlay_progress_bar is not None:
+                support_overlay_progress_bar.update(1)
+    finally:
+        if center_overlay_progress_bar is not None:
+            center_overlay_progress_bar.close()
+        if support_overlay_progress_bar is not None:
+            support_overlay_progress_bar.close()
+
+    return (
+        plot_paths,
+        center_overlay_dir,
+        support_overlap_mask_dir,
+        int(len(center_overlay_specs)),
+        int(len(support_viz_specs)),
+    )
+
+
+def _infer_wan21_t2v_head_trajectory_distance_metrics(
+    consensus_rows: Sequence[Dict[str, object]],
+    reference_distance_rows: Sequence[Dict[str, object]],
+    convergence_rows: Sequence[Dict[str, object]],
+) -> List[str]:
+    """Infer which distance metrics are present in saved CSV rows."""
+    metric_candidates = ["js", "hellinger", "wasserstein_map", "support_overlap", "center_l2"]
+    requested = []
+    for metric_name in metric_candidates:
+        consensus_key = f"{metric_name}_consensus"
+        reference_key = f"{metric_name}_reference_distance"
+        if any(str(row.get(consensus_key, "")).strip() != "" for row in consensus_rows):
+            requested.append(metric_name)
+            continue
+        if any(str(row.get(reference_key, "")).strip() != "" for row in reference_distance_rows):
+            requested.append(metric_name)
+            continue
+        if any(str(row.get("metric", "")).strip().lower() == metric_name for row in convergence_rows):
+            requested.append(metric_name)
+    return requested
+
+
+def _infer_wan21_t2v_attractor_distance_metrics(
+    attractor_rows: Sequence[Dict[str, object]],
+) -> List[str]:
+    """Infer which attractor distance metrics are actually present in saved CSV rows."""
+    metric_names = []
+    for row in attractor_rows:
+        metric_name = str(row.get("attractor_distance_metric", "")).strip().lower()
+        if not metric_name:
+            metric_name = "center_l2"
+        if metric_name not in metric_names:
+            metric_names.append(metric_name)
+    return metric_names
+
+
+def _render_wan21_t2v_head_trajectory_metric_plots(
+    consensus_rows: Sequence[Dict[str, object]],
+    attractor_rows: Sequence[Dict[str, object]],
+    reference_distance_rows: Sequence[Dict[str, object]],
+    convergence_rows: Sequence[Dict[str, object]],
+    output_dir: str,
+    requested_distance_metrics: Sequence[str],
+    skip_existing_plots: bool = False,
+) -> List[str]:
+    """Render the metric plots that depend only on saved CSV rows."""
+    plot_paths: List[str] = []
+    plots_dir = os.path.join(output_dir, "head_trajectory_dynamics_plots")
+    plot_specs_total = 0
+    available_layers = sorted(
+        {
+            int(row["layer"])
+            for row in list(consensus_rows) + list(attractor_rows) + list(reference_distance_rows) + list(convergence_rows)
+            if str(row.get("layer", "")).strip() != ""
+        }
+    )
+
+    for metric_name in requested_distance_metrics:
+        plot_specs_total += len(available_layers)
+        plot_specs_total += 1
+    normalized_attractor_rows = []
+    for row in attractor_rows:
+        normalized_row = dict(row)
+        metric_name = str(normalized_row.get("attractor_distance_metric", "")).strip().lower()
+        normalized_row["attractor_distance_metric"] = metric_name if metric_name else "center_l2"
+        normalized_attractor_rows.append(normalized_row)
+    attractor_metric_names = sorted(
+        {
+            str(row["attractor_distance_metric"])
+            for row in normalized_attractor_rows
+            if str(row.get("attractor_distance_metric", "")).strip() != ""
+        }
+    )
+    attractor_methods = sorted(set(str(row["attractor_method"]) for row in normalized_attractor_rows))
+    plot_specs_total += len(attractor_metric_names) * len(attractor_methods) * (1 + len(available_layers))
+    metric_to_reference_key = {
+        "js": "js_reference_distance",
+        "hellinger": "hellinger_reference_distance",
+        "wasserstein_map": "wasserstein_map_reference_distance",
+        "support_overlap": "support_overlap_reference_distance",
+        "center_l2": "center_l2_reference_distance",
+    }
+    plot_specs_total += sum(
+        len(available_layers)
+        for metric_name in metric_to_reference_key.keys()
+        if metric_name in requested_distance_metrics
+    )
+
+    plot_progress_bar = None
+    if plot_specs_total > 0:
+        try:
+            from tqdm import tqdm
+            plot_progress_bar = tqdm(
+                total=int(plot_specs_total),
+                desc="head_trajectory_dynamics plots",
+                unit="plot",
+                leave=True,
+            )
+        except Exception:
+            plot_progress_bar = None
+
+    def _mark_plot_done():
+        if plot_progress_bar is not None:
+            plot_progress_bar.update(1)
+
+    try:
+        for metric_name in requested_distance_metrics:
+            for layer_index in available_layers:
+                layer_rows = [row for row in consensus_rows if int(row["layer"]) == int(layer_index)]
+                if not layer_rows:
+                    _mark_plot_done()
+                    continue
+                save_file = os.path.join(
+                    plots_dir,
+                    "consensus_curves",
+                    metric_name,
+                    f"consensus_layer_{int(layer_index):02d}_{metric_name}.pdf",
+                )
+                if _maybe_skip_wan21_t2v_existing_plot(save_file, skip_existing_plots):
+                    plot_paths.append(save_file)
+                else:
+                    plot_path = _plot_wan21_t2v_head_trajectory_dynamics_curve(
+                        rows=layer_rows,
+                        save_file=save_file,
+                        metric_key=f"{metric_name}_consensus",
+                        title=f"Head Trajectory Consensus ({metric_name}) | layer={int(layer_index)}",
+                        y_label=f"{metric_name} consensus",
+                    )
+                    if plot_path:
+                        plot_paths.append(plot_path)
+                _mark_plot_done()
+
+            save_file = os.path.join(
+                plots_dir,
+                "consensus_heatmaps",
+                f"consensus_heatmap_{metric_name}.pdf",
+            )
+            if _maybe_skip_wan21_t2v_existing_plot(save_file, skip_existing_plots):
+                plot_paths.append(save_file)
+            else:
+                heatmap_path = _plot_wan21_t2v_head_trajectory_dynamics_heatmap(
+                    matrix_rows=consensus_rows,
+                    save_file=save_file,
+                    title=f"Head Trajectory Consensus Heatmap ({metric_name})",
+                    row_key="layer",
+                    col_key="step",
+                    value_key=f"{metric_name}_consensus",
+                    row_label="layer",
+                    col_label="diffusion step",
+                )
+                if heatmap_path:
+                    plot_paths.append(heatmap_path)
+            _mark_plot_done()
+
+        for attractor_metric_name in attractor_metric_names:
+            for method_name in attractor_methods:
+                method_attractor_rows = [
+                    row
+                    for row in normalized_attractor_rows
+                    if str(row["attractor_method"]) == method_name
+                    and str(row["attractor_distance_metric"]) == str(attractor_metric_name)
+                ]
+                if not method_attractor_rows:
+                    _mark_plot_done()
+                    for _ in available_layers:
+                        _mark_plot_done()
+                    continue
+
+                save_file = os.path.join(
+                    plots_dir,
+                    "attractor_curves",
+                    attractor_metric_name,
+                    method_name,
+                    "attractor_all_heads.pdf",
+                )
+                if _maybe_skip_wan21_t2v_existing_plot(save_file, skip_existing_plots):
+                    plot_paths.append(save_file)
+                else:
+                    plot_path = _plot_wan21_t2v_head_trajectory_dynamics_all_heads_curve(
+                        rows=method_attractor_rows,
+                        save_file=save_file,
+                        metric_key="attractor_score_mean",
+                        title=(
+                            f"Head Attractor Score ({method_name}, metric={str(attractor_metric_name)}) | "
+                            "all analyzed heads"
+                        ),
+                        y_label="attractor score",
+                    )
+                    if plot_path:
+                        plot_paths.append(plot_path)
+                _mark_plot_done()
+
+                for layer_index in available_layers:
+                    layer_attractor_rows = [
+                        row for row in method_attractor_rows
+                        if int(row["layer"]) == int(layer_index)
+                    ]
+                    if not layer_attractor_rows:
+                        _mark_plot_done()
+                        continue
+                    by_head: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+                    for row in layer_attractor_rows:
+                        by_head[str(row["head_tag"])].append(row)
+
+                    save_file = os.path.join(
+                        plots_dir,
+                        "attractor_curves",
+                        attractor_metric_name,
+                        method_name,
+                        f"attractor_layer_{int(layer_index):02d}.pdf",
+                    )
+                    if _maybe_skip_wan21_t2v_existing_plot(save_file, skip_existing_plots):
+                        plot_paths.append(save_file)
+                        _mark_plot_done()
+                        continue
+
+                    import matplotlib
+                    matplotlib.use("Agg")
+                    import matplotlib.pyplot as plt
+
+                    fig, axis = plt.subplots(1, 1, figsize=(8.2, 5.0))
+                    head_tags = sorted(by_head.keys())
+                    line_colors = _get_wan21_t2v_visible_line_colors(len(head_tags))
+                    for color_index, head_tag in enumerate(head_tags):
+                        head_rows = sorted(by_head[head_tag], key=lambda row: int(row["step"]))
+                        x_steps = [int(row["step"]) for row in head_rows]
+                        y_values = [float(row["attractor_score_mean"]) for row in head_rows]
+                        axis.plot(
+                            x_steps,
+                            y_values,
+                            linewidth=1.4,
+                            alpha=0.92,
+                            color=line_colors[color_index],
+                            label=head_tag,
+                        )
+                    axis.set_title(
+                        f"Head Attractor Score ({method_name}, metric={str(attractor_metric_name)}) | "
+                        f"layer={int(layer_index)}"
+                    )
+                    axis.set_xlabel("diffusion step")
+                    axis.set_ylabel("attractor score")
+                    axis.grid(alpha=0.22, linestyle="--")
+                    if len(head_tags) <= 20:
+                        axis.legend(fontsize=7, ncol=2)
+                    fig.tight_layout()
+                    _ensure_dir(os.path.dirname(save_file))
+                    fig.savefig(save_file, format="pdf")
+                    plt.close(fig)
+                    plot_paths.append(save_file)
+                    _mark_plot_done()
+
+        for metric_name, metric_key in metric_to_reference_key.items():
+            if metric_name not in requested_distance_metrics:
+                continue
+            normalized_curve_rows = []
+            raw_curve_rows = []
+            per_head_rows: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+            for row in reference_distance_rows:
+                if str(row.get(metric_key, "")).strip() == "":
+                    continue
+                per_head_rows[(int(row["layer"]), int(row["head"]))].append(row)
+            for (layer_index, head_index), head_rows in per_head_rows.items():
+                ordered_rows = sorted(head_rows, key=lambda row: int(row["step"]))
+                distances = [float(row[metric_key]) for row in ordered_rows]
+                if not distances:
+                    continue
+                initial_distance = float(distances[0])
+                final_distance = float(distances[-1])
+                gap = float(initial_distance - final_distance)
+                for row, distance_value in zip(ordered_rows, distances):
+                    if abs(gap) > 1e-8:
+                        normalized_value = float((distance_value - final_distance) / gap)
+                    else:
+                        normalized_value = 0.0
+                    normalized_curve_rows.append(
+                        {
+                            "step": int(row["step"]),
+                            "layer": int(layer_index),
+                            "head": int(head_index),
+                            "head_tag": f"L{int(layer_index)}H{int(head_index)}",
+                            "value": normalized_value,
+                        }
+                    )
+                    raw_curve_rows.append(
+                        {
+                            "step": int(row["step"]),
+                            "layer": int(layer_index),
+                            "head": int(head_index),
+                            "head_tag": f"L{int(layer_index)}H{int(head_index)}",
+                            "value": float(distance_value),
+                        }
+                    )
+
+            for layer_index in available_layers:
+                layer_reference_curve_rows = [
+                    row
+                    for row in reference_distance_rows
+                    if int(row["layer"]) == int(layer_index) and str(row.get(metric_key, "")).strip() != ""
+                ]
+                save_file = os.path.join(
+                    plots_dir,
+                    "reference_distance_curves",
+                    metric_name,
+                    f"reference_distance_layer_{int(layer_index):02d}.pdf",
+                )
+                if layer_reference_curve_rows:
+                    if _maybe_skip_wan21_t2v_existing_plot(save_file, skip_existing_plots):
+                        plot_paths.append(save_file)
+                    else:
+                        curve_path = _plot_wan21_t2v_head_trajectory_dynamics_multihead_curve(
+                            rows=layer_reference_curve_rows,
+                            save_file=save_file,
+                            metric_key=metric_key,
+                            title=f"Reference Distance Curves ({metric_name}) | layer={int(layer_index)}",
+                            y_label=f"{metric_name} reference distance",
+                        )
+                        if curve_path:
+                            plot_paths.append(curve_path)
+                _mark_plot_done()
+    finally:
+        if plot_progress_bar is not None:
+            plot_progress_bar.close()
+
+    return plot_paths
+
+
+def _plot_wan21_t2v_head_trajectory_dynamics_convergence_curve(
+    rows: Sequence[Dict[str, object]],
+    save_file: str,
+    title: str,
+    y_label: str,
+    curve_group_key: Optional[str] = None,
+):
+    """Plot convergence curves from rows containing `step` and `value`."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not rows:
+        return ""
+
+    grouped_rows: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    if curve_group_key is None:
+        grouped_rows["all"] = list(rows)
+    else:
+        for row in rows:
+            grouped_rows[str(row[curve_group_key])].append(row)
+
+    fig, axis = plt.subplots(1, 1, figsize=(8.4, 5.0))
+    group_names = sorted(grouped_rows.keys(), key=lambda x: (x != "all", x))
+    line_colors = _get_wan21_t2v_visible_line_colors(len(group_names))
+    for color_index, group_name in enumerate(group_names):
+        step_to_values: Dict[int, List[float]] = defaultdict(list)
+        for row in grouped_rows[group_name]:
+            step_to_values[int(row["step"])].append(float(row["value"]))
+        x_steps = sorted(step_to_values.keys())
+        y_values = [
+            float(sum(step_to_values[step_value]) / len(step_to_values[step_value]))
+            for step_value in x_steps
+        ]
+        axis.plot(
+            x_steps,
+            y_values,
+            linewidth=1.8,
+            alpha=0.96,
+            color=line_colors[color_index],
+            label=group_name,
+        )
+
+    axis.set_title(title)
+    axis.set_xlabel("diffusion step")
+    axis.set_ylabel(y_label)
+    axis.grid(alpha=0.22, linestyle="--")
+    if curve_group_key is not None and len(group_names) <= 16:
+        axis.legend(fontsize=7.5, ncol=2)
+    fig.tight_layout()
+
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _plot_wan21_t2v_head_trajectory_dynamics_all_heads_curve(
+    rows: Sequence[Dict[str, object]],
+    save_file: str,
+    metric_key: str,
+    title: str,
+    y_label: str,
+):
+    """Plot one global curve figure with one line per LxHy head tag across all layers."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    grouped_rows: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        if metric_key not in row:
+            continue
+        grouped_rows[str(row["head_tag"])].append(row)
+    if not grouped_rows:
+        return ""
+
+    head_tags = sorted(grouped_rows.keys())
+    line_colors = _get_wan21_t2v_visible_line_colors(len(head_tags))
+    fig, axis = plt.subplots(1, 1, figsize=(10.2, 5.8))
+    for color_index, head_tag in enumerate(head_tags):
+        head_rows = sorted(grouped_rows[head_tag], key=lambda row: int(row["step"]))
+        x_steps = [int(row["step"]) for row in head_rows]
+        y_values = [float(row[metric_key]) for row in head_rows]
+        axis.plot(
+            x_steps,
+            y_values,
+            linewidth=1.15,
+            alpha=0.90,
+            color=line_colors[color_index],
+            label=head_tag,
+        )
+
+    axis.set_title(title)
+    axis.set_xlabel("diffusion step")
+    axis.set_ylabel(y_label)
+    axis.grid(alpha=0.22, linestyle="--")
+    if len(head_tags) <= 32:
+        axis.legend(fontsize=6.2, ncol=4)
+    fig.tight_layout()
+
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
 def run_wan21_t2v_head_trajectory_dynamics(
     wan21_root: str,
     ckpt_dir: str,
@@ -562,6 +2197,7 @@ def run_wan21_t2v_head_trajectory_dynamics(
     head_trajectory_dynamics_reference_layer: int = 27,
     head_trajectory_dynamics_support_quantile: float = 0.9,
     head_trajectory_dynamics_attractor_window: int = 3,
+    head_trajectory_dynamics_attractor_distance_metrics: Sequence[str] = tuple(),
     head_trajectory_dynamics_center_method: str = "region_centroid",
     head_trajectory_dynamics_center_power: float = 1.5,
     head_trajectory_dynamics_center_quantile: float = 0.8,
@@ -569,10 +2205,32 @@ def run_wan21_t2v_head_trajectory_dynamics(
     head_trajectory_dynamics_preprocess_winsorize_quantile: float = 0.995,
     head_trajectory_dynamics_preprocess_despike_quantile: float = 0.98,
     head_trajectory_dynamics_preprocess_min_component_area: int = 2,
+    head_trajectory_dynamics_reference_center_method: str = "same_as_head",
+    head_trajectory_dynamics_reference_center_power: float = -1.0,
+    head_trajectory_dynamics_reference_center_quantile: float = -1.0,
+    head_trajectory_dynamics_reference_preprocessed_center_mode: str = "same_as_head",
+    head_trajectory_dynamics_reference_preprocess_winsorize_quantile: float = -1.0,
+    head_trajectory_dynamics_reference_preprocess_despike_quantile: float = -1.0,
+    head_trajectory_dynamics_reference_preprocess_min_component_area: int = -1,
+    head_trajectory_dynamics_center_viz_enable: bool = False,
     head_trajectory_dynamics_center_viz_step: int = -1,
     head_trajectory_dynamics_center_viz_layer: int = -1,
     head_trajectory_dynamics_center_viz_heads: Sequence[str] = tuple(),
     head_trajectory_dynamics_center_viz_num_frames: int = 10,
+    head_trajectory_dynamics_support_viz_enable: bool = False,
+    head_trajectory_dynamics_support_viz_step: int = -1,
+    head_trajectory_dynamics_support_viz_layer: int = -1,
+    head_trajectory_dynamics_support_viz_heads: Sequence[str] = tuple(),
+    head_trajectory_dynamics_support_viz_num_frames: int = 10,
+    head_trajectory_dynamics_support_viz_contour_min_component_area: int = 4,
+    head_trajectory_dynamics_support_cache_num_workers: int = 0,
+    head_trajectory_dynamics_cache_save_interval: int = 512,
+    head_trajectory_dynamics_hypothesis: str = "attractor",
+    head_trajectory_dynamics_traj_type: str = "",
+    head_trajectory_dynamics_use_motion_planning_region_before_metrics: bool = False,
+    head_trajectory_dynamics_plot_only_from_csv: bool = False,
+    head_trajectory_dynamics_overlay_only: bool = False,
+    head_trajectory_dynamics_skip_existing_plots: bool = True,
     reuse_cross_attention_dir: Optional[str] = None,
     parallel_cfg: Optional[Wan21T2VParallelConfig] = None,
 ):
@@ -588,25 +2246,120 @@ def run_wan21_t2v_head_trajectory_dynamics(
             support masks for support-overlap IoU.
         head_trajectory_dynamics_attractor_window: future-step window for multi-step
             attractor metrics.
-        head_trajectory_dynamics_center_method: one of
+        head_trajectory_dynamics_attractor_distance_metrics: distance metrics used by
+            attractor analysis when measuring whether followers move closer to the
+            current leader head. Empty means all supported metrics.
+        head_trajectory_dynamics_center_method: ordinary-head center method, one of
             `region_centroid` or `preprocessed_component_center`.
         head_trajectory_dynamics_center_power/head_trajectory_dynamics_center_quantile:
-            region-center extraction parameters.
-        head_trajectory_dynamics_preprocessed_center_mode: for the preprocessed method,
+            ordinary-head center extraction parameters.
+        head_trajectory_dynamics_preprocessed_center_mode: for the ordinary-head preprocessed method,
             choose `peak`, `centroid`, or `geometric_center`.
+        head_trajectory_dynamics_reference_center_*:
+            optional reference-trajectory center config. When left as `same_as_head`
+            / negative sentinel values, fallback to ordinary-head settings.
+        head_trajectory_dynamics_center_viz_enable: whether to render per-head
+            center-overlay PDFs at all.
         head_trajectory_dynamics_center_viz_step/layer/heads: optional selection for per-head
             center-overlay PDFs used to inspect center quality.
+        head_trajectory_dynamics_support_viz_*: optional selection for per-head
+            support-overlap mask / contour PDFs used to inspect the quantile-thresholded support region.
+        head_trajectory_dynamics_hypothesis: hypothesis label used to name the metrics subdirectory.
+        head_trajectory_dynamics_use_motion_planning_region_before_metrics: if true, metrics are
+            computed from attention maps masked by the contour-filtered support region.
+        head_trajectory_dynamics_support_cache_num_workers: number of CPU worker processes used
+            to build missing motion-planning-region masks. A non-positive value means use os.cpu_count().
+        head_trajectory_dynamics_cache_save_interval: flush caches every N newly materialized
+            entries. Larger values reduce disk-write frequency but increase the amount of work
+            lost if the run is interrupted mid-cache-build.
+        head_trajectory_dynamics_traj_type: trajectory subset label used by the bash wrapper to
+            record which head family was selected for the run.
+        head_trajectory_dynamics_overlay_only: reuse saved cross-attention maps and center cache to
+            render overlays only, skipping metric recomputation and CSV metric plotting.
 
     Outputs:
         CSV files for pairwise distances, consensus curves, attractor scores, final-trajectory distance,
         plus summary JSON and PDF visualizations.
     """
+    default_video_frame_count = max(1, int(frame_num))
     del wan21_root, ckpt_dir, task, frame_num, size, shift, sample_solver, sampling_steps, guide_scale
     del seed, device_id, offload_model, parallel_cfg, prompt
 
     if dist.is_initialized() and dist.get_rank() != 0:
         dist.barrier()
         return None
+
+    if bool(head_trajectory_dynamics_plot_only_from_csv):
+        _ensure_dir(metrics_output_dir)
+        consensus_csv_path = os.path.join(metrics_output_dir, "head_trajectory_dynamics_consensus.csv")
+        attractor_csv_path = os.path.join(metrics_output_dir, "head_trajectory_dynamics_attractor.csv")
+        reference_distance_csv_path = os.path.join(metrics_output_dir, "head_trajectory_dynamics_reference_distance.csv")
+        convergence_csv_path = os.path.join(metrics_output_dir, "head_trajectory_dynamics_convergence.csv")
+        summary_path = os.path.join(metrics_output_dir, "head_trajectory_dynamics_summary.json")
+
+        consensus_rows = _load_wan21_t2v_csv_rows(consensus_csv_path)
+        attractor_rows = _load_wan21_t2v_csv_rows(attractor_csv_path)
+        reference_distance_rows = _load_wan21_t2v_csv_rows(reference_distance_csv_path)
+        convergence_rows = _load_wan21_t2v_csv_rows(convergence_csv_path)
+
+        requested_distance_metrics = [str(x).strip().lower() for x in head_trajectory_dynamics_distance_metrics if str(x).strip()]
+        if not requested_distance_metrics:
+            requested_distance_metrics = _infer_wan21_t2v_head_trajectory_distance_metrics(
+                consensus_rows=consensus_rows,
+                reference_distance_rows=reference_distance_rows,
+                convergence_rows=convergence_rows,
+            )
+        requested_attractor_distance_metrics = [
+            str(x).strip().lower()
+            for x in head_trajectory_dynamics_attractor_distance_metrics
+            if str(x).strip()
+        ]
+        available_attractor_distance_metrics = _infer_wan21_t2v_attractor_distance_metrics(attractor_rows)
+        if requested_attractor_distance_metrics:
+            missing_attractor_metrics = [
+                metric_name
+                for metric_name in requested_attractor_distance_metrics
+                if metric_name not in available_attractor_distance_metrics
+            ]
+            if missing_attractor_metrics:
+                raise ValueError(
+                    "head_trajectory_dynamics_plot_only_from_csv=True cannot synthesize attractor metrics "
+                    "that are absent from the existing attractor CSV. "
+                    f"requested={requested_attractor_distance_metrics} "
+                    f"available_in_csv={available_attractor_distance_metrics} "
+                    "Please rerun with head_trajectory_dynamics_plot_only_from_csv=False to recompute them."
+                )
+        plot_paths = _render_wan21_t2v_head_trajectory_metric_plots(
+            consensus_rows=consensus_rows,
+            attractor_rows=attractor_rows,
+            reference_distance_rows=reference_distance_rows,
+            convergence_rows=convergence_rows,
+            output_dir=metrics_output_dir,
+            requested_distance_metrics=requested_distance_metrics,
+            skip_existing_plots=bool(head_trajectory_dynamics_skip_existing_plots),
+        )
+
+        summary = _load_wan21_t2v_json_if_exists(summary_path)
+        summary.update(
+            {
+                "experiment": "wan21_t2v_head_trajectory_dynamics",
+                "head_trajectory_dynamics_plot_only_from_csv": True,
+                "head_trajectory_dynamics_skip_existing_plots": bool(head_trajectory_dynamics_skip_existing_plots),
+                "head_trajectory_dynamics_hypothesis": str(head_trajectory_dynamics_hypothesis),
+                "head_trajectory_dynamics_traj_type": str(head_trajectory_dynamics_traj_type),
+                "head_trajectory_dynamics_use_motion_planning_region_before_metrics": bool(
+                    head_trajectory_dynamics_use_motion_planning_region_before_metrics
+                ),
+                "metrics_output_dir": metrics_output_dir,
+                "head_trajectory_dynamics_distance_metrics": list(requested_distance_metrics),
+                "available_attractor_distance_metrics_in_csv": list(available_attractor_distance_metrics),
+                "plot_paths": plot_paths,
+            }
+        )
+        _save_json(summary_path, summary)
+        if dist.is_initialized():
+            dist.barrier()
+        return summary
 
     object_words = [str(word).strip() for word in target_object_words if str(word).strip()]
     if not object_words:
@@ -623,6 +2376,13 @@ def run_wan21_t2v_head_trajectory_dynamics(
         )
 
     cross_attention_dir = os.path.abspath(str(reuse_cross_attention_dir))
+    cross_attention_summary_path = os.path.join(cross_attention_dir, "cross_attention_token_viz_summary.json")
+    cross_attention_summary = _load_wan21_t2v_json_if_exists(cross_attention_summary_path)
+    reuse_video_frame_count_raw = cross_attention_summary.get("frame_num", default_video_frame_count)
+    try:
+        reuse_video_frame_count = max(1, int(reuse_video_frame_count_raw))
+    except Exception:
+        reuse_video_frame_count = int(default_video_frame_count)
     loaded_maps_raw, loaded_maps_source = _load_wan21_t2v_cross_attention_mean_maps_from_disk(
         output_dir=cross_attention_dir,
         draw_attention_maps_path="",
@@ -693,34 +2453,119 @@ def run_wan21_t2v_head_trajectory_dynamics(
                 "(legacy alias: 'wasserstein' -> 'center_l2'), "
                 f"got `{metric_name}`."
             )
+    requested_attractor_distance_metrics = [
+        str(x).strip().lower()
+        for x in head_trajectory_dynamics_attractor_distance_metrics
+        if str(x).strip()
+    ]
+    if not requested_attractor_distance_metrics:
+        requested_attractor_distance_metrics = ["js", "hellinger", "wasserstein_map", "support_overlap", "center_l2"]
+    requested_attractor_distance_metrics = list(dict.fromkeys(requested_attractor_distance_metrics))
+    for metric_name in requested_attractor_distance_metrics:
+        if metric_name not in {"js", "hellinger", "wasserstein_map", "support_overlap", "center_l2"}:
+            raise ValueError(
+                "head_trajectory_dynamics_attractor_distance_metrics must be chosen from "
+                "{'js', 'hellinger', 'wasserstein_map', 'support_overlap', 'center_l2'}, "
+                f"got `{metric_name}`."
+            )
 
     parsed_heads = _parse_wan21_t2v_layer_head_specs(head_trajectory_dynamics_heads)
     requested_head_set = set(parsed_heads)
     parsed_center_viz_heads = _parse_wan21_t2v_layer_head_specs(head_trajectory_dynamics_center_viz_heads)
     requested_center_viz_head_set = set(parsed_center_viz_heads)
-    center_method_name = str(head_trajectory_dynamics_center_method).strip().lower()
-    cache_basename = _build_wan21_t2v_head_trajectory_cache_basename(
-        center_method=center_method_name,
+    parsed_support_viz_heads = _parse_wan21_t2v_layer_head_specs(head_trajectory_dynamics_support_viz_heads)
+    requested_support_viz_head_set = set(parsed_support_viz_heads)
+    metrics_output_dir = os.path.join(
+        output_dir,
+        _build_wan21_t2v_head_trajectory_metrics_subdir(
+            hypothesis_name=str(head_trajectory_dynamics_hypothesis),
+            use_motion_planning_region_before_metrics=bool(
+                head_trajectory_dynamics_use_motion_planning_region_before_metrics
+            ),
+        ),
+    )
+    need_motion_planning_region_masks = (
+        bool(head_trajectory_dynamics_support_viz_enable)
+        or bool(head_trajectory_dynamics_use_motion_planning_region_before_metrics)
+        or ("support_overlap" in requested_distance_metrics)
+        or ("support_overlap" in requested_attractor_distance_metrics)
+    )
+    motion_planning_region_cache_basename = _build_wan21_t2v_motion_planning_region_cache_basename(
+        support_quantile=float(head_trajectory_dynamics_support_quantile),
+        contour_min_component_area=int(head_trajectory_dynamics_support_viz_contour_min_component_area),
+    )
+    motion_planning_region_cache_path = os.path.join(output_dir, motion_planning_region_cache_basename)
+    motion_planning_region_cache_payload = _load_wan21_t2v_motion_planning_region_cache(
+        motion_planning_region_cache_path
+    )
+    motion_planning_region_cache_payload["support_quantile"] = float(head_trajectory_dynamics_support_quantile)
+    motion_planning_region_cache_payload["min_component_area"] = int(
+        head_trajectory_dynamics_support_viz_contour_min_component_area
+    )
+    motion_planning_region_cache_hits = 0
+    motion_planning_region_cache_misses = 0
+    motion_planning_region_pending_cache_writes = 0
+    motion_planning_region_cache_save_interval = max(1, int(head_trajectory_dynamics_cache_save_interval))
+
+    ordinary_center_config = _resolve_wan21_t2v_head_trajectory_center_config(
+        center_method=str(head_trajectory_dynamics_center_method),
         center_power=float(head_trajectory_dynamics_center_power),
         center_quantile=float(head_trajectory_dynamics_center_quantile),
-        preprocessed_center_mode=str(head_trajectory_dynamics_preprocessed_center_mode).strip().lower(),
+        preprocessed_center_mode=str(head_trajectory_dynamics_preprocessed_center_mode),
         preprocess_winsorize_quantile=float(head_trajectory_dynamics_preprocess_winsorize_quantile),
         preprocess_despike_quantile=float(head_trajectory_dynamics_preprocess_despike_quantile),
         preprocess_min_component_area=int(head_trajectory_dynamics_preprocess_min_component_area),
     )
+    reference_center_config = _resolve_wan21_t2v_head_trajectory_reference_center_config(
+        ordinary_center_config=ordinary_center_config,
+        reference_center_method=str(head_trajectory_dynamics_reference_center_method),
+        reference_center_power=float(head_trajectory_dynamics_reference_center_power),
+        reference_center_quantile=float(head_trajectory_dynamics_reference_center_quantile),
+        reference_preprocessed_center_mode=str(head_trajectory_dynamics_reference_preprocessed_center_mode),
+        reference_preprocess_winsorize_quantile=float(head_trajectory_dynamics_reference_preprocess_winsorize_quantile),
+        reference_preprocess_despike_quantile=float(head_trajectory_dynamics_reference_preprocess_despike_quantile),
+        reference_preprocess_min_component_area=int(head_trajectory_dynamics_reference_preprocess_min_component_area),
+    )
+    center_method_name = str(ordinary_center_config["center_method"])
+    cache_basename = _build_wan21_t2v_head_trajectory_cache_basename(
+        center_method=center_method_name,
+        center_power=float(ordinary_center_config["center_power"]),
+        center_quantile=float(ordinary_center_config["center_quantile"]),
+        preprocessed_center_mode=str(ordinary_center_config["preprocessed_center_mode"]),
+        preprocess_winsorize_quantile=float(ordinary_center_config["preprocess_winsorize_quantile"]),
+        preprocess_despike_quantile=float(ordinary_center_config["preprocess_despike_quantile"]),
+        preprocess_min_component_area=int(ordinary_center_config["preprocess_min_component_area"]),
+    )
     center_cache_path = os.path.join(output_dir, cache_basename)
     center_cache_payload = _load_wan21_t2v_head_trajectory_cache(center_cache_path)
     center_cache_payload["center_method"] = center_method_name
-    center_cache_payload["algorithm_params"] = {
-        "center_power": float(head_trajectory_dynamics_center_power),
-        "center_quantile": float(head_trajectory_dynamics_center_quantile),
-        "preprocessed_center_mode": str(head_trajectory_dynamics_preprocessed_center_mode).strip().lower(),
-        "preprocess_winsorize_quantile": float(head_trajectory_dynamics_preprocess_winsorize_quantile),
-        "preprocess_despike_quantile": float(head_trajectory_dynamics_preprocess_despike_quantile),
-        "preprocess_min_component_area": int(head_trajectory_dynamics_preprocess_min_component_area),
-    }
+    center_cache_payload["algorithm_params"] = dict(ordinary_center_config)
     cache_hits = 0
     cache_misses = 0
+    cache_save_interval = max(1, int(head_trajectory_dynamics_cache_save_interval))
+    pending_cache_writes = 0
+
+    filtered_center_cache_basename = _build_wan21_t2v_filtered_center_cache_basename(
+        ordinary_center_config=ordinary_center_config,
+        reference_center_config=reference_center_config,
+        support_quantile=float(head_trajectory_dynamics_support_quantile),
+        support_viz_contour_min_component_area=int(head_trajectory_dynamics_support_viz_contour_min_component_area),
+        reference_step=int(head_trajectory_dynamics_reference_step),
+        reference_layer=int(head_trajectory_dynamics_reference_layer),
+    )
+    filtered_center_cache_path = os.path.join(output_dir, filtered_center_cache_basename)
+    filtered_center_cache_payload = _load_wan21_t2v_head_trajectory_cache(filtered_center_cache_path)
+    filtered_center_cache_payload["center_method"] = center_method_name
+    filtered_center_cache_payload["algorithm_params"] = dict(ordinary_center_config)
+    filtered_center_cache_payload["reference_algorithm_params"] = dict(reference_center_config)
+    filtered_center_cache_payload["support_quantile"] = float(head_trajectory_dynamics_support_quantile)
+    filtered_center_cache_payload["support_viz_contour_min_component_area"] = int(
+        head_trajectory_dynamics_support_viz_contour_min_component_area
+    )
+    filtered_center_cache_payload["reference_step"] = int(head_trajectory_dynamics_reference_step)
+    filtered_center_cache_payload["reference_layer"] = int(head_trajectory_dynamics_reference_layer)
+    filtered_center_cache_hits = 0
+    filtered_center_cache_misses = 0
 
     if head_trajectory_dynamics_reference_step not in set(available_steps):
         raise ValueError(
@@ -749,13 +2594,13 @@ def run_wan21_t2v_head_trajectory_dynamics(
     reference_probability_map = _normalize_wan21_t2v_attention_map_per_frame(reference_head_mean_map)
     reference_center_trajectory, reference_center_stats = _extract_wan21_t2v_head_trajectory_centers(
         map_fhw=reference_head_mean_map,
-        center_method=center_method_name,
-        center_power=float(head_trajectory_dynamics_center_power),
-        center_quantile=float(head_trajectory_dynamics_center_quantile),
-        preprocessed_center_mode=str(head_trajectory_dynamics_preprocessed_center_mode).strip().lower(),
-        preprocess_winsorize_quantile=float(head_trajectory_dynamics_preprocess_winsorize_quantile),
-        preprocess_despike_quantile=float(head_trajectory_dynamics_preprocess_despike_quantile),
-        preprocess_min_component_area=int(head_trajectory_dynamics_preprocess_min_component_area),
+        center_method=str(reference_center_config["center_method"]),
+        center_power=float(reference_center_config["center_power"]),
+        center_quantile=float(reference_center_config["center_quantile"]),
+        preprocessed_center_mode=str(reference_center_config["preprocessed_center_mode"]),
+        preprocess_winsorize_quantile=float(reference_center_config["preprocess_winsorize_quantile"]),
+        preprocess_despike_quantile=float(reference_center_config["preprocess_despike_quantile"]),
+        preprocess_min_component_area=int(reference_center_config["preprocess_min_component_area"]),
     )
     final_reference_center = _center_trajectory_wan21_t2v_to_tensor(reference_center_trajectory)
 
@@ -769,7 +2614,7 @@ def run_wan21_t2v_head_trajectory_dynamics(
 
     probability_maps_by_step_layer_head: Dict[Tuple[int, int, int], torch.Tensor] = {}
     center_trajectories_by_step_layer_head: Dict[Tuple[int, int, int], torch.Tensor] = {}
-
+    extraction_task_count = 0
     for step_index in resolved_steps:
         for layer_index in available_layers:
             object_head_maps = _mean_wan21_t2v_head_maps_for_words(
@@ -780,107 +2625,306 @@ def run_wan21_t2v_head_trajectory_dynamics(
             )
             if object_head_maps is None:
                 continue
-            cache_dirty = False
             for head_index in range(int(object_head_maps.size(0))):
                 if requested_head_set and (int(layer_index), int(head_index)) not in requested_head_set:
                     continue
-                map_fhw = object_head_maps[head_index]
-                probability_map = _normalize_wan21_t2v_attention_map_per_frame(map_fhw)
-                cached_trajectory = _get_wan21_t2v_cached_center_trajectory(
-                    cache_payload=center_cache_payload,
+                extraction_task_count += 1
+
+    extraction_progress_bar = None
+    if extraction_task_count > 0:
+        try:
+            from tqdm import tqdm
+            extraction_progress_bar = tqdm(
+                total=int(extraction_task_count),
+                desc="head_trajectory centers",
+                unit="head",
+                leave=True,
+            )
+        except Exception:
+            extraction_progress_bar = None
+
+    try:
+        for step_index in resolved_steps:
+            for layer_index in available_layers:
+                object_head_maps = _mean_wan21_t2v_head_maps_for_words(
+                    mean_maps=mean_maps,
                     step=int(step_index),
                     layer=int(layer_index),
-                    head=int(head_index),
+                    words=object_words_in_maps,
                 )
-                if cached_trajectory is None:
-                    extracted_trajectory, _ = _extract_wan21_t2v_head_trajectory_centers(
-                        map_fhw=map_fhw,
-                        center_method=center_method_name,
-                        center_power=float(head_trajectory_dynamics_center_power),
-                        center_quantile=float(head_trajectory_dynamics_center_quantile),
-                        preprocessed_center_mode=str(head_trajectory_dynamics_preprocessed_center_mode).strip().lower(),
-                        preprocess_winsorize_quantile=float(head_trajectory_dynamics_preprocess_winsorize_quantile),
-                        preprocess_despike_quantile=float(head_trajectory_dynamics_preprocess_despike_quantile),
-                        preprocess_min_component_area=int(head_trajectory_dynamics_preprocess_min_component_area),
-                    )
-                    _set_wan21_t2v_cached_center_trajectory(
+                if object_head_maps is None:
+                    continue
+                cache_dirty = False
+                for head_index in range(int(object_head_maps.size(0))):
+                    if requested_head_set and (int(layer_index), int(head_index)) not in requested_head_set:
+                        continue
+                    map_fhw = object_head_maps[head_index]
+                    probability_map = _normalize_wan21_t2v_attention_map_per_frame(map_fhw)
+                    cached_trajectory = _get_wan21_t2v_cached_center_trajectory(
                         cache_payload=center_cache_payload,
                         step=int(step_index),
                         layer=int(layer_index),
                         head=int(head_index),
-                        trajectory=extracted_trajectory,
                     )
-                    cached_trajectory = extracted_trajectory
-                    cache_dirty = True
-                    cache_misses += 1
-                else:
-                    cache_hits += 1
-                center_trajectory = _center_trajectory_wan21_t2v_to_tensor(cached_trajectory)
-                key = (int(step_index), int(layer_index), int(head_index))
-                probability_maps_by_step_layer_head[key] = probability_map
-                center_trajectories_by_step_layer_head[key] = center_trajectory
-                head_map_records.append(
-                    {
-                        "step": int(step_index),
-                        "layer": int(layer_index),
-                        "head": int(head_index),
-                        "head_tag": f"L{int(layer_index)}H{int(head_index)}",
-                        "frame_count": int(probability_map.size(0)),
-                        "token_grid_h": int(probability_map.size(1)),
-                        "token_grid_w": int(probability_map.size(2)),
-                    }
-                )
-                reference_row = {
-                    "step": int(step_index),
-                    "layer": int(layer_index),
-                    "head": int(head_index),
-                    "head_tag": f"L{int(layer_index)}H{int(head_index)}",
-                }
-                if "js" in requested_distance_metrics:
-                    reference_row["js_reference_distance"] = float(
-                        _js_wan21_t2v_distance_per_frame(probability_map, reference_probability_map).mean().item()
-                    )
-                if "hellinger" in requested_distance_metrics:
-                    reference_row["hellinger_reference_distance"] = float(
-                        _hellinger_wan21_t2v_distance_per_frame(probability_map, reference_probability_map).mean().item()
-                    )
-                if "wasserstein_map" in requested_distance_metrics:
-                    reference_row["wasserstein_map_reference_distance"] = float(
-                        _marginal_wasserstein_wan21_t2v_distance_per_frame(probability_map, reference_probability_map).mean().item()
-                    )
-                if "support_overlap" in requested_distance_metrics:
-                    reference_support_iou = _support_overlap_iou_wan21_t2v_per_frame(
-                        probability_map,
-                        reference_probability_map,
-                        quantile=float(head_trajectory_dynamics_support_quantile),
-                    )
-                    reference_row["support_overlap_reference_iou"] = float(reference_support_iou.mean().item())
-                    reference_row["support_overlap_reference_distance"] = float((1.0 - reference_support_iou).mean().item())
-                if "center_l2" in requested_distance_metrics:
-                    reference_row["center_l2_reference_distance"] = float(
-                        _trajectory_distance_wan21_t2v_soft_centers(center_trajectory, final_reference_center)
-                    )
-                reference_distance_rows.append(reference_row)
-                for frame_index in range(int(center_trajectory.size(0))):
-                    center_rows.append(
+                    if cached_trajectory is None:
+                        extracted_trajectory, _ = _extract_wan21_t2v_head_trajectory_centers(
+                            map_fhw=map_fhw,
+                            center_method=str(ordinary_center_config["center_method"]),
+                            center_power=float(ordinary_center_config["center_power"]),
+                            center_quantile=float(ordinary_center_config["center_quantile"]),
+                            preprocessed_center_mode=str(ordinary_center_config["preprocessed_center_mode"]),
+                            preprocess_winsorize_quantile=float(ordinary_center_config["preprocess_winsorize_quantile"]),
+                            preprocess_despike_quantile=float(ordinary_center_config["preprocess_despike_quantile"]),
+                            preprocess_min_component_area=int(ordinary_center_config["preprocess_min_component_area"]),
+                        )
+                        _set_wan21_t2v_cached_center_trajectory(
+                            cache_payload=center_cache_payload,
+                            step=int(step_index),
+                            layer=int(layer_index),
+                            head=int(head_index),
+                            trajectory=extracted_trajectory,
+                        )
+                        cached_trajectory = extracted_trajectory
+                        cache_dirty = True
+                        cache_misses += 1
+                        pending_cache_writes += 1
+                        if pending_cache_writes >= int(cache_save_interval):
+                            _save_wan21_t2v_head_trajectory_cache(center_cache_path, center_cache_payload)
+                            pending_cache_writes = 0
+                    else:
+                        cache_hits += 1
+                    center_trajectory = _center_trajectory_wan21_t2v_to_tensor(cached_trajectory)
+                    key = (int(step_index), int(layer_index), int(head_index))
+                    probability_maps_by_step_layer_head[key] = probability_map
+                    center_trajectories_by_step_layer_head[key] = center_trajectory
+                    head_map_records.append(
                         {
                             "step": int(step_index),
                             "layer": int(layer_index),
                             "head": int(head_index),
                             "head_tag": f"L{int(layer_index)}H{int(head_index)}",
-                            "frame": int(frame_index),
-                            "center_y": float(center_trajectory[frame_index, 0].item()),
-                            "center_x": float(center_trajectory[frame_index, 1].item()),
+                            "frame_count": int(probability_map.size(0)),
+                            "token_grid_h": int(probability_map.size(1)),
+                            "token_grid_w": int(probability_map.size(2)),
                         }
                     )
-            if cache_dirty:
-                _save_wan21_t2v_head_trajectory_cache(center_cache_path, center_cache_payload)
+                    if extraction_progress_bar is not None:
+                        extraction_progress_bar.update(1)
+                if cache_dirty:
+                    _save_wan21_t2v_head_trajectory_cache(center_cache_path, center_cache_payload)
+                    pending_cache_writes = 0
+    finally:
+        if pending_cache_writes > 0:
+            _save_wan21_t2v_head_trajectory_cache(center_cache_path, center_cache_payload)
+        if extraction_progress_bar is not None:
+            extraction_progress_bar.close()
 
     if not head_map_records:
         raise ValueError(
             "No head maps remain after applying head filters. "
             f"requested_heads={list(head_trajectory_dynamics_heads)}"
         )
+
+    support_masks_by_key: Dict[Tuple[int, int, int], torch.Tensor] = {}
+    if bool(need_motion_planning_region_masks):
+        support_masks_by_key, cache_hits, cache_misses = _build_wan21_t2v_motion_planning_region_masks_with_progress(
+            probability_maps_by_step_layer_head=probability_maps_by_step_layer_head,
+            cache_payload=motion_planning_region_cache_payload,
+            cache_path=motion_planning_region_cache_path,
+            support_quantile=float(head_trajectory_dynamics_support_quantile),
+            min_component_area=int(head_trajectory_dynamics_support_viz_contour_min_component_area),
+            num_workers=int(head_trajectory_dynamics_support_cache_num_workers),
+            cache_save_interval=int(motion_planning_region_cache_save_interval),
+        )
+        motion_planning_region_cache_hits += int(cache_hits)
+        motion_planning_region_cache_misses += int(cache_misses)
+
+    (
+        overlay_plot_paths,
+        center_overlay_dir,
+        support_overlap_mask_dir,
+        num_center_overlay_pdfs,
+        num_support_overlap_mask_pdfs,
+    ) = _render_wan21_t2v_head_trajectory_overlays(
+        probability_maps_by_step_layer_head=probability_maps_by_step_layer_head,
+        center_trajectories_by_step_layer_head=center_trajectories_by_step_layer_head,
+        output_dir=output_dir,
+        requested_head_set=parsed_heads,
+        requested_center_viz_head_set=parsed_center_viz_heads,
+        requested_support_viz_head_set=parsed_support_viz_heads,
+        head_trajectory_dynamics_center_viz_enable=bool(head_trajectory_dynamics_center_viz_enable),
+        head_trajectory_dynamics_center_viz_step=int(head_trajectory_dynamics_center_viz_step),
+        head_trajectory_dynamics_center_viz_layer=int(head_trajectory_dynamics_center_viz_layer),
+        head_trajectory_dynamics_center_viz_num_frames=int(head_trajectory_dynamics_center_viz_num_frames),
+        head_trajectory_dynamics_support_viz_enable=bool(head_trajectory_dynamics_support_viz_enable),
+        head_trajectory_dynamics_support_viz_step=int(head_trajectory_dynamics_support_viz_step),
+        head_trajectory_dynamics_support_viz_layer=int(head_trajectory_dynamics_support_viz_layer),
+        head_trajectory_dynamics_support_viz_num_frames=int(head_trajectory_dynamics_support_viz_num_frames),
+        head_trajectory_dynamics_support_viz_contour_min_component_area=int(
+            head_trajectory_dynamics_support_viz_contour_min_component_area
+        ),
+        head_trajectory_dynamics_support_quantile=float(head_trajectory_dynamics_support_quantile),
+        head_trajectory_dynamics_skip_existing_plots=bool(head_trajectory_dynamics_skip_existing_plots),
+        reuse_video_frame_count=int(reuse_video_frame_count),
+    )
+
+    if bool(head_trajectory_dynamics_overlay_only):
+        summary_path = os.path.join(output_dir, "head_trajectory_dynamics_summary.json")
+        summary = _load_wan21_t2v_json_if_exists(summary_path)
+        summary.update(
+            {
+                "experiment": "wan21_t2v_head_trajectory_dynamics",
+                "head_trajectory_dynamics_overlay_only": True,
+                "head_trajectory_dynamics_skip_existing_plots": bool(head_trajectory_dynamics_skip_existing_plots),
+                "head_trajectory_dynamics_center_viz_enable": bool(head_trajectory_dynamics_center_viz_enable),
+                "head_trajectory_dynamics_support_viz_enable": bool(head_trajectory_dynamics_support_viz_enable),
+                "head_trajectory_dynamics_traj_type": str(head_trajectory_dynamics_traj_type),
+                "center_overlay_dir": center_overlay_dir,
+                "support_overlap_mask_dir": support_overlap_mask_dir,
+                "num_center_overlay_pdfs": int(num_center_overlay_pdfs),
+                "num_support_overlap_mask_pdfs": int(num_support_overlap_mask_pdfs),
+                "center_cache_json": center_cache_path,
+                "motion_planning_region_cache_json": motion_planning_region_cache_path,
+                "plot_paths": overlay_plot_paths,
+                "reuse_cross_attention_dir": cross_attention_dir,
+                "reuse_cross_attention_summary_path": cross_attention_summary_path,
+                "reuse_video_frame_count": int(reuse_video_frame_count),
+                "loaded_maps_source": loaded_maps_source,
+            }
+        )
+        _save_json(summary_path, summary)
+        if dist.is_initialized():
+            dist.barrier()
+        return summary
+
+    reference_motion_planning_region_mask = _build_wan21_t2v_motion_planning_region_mask_fhw(
+        probability_map_fhw=reference_probability_map,
+        quantile=float(head_trajectory_dynamics_support_quantile),
+        min_component_area=int(head_trajectory_dynamics_support_viz_contour_min_component_area),
+    )
+
+    if bool(head_trajectory_dynamics_use_motion_planning_region_before_metrics):
+        (
+            filtered_probability_maps_by_step_layer_head,
+        ) = (
+            _materialize_wan21_t2v_motion_planning_filtered_maps(
+                probability_maps_by_step_layer_head=probability_maps_by_step_layer_head,
+                motion_planning_region_masks_by_step_layer_head=support_masks_by_key,
+                progress_desc="head_trajectory apply mask",
+            ),
+        )
+        (
+            filtered_center_trajectories_by_step_layer_head,
+            filter_cache_hits,
+            filter_cache_misses,
+        ) = _materialize_wan21_t2v_motion_planning_filtered_centers(
+            filtered_probability_maps_by_step_layer_head=filtered_probability_maps_by_step_layer_head,
+            filtered_center_cache_payload=filtered_center_cache_payload,
+            filtered_center_cache_path=filtered_center_cache_path,
+            center_config=ordinary_center_config,
+            progress_desc="head_trajectory filtered centers",
+            cache_save_interval=int(cache_save_interval),
+        )
+        filtered_center_cache_hits += int(filter_cache_hits)
+        filtered_center_cache_misses += int(filter_cache_misses)
+
+        probability_maps_by_step_layer_head = filtered_probability_maps_by_step_layer_head
+        center_trajectories_by_step_layer_head = filtered_center_trajectories_by_step_layer_head
+        reference_probability_map = _apply_wan21_t2v_motion_planning_region_to_probability_map(
+            probability_map_fhw=reference_probability_map,
+            motion_planning_region_mask_fhw=reference_motion_planning_region_mask,
+        )
+        filtered_reference_center_trajectory = _get_wan21_t2v_cached_reference_center_trajectory(
+            cache_payload=filtered_center_cache_payload
+        )
+        if filtered_reference_center_trajectory is None:
+            reference_center_trajectory, reference_center_stats = _extract_wan21_t2v_head_trajectory_centers(
+                map_fhw=reference_probability_map,
+                center_method=str(reference_center_config["center_method"]),
+                center_power=float(reference_center_config["center_power"]),
+                center_quantile=float(reference_center_config["center_quantile"]),
+                preprocessed_center_mode=str(reference_center_config["preprocessed_center_mode"]),
+                preprocess_winsorize_quantile=float(reference_center_config["preprocess_winsorize_quantile"]),
+                preprocess_despike_quantile=float(reference_center_config["preprocess_despike_quantile"]),
+                preprocess_min_component_area=int(reference_center_config["preprocess_min_component_area"]),
+            )
+            filtered_reference_center_trajectory = reference_center_trajectory
+            _set_wan21_t2v_cached_reference_center_trajectory(
+                cache_payload=filtered_center_cache_payload,
+                trajectory=filtered_reference_center_trajectory,
+            )
+            filtered_center_cache_payload["reference_center_stats"] = dict(reference_center_stats)
+            filtered_center_cache_misses += 1
+            _save_wan21_t2v_head_trajectory_cache(filtered_center_cache_path, filtered_center_cache_payload)
+        else:
+            filtered_center_cache_hits += 1
+            reference_center_stats = filtered_center_cache_payload.get("reference_center_stats", {})
+            if not isinstance(reference_center_stats, dict):
+                reference_center_stats = {
+                    "center_method": str(reference_center_config["center_method"]),
+                    "center_power": float(reference_center_config["center_power"]),
+                    "center_quantile": float(reference_center_config["center_quantile"]),
+                    "preprocess_enabled": 1
+                    if str(reference_center_config["center_method"]).strip().lower() == "preprocessed_component_center"
+                    else 0,
+                    "preprocessed_center_mode": str(reference_center_config["preprocessed_center_mode"]).strip().lower(),
+                }
+        final_reference_center = _center_trajectory_wan21_t2v_to_tensor(filtered_reference_center_trajectory)
+
+    reference_distance_rows = []
+    center_rows = []
+    for step_index, layer_index, head_index in sorted(probability_maps_by_step_layer_head.keys()):
+        probability_map = probability_maps_by_step_layer_head[(int(step_index), int(layer_index), int(head_index))]
+        center_trajectory = center_trajectories_by_step_layer_head[(int(step_index), int(layer_index), int(head_index))]
+        reference_row = {
+            "step": int(step_index),
+            "layer": int(layer_index),
+            "head": int(head_index),
+            "head_tag": f"L{int(layer_index)}H{int(head_index)}",
+        }
+        if "js" in requested_distance_metrics:
+            reference_row["js_reference_distance"] = float(
+                _js_wan21_t2v_distance_per_frame(probability_map, reference_probability_map).mean().item()
+            )
+        if "hellinger" in requested_distance_metrics:
+            reference_row["hellinger_reference_distance"] = float(
+                _hellinger_wan21_t2v_distance_per_frame(probability_map, reference_probability_map).mean().item()
+            )
+        if "wasserstein_map" in requested_distance_metrics:
+            reference_row["wasserstein_map_reference_distance"] = float(
+                _marginal_wasserstein_wan21_t2v_distance_per_frame(probability_map, reference_probability_map).mean().item()
+            )
+        if "support_overlap" in requested_distance_metrics:
+            if bool(head_trajectory_dynamics_use_motion_planning_region_before_metrics):
+                reference_support_iou = _support_overlap_mask_iou_wan21_t2v_per_frame(
+                    support_masks_by_key[(int(step_index), int(layer_index), int(head_index))],
+                    reference_motion_planning_region_mask,
+                )
+            else:
+                reference_support_iou = _support_overlap_iou_wan21_t2v_per_frame(
+                    probability_map,
+                    reference_probability_map,
+                    quantile=float(head_trajectory_dynamics_support_quantile),
+                )
+            reference_row["support_overlap_reference_iou"] = float(reference_support_iou.mean().item())
+            reference_row["support_overlap_reference_distance"] = float((1.0 - reference_support_iou).mean().item())
+        if "center_l2" in requested_distance_metrics:
+            reference_row["center_l2_reference_distance"] = float(
+                _trajectory_distance_wan21_t2v_soft_centers(center_trajectory, final_reference_center)
+            )
+        reference_distance_rows.append(reference_row)
+        for frame_index in range(int(center_trajectory.size(0))):
+            center_rows.append(
+                {
+                    "step": int(step_index),
+                    "layer": int(layer_index),
+                    "head": int(head_index),
+                    "head_tag": f"L{int(layer_index)}H{int(head_index)}",
+                    "frame": int(frame_index),
+                    "center_y": float(center_trajectory[frame_index, 0].item()),
+                    "center_x": float(center_trajectory[frame_index, 1].item()),
+                }
+            )
 
     per_step_layer_heads: Dict[Tuple[int, int], List[int]] = defaultdict(list)
     for step_index, layer_index, head_index in probability_maps_by_step_layer_head.keys():
@@ -889,146 +2933,18 @@ def run_wan21_t2v_head_trajectory_dynamics(
     for key in per_step_layer_heads:
         per_step_layer_heads[key] = sorted(set(per_step_layer_heads[key]))
 
-    for (step_index, layer_index), head_indices in sorted(per_step_layer_heads.items()):
-        metric_to_pairwise_values: Dict[str, List[float]] = {metric_name: [] for metric_name in requested_distance_metrics}
-        for head_i_idx in range(len(head_indices)):
-            head_i = int(head_indices[head_i_idx])
-            prob_i = probability_maps_by_step_layer_head[(step_index, layer_index, head_i)]
-            for head_j_idx in range(head_i_idx + 1, len(head_indices)):
-                head_j = int(head_indices[head_j_idx])
-                prob_j = probability_maps_by_step_layer_head[(step_index, layer_index, head_j)]
-                row = {
-                    "step": int(step_index),
-                    "layer": int(layer_index),
-                    "head_a": int(head_i),
-                    "head_b": int(head_j),
-                    "head_tag_a": f"L{int(layer_index)}H{int(head_i)}",
-                    "head_tag_b": f"L{int(layer_index)}H{int(head_j)}",
-                }
-                if "js" in requested_distance_metrics:
-                    js_distance = _js_wan21_t2v_distance_per_frame(prob_i, prob_j).mean().item()
-                    row["js_distance"] = float(js_distance)
-                    metric_to_pairwise_values["js"].append(float(js_distance))
-                if "hellinger" in requested_distance_metrics:
-                    hellinger_distance = _hellinger_wan21_t2v_distance_per_frame(prob_i, prob_j).mean().item()
-                    row["hellinger_distance"] = float(hellinger_distance)
-                    metric_to_pairwise_values["hellinger"].append(float(hellinger_distance))
-                if "wasserstein_map" in requested_distance_metrics:
-                    wasserstein_map_distance = _marginal_wasserstein_wan21_t2v_distance_per_frame(prob_i, prob_j).mean().item()
-                    row["wasserstein_map_distance"] = float(wasserstein_map_distance)
-                    metric_to_pairwise_values["wasserstein_map"].append(float(wasserstein_map_distance))
-                if "support_overlap" in requested_distance_metrics:
-                    support_iou = _support_overlap_iou_wan21_t2v_per_frame(
-                        prob_i,
-                        prob_j,
-                        quantile=float(head_trajectory_dynamics_support_quantile),
-                    )
-                    row["support_overlap_iou"] = float(support_iou.mean().item())
-                    row["support_overlap_distance"] = float((1.0 - support_iou).mean().item())
-                    metric_to_pairwise_values["support_overlap"].append(float((1.0 - support_iou).mean().item()))
-                if "center_l2" in requested_distance_metrics:
-                    center_i = center_trajectories_by_step_layer_head[(step_index, layer_index, head_i)]
-                    center_j = center_trajectories_by_step_layer_head[(step_index, layer_index, head_j)]
-                    center_distance = _center_trajectory_wan21_t2v_distance_per_frame(center_i, center_j).mean().item()
-                    row["center_l2_distance"] = float(center_distance)
-                    metric_to_pairwise_values["center_l2"].append(float(center_distance))
-                pairwise_rows.append(row)
-
-        consensus_row = {
-            "step": int(step_index),
-            "layer": int(layer_index),
-            "num_heads": int(len(head_indices)),
-        }
-        for metric_name in requested_distance_metrics:
-            values = metric_to_pairwise_values[metric_name]
-            if values:
-                mean_distance = float(sum(values) / len(values))
-                consensus_row[f"{metric_name}_pairwise_distance_mean"] = mean_distance
-                consensus_row[f"{metric_name}_consensus"] = float(1.0 / (1.0 + mean_distance))
-            else:
-                consensus_row[f"{metric_name}_pairwise_distance_mean"] = 0.0
-                consensus_row[f"{metric_name}_consensus"] = 1.0
-        consensus_rows.append(consensus_row)
-
+    pairwise_task_count = 0
+    for head_indices in per_step_layer_heads.values():
+        pairwise_task_count += int(len(head_indices) * max(0, len(head_indices) - 1) / 2)
+    attractor_task_count = 0
     sorted_resolved_steps = sorted(int(step) for step in resolved_steps)
-    step_to_index = {step: idx for idx, step in enumerate(sorted_resolved_steps)}
     for step_index in sorted_resolved_steps[:-1]:
-        step_pos = step_to_index[int(step_index)]
-        future_steps = sorted_resolved_steps[step_pos + 1: step_pos + 1 + max(1, int(head_trajectory_dynamics_attractor_window))]
-        next_step = future_steps[0] if future_steps else None
         for layer_index in available_layers:
             head_indices = per_step_layer_heads.get((int(step_index), int(layer_index)), [])
-            if not head_indices or not future_steps:
+            if not head_indices:
                 continue
-            future_head_sets = {
-                int(future_step): set(per_step_layer_heads.get((int(future_step), int(layer_index)), []))
-                for future_step in future_steps
-            }
-            for leader_head in head_indices:
-                leader_key = (int(step_index), int(layer_index), int(leader_head))
-                if leader_key not in center_trajectories_by_step_layer_head:
-                    continue
-                leader_traj = center_trajectories_by_step_layer_head[leader_key]
-                one_step_deltas = []
-                window_mean_deltas = []
-                best_future_deltas = []
-                for follower_head in head_indices:
-                    if int(follower_head) == int(leader_head):
-                        continue
-                    follower_current_key = (int(step_index), int(layer_index), int(follower_head))
-                    if follower_current_key not in center_trajectories_by_step_layer_head:
-                        continue
-                    follower_current = center_trajectories_by_step_layer_head[follower_current_key]
-                    current_distance = _trajectory_distance_wan21_t2v_soft_centers(follower_current, leader_traj)
-                    future_distances = []
-                    for future_step in future_steps:
-                        if int(follower_head) not in future_head_sets[int(future_step)]:
-                            continue
-                        follower_future = center_trajectories_by_step_layer_head[(int(future_step), int(layer_index), int(follower_head))]
-                        future_distances.append(
-                            (
-                                int(future_step),
-                                float(_trajectory_distance_wan21_t2v_soft_centers(follower_future, leader_traj)),
-                            )
-                        )
-                    if not future_distances:
-                        continue
-                    if next_step is not None and future_distances[0][0] == int(next_step):
-                        one_step_deltas.append(float(current_distance - future_distances[0][1]))
-                    window_mean_deltas.append(
-                        float(
-                            current_distance
-                            - sum(distance for _, distance in future_distances) / float(len(future_distances))
-                        )
-                    )
-                    best_future_deltas.append(
-                        float(current_distance - min(distance for _, distance in future_distances))
-                    )
-
-                method_to_deltas = {
-                    "one_step": one_step_deltas,
-                    "window_mean": window_mean_deltas,
-                    "best_future": best_future_deltas,
-                }
-                for method_name, deltas in method_to_deltas.items():
-                    if not deltas:
-                        continue
-                    attractor_rows.append(
-                        {
-                            "step": int(step_index),
-                            "next_step": int(next_step) if next_step is not None else -1,
-                            "window_end_step": int(future_steps[-1]),
-                            "layer": int(layer_index),
-                            "head": int(leader_head),
-                            "head_tag": f"L{int(layer_index)}H{int(leader_head)}",
-                            "attractor_method": method_name,
-                            "attractor_score_mean": float(sum(deltas) / len(deltas)),
-                            "attractor_score_max": float(max(deltas)),
-                            "attractor_score_min": float(min(deltas)),
-                            "num_followers": int(len(deltas)),
-                        }
-                    )
-
+            attractor_task_count += int(len(head_indices) * len(requested_attractor_distance_metrics))
+    convergence_task_count = 0
     metric_to_reference_key = {
         "js": "js_reference_distance",
         "hellinger": "hellinger_reference_distance",
@@ -1044,333 +2960,294 @@ def run_wan21_t2v_head_trajectory_dynamics(
                 if int(row["layer"]) == int(layer_index)
             )
         )
-        for head_index in layer_heads:
-            head_rows = sorted(
-                [
-                    row
-                    for row in reference_distance_rows
-                    if int(row["layer"]) == int(layer_index) and int(row["head"]) == int(head_index)
-                ],
-                key=lambda row: int(row["step"]),
-            )
-            if not head_rows:
-                continue
-            for metric_name, metric_key in metric_to_reference_key.items():
-                if metric_name not in requested_distance_metrics:
-                    continue
-                values = [float(row[metric_key]) for row in head_rows if metric_key in row]
-                if not values:
-                    continue
-                initial_distance = float(values[0])
-                final_distance = float(values[-1])
-                distance_gap = max(0.0, initial_distance - final_distance)
-                lock_in_step_rho_0p2 = ""
-                lock_in_step_rho_0p5 = ""
-                threshold_0p2 = final_distance + 0.2 * distance_gap
-                threshold_0p5 = final_distance + 0.5 * distance_gap
-                for row in head_rows:
-                    step_value = int(row["step"])
-                    metric_value = float(row[metric_key])
-                    if lock_in_step_rho_0p2 == "" and metric_value <= threshold_0p2:
-                        lock_in_step_rho_0p2 = step_value
-                    if lock_in_step_rho_0p5 == "" and metric_value <= threshold_0p5:
-                        lock_in_step_rho_0p5 = step_value
-                convergence_rows.append(
-                    {
-                        "layer": int(layer_index),
-                        "head": int(head_index),
-                        "head_tag": f"L{int(layer_index)}H{int(head_index)}",
-                        "metric": metric_name,
-                        "initial_reference_distance": initial_distance,
-                        "final_reference_distance": final_distance,
-                        "reference_distance_auc": float(sum(values) / len(values)),
-                        "lock_in_step_rho_0p2": lock_in_step_rho_0p2,
-                        "lock_in_step_rho_0p5": lock_in_step_rho_0p5,
-                    }
-                )
+        convergence_task_count += int(len(layer_heads) * len(requested_distance_metrics))
 
-    _save_csv(os.path.join(output_dir, "head_trajectory_dynamics_head_maps.csv"), head_map_records)
-    _save_csv(os.path.join(output_dir, "head_trajectory_dynamics_pairwise.csv"), pairwise_rows)
-    _save_csv(os.path.join(output_dir, "head_trajectory_dynamics_consensus.csv"), consensus_rows)
-    _save_csv(os.path.join(output_dir, "head_trajectory_dynamics_attractor.csv"), attractor_rows)
-    _save_csv(os.path.join(output_dir, "head_trajectory_dynamics_reference_distance.csv"), reference_distance_rows)
-    _save_csv(os.path.join(output_dir, "head_trajectory_dynamics_convergence.csv"), convergence_rows)
-    trajectory_centers_csv_path = os.path.join(output_dir, "head_trajectory_dynamics_trajectory_centers.csv")
-    legacy_soft_centers_csv_path = os.path.join(output_dir, "head_trajectory_dynamics_soft_centers.csv")
+    metric_progress_bar = None
+    total_metric_tasks = int(pairwise_task_count + attractor_task_count + convergence_task_count)
+    if total_metric_tasks > 0:
+        try:
+            from tqdm import tqdm
+            metric_progress_bar = tqdm(
+                total=int(total_metric_tasks),
+                desc="head_trajectory_dynamics metrics",
+                unit="task",
+                leave=True,
+            )
+        except Exception:
+            metric_progress_bar = None
+
+    try:
+        for (step_index, layer_index), head_indices in sorted(per_step_layer_heads.items()):
+            metric_to_pairwise_values: Dict[str, List[float]] = {metric_name: [] for metric_name in requested_distance_metrics}
+            for head_i_idx in range(len(head_indices)):
+                head_i = int(head_indices[head_i_idx])
+                prob_i = probability_maps_by_step_layer_head[(step_index, layer_index, head_i)]
+                for head_j_idx in range(head_i_idx + 1, len(head_indices)):
+                    head_j = int(head_indices[head_j_idx])
+                    prob_j = probability_maps_by_step_layer_head[(step_index, layer_index, head_j)]
+                    row = {
+                        "step": int(step_index),
+                        "layer": int(layer_index),
+                        "head_a": int(head_i),
+                        "head_b": int(head_j),
+                        "head_tag_a": f"L{int(layer_index)}H{int(head_i)}",
+                        "head_tag_b": f"L{int(layer_index)}H{int(head_j)}",
+                    }
+                    if "js" in requested_distance_metrics:
+                        js_distance = _js_wan21_t2v_distance_per_frame(prob_i, prob_j).mean().item()
+                        row["js_distance"] = float(js_distance)
+                        metric_to_pairwise_values["js"].append(float(js_distance))
+                    if "hellinger" in requested_distance_metrics:
+                        hellinger_distance = _hellinger_wan21_t2v_distance_per_frame(prob_i, prob_j).mean().item()
+                        row["hellinger_distance"] = float(hellinger_distance)
+                        metric_to_pairwise_values["hellinger"].append(float(hellinger_distance))
+                    if "wasserstein_map" in requested_distance_metrics:
+                        wasserstein_map_distance = _marginal_wasserstein_wan21_t2v_distance_per_frame(prob_i, prob_j).mean().item()
+                        row["wasserstein_map_distance"] = float(wasserstein_map_distance)
+                        metric_to_pairwise_values["wasserstein_map"].append(float(wasserstein_map_distance))
+                    if "support_overlap" in requested_distance_metrics:
+                        if bool(head_trajectory_dynamics_use_motion_planning_region_before_metrics):
+                            support_iou = _support_overlap_mask_iou_wan21_t2v_per_frame(
+                                support_masks_by_key[(int(step_index), int(layer_index), int(head_i))],
+                                support_masks_by_key[(int(step_index), int(layer_index), int(head_j))],
+                            )
+                        else:
+                            support_iou = _support_overlap_iou_wan21_t2v_per_frame(
+                                prob_i,
+                                prob_j,
+                                quantile=float(head_trajectory_dynamics_support_quantile),
+                            )
+                        row["support_overlap_iou"] = float(support_iou.mean().item())
+                        row["support_overlap_distance"] = float((1.0 - support_iou).mean().item())
+                        metric_to_pairwise_values["support_overlap"].append(float((1.0 - support_iou).mean().item()))
+                    if "center_l2" in requested_distance_metrics:
+                        center_i = center_trajectories_by_step_layer_head[(step_index, layer_index, head_i)]
+                        center_j = center_trajectories_by_step_layer_head[(step_index, layer_index, head_j)]
+                        center_distance = _center_trajectory_wan21_t2v_distance_per_frame(center_i, center_j).mean().item()
+                        row["center_l2_distance"] = float(center_distance)
+                        metric_to_pairwise_values["center_l2"].append(float(center_distance))
+                    pairwise_rows.append(row)
+                    if metric_progress_bar is not None:
+                        metric_progress_bar.update(1)
+
+            consensus_row = {
+                "step": int(step_index),
+                "layer": int(layer_index),
+                "num_heads": int(len(head_indices)),
+            }
+            for metric_name in requested_distance_metrics:
+                values = metric_to_pairwise_values[metric_name]
+                if values:
+                    mean_distance = float(sum(values) / len(values))
+                    consensus_row[f"{metric_name}_pairwise_distance_mean"] = mean_distance
+                    consensus_row[f"{metric_name}_consensus"] = float(1.0 / (1.0 + mean_distance))
+                else:
+                    consensus_row[f"{metric_name}_pairwise_distance_mean"] = 0.0
+                    consensus_row[f"{metric_name}_consensus"] = 1.0
+            consensus_rows.append(consensus_row)
+
+        step_to_index = {step: idx for idx, step in enumerate(sorted_resolved_steps)}
+        for step_index in sorted_resolved_steps[:-1]:
+            step_pos = step_to_index[int(step_index)]
+            future_steps = sorted_resolved_steps[step_pos + 1: step_pos + 1 + max(1, int(head_trajectory_dynamics_attractor_window))]
+            next_step = future_steps[0] if future_steps else None
+            for layer_index in available_layers:
+                head_indices = per_step_layer_heads.get((int(step_index), int(layer_index)), [])
+                if not head_indices or not future_steps:
+                    continue
+                future_head_sets = {
+                    int(future_step): set(per_step_layer_heads.get((int(future_step), int(layer_index)), []))
+                    for future_step in future_steps
+                }
+                for leader_head in head_indices:
+                    leader_key = (int(step_index), int(layer_index), int(leader_head))
+                    if leader_key not in center_trajectories_by_step_layer_head:
+                        continue
+                    leader_traj = center_trajectories_by_step_layer_head[leader_key]
+                    leader_prob = probability_maps_by_step_layer_head[leader_key]
+                    for attractor_distance_metric in requested_attractor_distance_metrics:
+                        one_step_deltas = []
+                        window_mean_deltas = []
+                        best_future_deltas = []
+                        for follower_head in head_indices:
+                            if int(follower_head) == int(leader_head):
+                                continue
+                            follower_current_key = (int(step_index), int(layer_index), int(follower_head))
+                            if follower_current_key not in center_trajectories_by_step_layer_head:
+                                continue
+                            follower_current = center_trajectories_by_step_layer_head[follower_current_key]
+                            follower_current_prob = probability_maps_by_step_layer_head[follower_current_key]
+                            current_distance = _compute_wan21_t2v_head_trajectory_distance(
+                                metric_name=attractor_distance_metric,
+                                probability_map_a_fhw=follower_current_prob,
+                                probability_map_b_fhw=leader_prob,
+                                center_traj_a=follower_current,
+                                center_traj_b=leader_traj,
+                                support_quantile=float(head_trajectory_dynamics_support_quantile),
+                                use_motion_planning_region_for_support_overlap=bool(
+                                    head_trajectory_dynamics_use_motion_planning_region_before_metrics
+                                ),
+                                support_mask_a_fhw=(
+                                    support_masks_by_key[follower_current_key]
+                                    if follower_current_key in support_masks_by_key else None
+                                ),
+                                support_mask_b_fhw=(
+                                    support_masks_by_key[leader_key]
+                                    if leader_key in support_masks_by_key else None
+                                ),
+                            )
+                            future_distances = []
+                            for future_step in future_steps:
+                                if int(follower_head) not in future_head_sets[int(future_step)]:
+                                    continue
+                                follower_future_key = (int(future_step), int(layer_index), int(follower_head))
+                                follower_future = center_trajectories_by_step_layer_head[follower_future_key]
+                                follower_future_prob = probability_maps_by_step_layer_head[follower_future_key]
+                                future_distances.append(
+                                    (
+                                        int(future_step),
+                                        _compute_wan21_t2v_head_trajectory_distance(
+                                            metric_name=attractor_distance_metric,
+                                            probability_map_a_fhw=follower_future_prob,
+                                            probability_map_b_fhw=leader_prob,
+                                            center_traj_a=follower_future,
+                                            center_traj_b=leader_traj,
+                                            support_quantile=float(head_trajectory_dynamics_support_quantile),
+                                            use_motion_planning_region_for_support_overlap=bool(
+                                                head_trajectory_dynamics_use_motion_planning_region_before_metrics
+                                            ),
+                                            support_mask_a_fhw=(
+                                                support_masks_by_key[follower_future_key]
+                                                if follower_future_key in support_masks_by_key else None
+                                            ),
+                                            support_mask_b_fhw=(
+                                                support_masks_by_key[leader_key]
+                                                if leader_key in support_masks_by_key else None
+                                            ),
+                                        ),
+                                    )
+                                )
+                            if not future_distances:
+                                continue
+                            if next_step is not None and future_distances[0][0] == int(next_step):
+                                one_step_deltas.append(float(current_distance - future_distances[0][1]))
+                            window_mean_deltas.append(
+                                float(
+                                    current_distance
+                                    - sum(distance for _, distance in future_distances) / float(len(future_distances))
+                                )
+                            )
+                            best_future_deltas.append(
+                                float(current_distance - min(distance for _, distance in future_distances))
+                            )
+
+                        method_to_deltas = {
+                            "one_step": one_step_deltas,
+                            "window_mean": window_mean_deltas,
+                            "best_future": best_future_deltas,
+                        }
+                        for method_name, deltas in method_to_deltas.items():
+                            if not deltas:
+                                continue
+                            attractor_rows.append(
+                                {
+                                    "step": int(step_index),
+                                    "next_step": int(next_step) if next_step is not None else -1,
+                                    "window_end_step": int(future_steps[-1]),
+                                    "layer": int(layer_index),
+                                    "head": int(leader_head),
+                                    "head_tag": f"L{int(layer_index)}H{int(leader_head)}",
+                                    "attractor_method": method_name,
+                                    "attractor_distance_metric": str(attractor_distance_metric),
+                                    "attractor_score_mean": float(sum(deltas) / len(deltas)),
+                                    "attractor_score_max": float(max(deltas)),
+                                    "attractor_score_min": float(min(deltas)),
+                                    "num_followers": int(len(deltas)),
+                                }
+                            )
+                        if metric_progress_bar is not None:
+                            metric_progress_bar.update(1)
+
+        for layer_index in available_layers:
+            layer_heads = sorted(
+                set(
+                    int(row["head"])
+                    for row in reference_distance_rows
+                    if int(row["layer"]) == int(layer_index)
+                )
+            )
+            for head_index in layer_heads:
+                head_rows = sorted(
+                    [
+                        row
+                        for row in reference_distance_rows
+                        if int(row["layer"]) == int(layer_index) and int(row["head"]) == int(head_index)
+                    ],
+                    key=lambda row: int(row["step"]),
+                )
+                if not head_rows:
+                    continue
+                for metric_name, metric_key in metric_to_reference_key.items():
+                    if metric_name not in requested_distance_metrics:
+                        continue
+                    values = [float(row[metric_key]) for row in head_rows if metric_key in row]
+                    if not values:
+                        continue
+                    initial_distance = float(values[0])
+                    final_distance = float(values[-1])
+                    distance_gap = max(0.0, initial_distance - final_distance)
+                    lock_in_step_rho_0p2 = ""
+                    lock_in_step_rho_0p5 = ""
+                    threshold_0p2 = final_distance + 0.2 * distance_gap
+                    threshold_0p5 = final_distance + 0.5 * distance_gap
+                    for row in head_rows:
+                        step_value = int(row["step"])
+                        metric_value = float(row[metric_key])
+                        if lock_in_step_rho_0p2 == "" and metric_value <= threshold_0p2:
+                            lock_in_step_rho_0p2 = step_value
+                        if lock_in_step_rho_0p5 == "" and metric_value <= threshold_0p5:
+                            lock_in_step_rho_0p5 = step_value
+                    convergence_rows.append(
+                        {
+                            "layer": int(layer_index),
+                            "head": int(head_index),
+                            "head_tag": f"L{int(layer_index)}H{int(head_index)}",
+                            "metric": metric_name,
+                            "initial_reference_distance": initial_distance,
+                            "final_reference_distance": final_distance,
+                            "reference_distance_auc": float(sum(values) / len(values)),
+                            "lock_in_step_rho_0p2": lock_in_step_rho_0p2,
+                            "lock_in_step_rho_0p5": lock_in_step_rho_0p5,
+                        }
+                    )
+                    if metric_progress_bar is not None:
+                        metric_progress_bar.update(1)
+    finally:
+        if metric_progress_bar is not None:
+            metric_progress_bar.close()
+
+    _ensure_dir(metrics_output_dir)
+    _save_csv(os.path.join(metrics_output_dir, "head_trajectory_dynamics_head_maps.csv"), head_map_records)
+    _save_csv(os.path.join(metrics_output_dir, "head_trajectory_dynamics_pairwise.csv"), pairwise_rows)
+    _save_csv(os.path.join(metrics_output_dir, "head_trajectory_dynamics_consensus.csv"), consensus_rows)
+    _save_csv(os.path.join(metrics_output_dir, "head_trajectory_dynamics_attractor.csv"), attractor_rows)
+    _save_csv(os.path.join(metrics_output_dir, "head_trajectory_dynamics_reference_distance.csv"), reference_distance_rows)
+    _save_csv(os.path.join(metrics_output_dir, "head_trajectory_dynamics_convergence.csv"), convergence_rows)
+    trajectory_centers_csv_path = os.path.join(metrics_output_dir, "head_trajectory_dynamics_trajectory_centers.csv")
+    legacy_soft_centers_csv_path = os.path.join(metrics_output_dir, "head_trajectory_dynamics_soft_centers.csv")
     _save_csv(trajectory_centers_csv_path, center_rows)
     _save_csv(legacy_soft_centers_csv_path, center_rows)
 
-    plot_paths = []
-    plots_dir = os.path.join(output_dir, "head_trajectory_dynamics_plots")
-
-    for metric_name in requested_distance_metrics:
-        for layer_index in available_layers:
-            layer_rows = [row for row in consensus_rows if int(row["layer"]) == int(layer_index)]
-            if not layer_rows:
-                continue
-            plot_path = _plot_wan21_t2v_head_trajectory_dynamics_curve(
-                rows=layer_rows,
-                save_file=os.path.join(
-                    plots_dir,
-                    "consensus_curves",
-                    metric_name,
-                    f"consensus_layer_{int(layer_index):02d}_{metric_name}.pdf",
-                ),
-                metric_key=f"{metric_name}_consensus",
-                title=f"Head Trajectory Consensus ({metric_name}) | layer={int(layer_index)}",
-                y_label=f"{metric_name} consensus",
-            )
-            if plot_path:
-                plot_paths.append(plot_path)
-
-        heatmap_path = _plot_wan21_t2v_head_trajectory_dynamics_heatmap(
-            matrix_rows=consensus_rows,
-            save_file=os.path.join(
-                plots_dir,
-                "consensus_heatmaps",
-                f"consensus_heatmap_{metric_name}.pdf",
-            ),
-            title=f"Head Trajectory Consensus Heatmap ({metric_name})",
-            row_key="layer",
-            col_key="step",
-            value_key=f"{metric_name}_consensus",
-            row_label="layer",
-            col_label="diffusion step",
-        )
-        if heatmap_path:
-            plot_paths.append(heatmap_path)
-
-    attractor_methods = sorted(set(str(row["attractor_method"]) for row in attractor_rows))
-    for method_name in attractor_methods:
-        for layer_index in available_layers:
-            layer_attractor_rows = [
-                row for row in attractor_rows
-                if int(row["layer"]) == int(layer_index) and str(row["attractor_method"]) == method_name
-            ]
-            if not layer_attractor_rows:
-                continue
-            by_head: Dict[str, List[Dict[str, object]]] = defaultdict(list)
-            for row in layer_attractor_rows:
-                by_head[str(row["head_tag"])].append(row)
-
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-
-            fig, axis = plt.subplots(1, 1, figsize=(8.2, 5.0))
-            head_tags = sorted(by_head.keys())
-            color_map = plt.get_cmap("tab20", max(1, len(head_tags)))
-            for color_index, head_tag in enumerate(head_tags):
-                head_rows = sorted(by_head[head_tag], key=lambda row: int(row["step"]))
-                x_steps = [int(row["step"]) for row in head_rows]
-                y_values = [float(row["attractor_score_mean"]) for row in head_rows]
-                axis.plot(
-                    x_steps,
-                    y_values,
-                    linewidth=1.4,
-                    alpha=0.92,
-                    color=color_map(color_index),
-                    label=head_tag,
-                )
-            axis.set_title(f"Head Attractor Score ({method_name}) | layer={int(layer_index)}")
-            axis.set_xlabel("diffusion step")
-            axis.set_ylabel("attractor score")
-            axis.grid(alpha=0.22, linestyle="--")
-            if len(head_tags) <= 20:
-                axis.legend(fontsize=7, ncol=2)
-            fig.tight_layout()
-            plot_path = os.path.join(
-                plots_dir,
-                "attractor_curves",
-                method_name,
-                f"attractor_layer_{int(layer_index):02d}.pdf",
-            )
-            _ensure_dir(os.path.dirname(plot_path))
-            fig.savefig(plot_path, format="pdf")
-            plt.close(fig)
-            plot_paths.append(plot_path)
-
-    metric_to_reference_key = {
-        "js": "js_reference_distance",
-        "hellinger": "hellinger_reference_distance",
-        "wasserstein_map": "wasserstein_map_reference_distance",
-        "support_overlap": "support_overlap_reference_distance",
-        "center_l2": "center_l2_reference_distance",
-    }
-    for metric_name, metric_key in metric_to_reference_key.items():
-        if metric_name not in requested_distance_metrics:
-            continue
-        for layer_index in available_layers:
-            layer_reference_curve_rows = [
-                row
-                for row in reference_distance_rows
-                if int(row["layer"]) == int(layer_index) and metric_key in row
-            ]
-            if layer_reference_curve_rows:
-                curve_path = _plot_wan21_t2v_head_trajectory_dynamics_multihead_curve(
-                    rows=layer_reference_curve_rows,
-                    save_file=os.path.join(
-                        plots_dir,
-                        "reference_distance_curves",
-                        metric_name,
-                        f"reference_distance_layer_{int(layer_index):02d}.pdf",
-                    ),
-                    metric_key=metric_key,
-                    title=f"Reference Distance Curves ({metric_name}) | layer={int(layer_index)}",
-                    y_label=f"{metric_name} reference distance",
-                )
-                if curve_path:
-                    plot_paths.append(curve_path)
-
-            layer_reference_rows = [
-                {
-                    "step": int(row["step"]),
-                    "head": int(row["head"]),
-                    metric_key: float(row[metric_key]),
-                }
-                for row in reference_distance_rows
-                if int(row["layer"]) == int(layer_index) and metric_key in row
-            ]
-            if not layer_reference_rows:
-                continue
-            heatmap_path = _plot_wan21_t2v_head_trajectory_dynamics_heatmap(
-                matrix_rows=layer_reference_rows,
-                save_file=os.path.join(
-                    plots_dir,
-                    "reference_distance_heatmaps",
-                    metric_name,
-                    f"reference_distance_layer_{int(layer_index):02d}.pdf",
-                ),
-                title=f"Reference Distance Heatmap ({metric_name}) | layer={int(layer_index)}",
-                row_key="head",
-                col_key="step",
-                value_key=metric_key,
-                row_label="head",
-                col_label="diffusion step",
-            )
-            if heatmap_path:
-                plot_paths.append(heatmap_path)
-
-        metric_convergence_rows = [
-            row
-            for row in convergence_rows
-            if str(row["metric"]) == metric_name
-        ]
-        if metric_convergence_rows:
-            auc_heatmap_rows = [
-                {
-                    "layer": int(row["layer"]),
-                    "head": int(row["head"]),
-                    "reference_distance_auc": float(row["reference_distance_auc"]),
-                }
-                for row in metric_convergence_rows
-            ]
-            auc_heatmap_path = _plot_wan21_t2v_head_trajectory_dynamics_heatmap(
-                matrix_rows=auc_heatmap_rows,
-                save_file=os.path.join(
-                    plots_dir,
-                    "convergence_heatmaps",
-                    metric_name,
-                    "reference_distance_auc.pdf",
-                ),
-                title=f"Reference Distance AUC ({metric_name})",
-                row_key="layer",
-                col_key="head",
-                value_key="reference_distance_auc",
-                row_label="layer",
-                col_label="head",
-            )
-            if auc_heatmap_path:
-                plot_paths.append(auc_heatmap_path)
-
-            for lock_in_key in ("lock_in_step_rho_0p2", "lock_in_step_rho_0p5"):
-                lock_in_rows = [
-                    {
-                        "layer": int(row["layer"]),
-                        "head": int(row["head"]),
-                        lock_in_key: float(row[lock_in_key]),
-                    }
-                    for row in metric_convergence_rows
-                    if str(row[lock_in_key]) != ""
-                ]
-                if not lock_in_rows:
-                    continue
-                lock_in_path = _plot_wan21_t2v_head_trajectory_dynamics_heatmap(
-                    matrix_rows=lock_in_rows,
-                    save_file=os.path.join(
-                        plots_dir,
-                        "convergence_heatmaps",
-                        metric_name,
-                        f"{lock_in_key}.pdf",
-                    ),
-                    title=f"{lock_in_key} ({metric_name})",
-                    row_key="layer",
-                    col_key="head",
-                    value_key=lock_in_key,
-                    row_label="layer",
-                    col_label="head",
-                )
-                if lock_in_path:
-                    plot_paths.append(lock_in_path)
-
-    center_overlay_dir = os.path.join(output_dir, "head_trajectory_dynamics_head_center_overlays")
-    center_overlay_specs: List[Tuple[int, int, int]] = []
-    explicit_center_viz = (
-        int(head_trajectory_dynamics_center_viz_step) >= 1
-        and int(head_trajectory_dynamics_center_viz_layer) >= 0
+    metric_plot_paths = _render_wan21_t2v_head_trajectory_metric_plots(
+        consensus_rows=consensus_rows,
+        attractor_rows=attractor_rows,
+        reference_distance_rows=reference_distance_rows,
+        convergence_rows=convergence_rows,
+        output_dir=metrics_output_dir,
+        requested_distance_metrics=requested_distance_metrics,
+        skip_existing_plots=bool(head_trajectory_dynamics_skip_existing_plots),
     )
-    if explicit_center_viz:
-        selected_step = int(head_trajectory_dynamics_center_viz_step)
-        selected_layer = int(head_trajectory_dynamics_center_viz_layer)
-        candidate_heads = sorted(
-            head_idx
-            for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
-            if int(step_idx) == selected_step and int(layer_idx) == selected_layer
-        )
-        if requested_center_viz_head_set:
-            candidate_heads = [
-                head_idx
-                for head_idx in candidate_heads
-                if (selected_layer, int(head_idx)) in requested_center_viz_head_set
-            ]
-        center_overlay_specs = [
-            (selected_step, selected_layer, int(head_idx))
-            for head_idx in candidate_heads
-        ]
-    elif requested_center_viz_head_set:
-        center_overlay_specs = sorted(
-            [
-                (int(step_idx), int(layer_idx), int(head_idx))
-                for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
-                if (int(layer_idx), int(head_idx)) in requested_center_viz_head_set
-            ]
-        )
-    elif requested_head_set:
-        center_overlay_specs = sorted(
-            [
-                (int(step_idx), int(layer_idx), int(head_idx))
-                for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
-                if (int(layer_idx), int(head_idx)) in requested_head_set
-            ]
-        )
-
-    for step_index, layer_index, head_idx in center_overlay_specs:
-        probability_map = probability_maps_by_step_layer_head[(int(step_index), int(layer_index), int(head_idx))]
-        center_trajectory = center_trajectories_by_step_layer_head[(int(step_index), int(layer_index), int(head_idx))]
-        plot_path = _plot_wan21_t2v_head_trajectory_center_overlay(
-            probability_map_fhw=probability_map,
-            center_f2=center_trajectory,
-            save_file=os.path.join(
-                center_overlay_dir,
-                f"step_{int(step_index):03d}",
-                f"layer_{int(layer_index):02d}",
-                f"center_overlay_step_{int(step_index):03d}_layer_{int(layer_index):02d}_head_{int(head_idx):02d}.pdf",
-            ),
-            title=f"Center Overlay | step={int(step_index)} layer={int(layer_index)} head={int(head_idx)}",
-            num_frames=head_trajectory_dynamics_center_viz_num_frames,
-        )
-        if plot_path:
-            plot_paths.append(plot_path)
+    plot_paths = list(overlay_plot_paths) + list(metric_plot_paths)
 
     summary = {
         "experiment": "wan21_t2v_head_trajectory_dynamics",
@@ -1380,6 +3257,8 @@ def run_wan21_t2v_head_trajectory_dynamics(
         "token_types": word_to_type,
         "object_words_in_maps": object_words_in_maps,
         "reuse_cross_attention_dir": cross_attention_dir,
+        "reuse_cross_attention_summary_path": cross_attention_summary_path,
+        "reuse_video_frame_count": int(reuse_video_frame_count),
         "loaded_maps_source": loaded_maps_source,
         "available_steps": [int(step) for step in available_steps],
         "available_layers": [int(layer) for layer in available_layers],
@@ -1390,8 +3269,18 @@ def run_wan21_t2v_head_trajectory_dynamics(
             for layer_index, head_index in parsed_heads
         ],
         "head_trajectory_dynamics_distance_metrics": list(requested_distance_metrics),
+        "head_trajectory_dynamics_attractor_distance_metrics": list(requested_attractor_distance_metrics),
+        "head_trajectory_dynamics_hypothesis": str(head_trajectory_dynamics_hypothesis),
+        "head_trajectory_dynamics_traj_type": str(head_trajectory_dynamics_traj_type),
+        "head_trajectory_dynamics_use_motion_planning_region_before_metrics": bool(
+            head_trajectory_dynamics_use_motion_planning_region_before_metrics
+        ),
+        "head_trajectory_dynamics_plot_only_from_csv": False,
+        "head_trajectory_dynamics_skip_existing_plots": bool(head_trajectory_dynamics_skip_existing_plots),
+        "metrics_output_dir": metrics_output_dir,
         "reference_step": int(head_trajectory_dynamics_reference_step),
         "reference_layer": int(head_trajectory_dynamics_reference_layer),
+        "head_trajectory_dynamics_center_viz_enable": bool(head_trajectory_dynamics_center_viz_enable),
         "center_viz_step": int(head_trajectory_dynamics_center_viz_step),
         "center_viz_layer": int(head_trajectory_dynamics_center_viz_layer),
         "center_viz_heads_input": [str(x) for x in head_trajectory_dynamics_center_viz_heads],
@@ -1401,7 +3290,24 @@ def run_wan21_t2v_head_trajectory_dynamics(
         ],
         "center_viz_num_frames": int(head_trajectory_dynamics_center_viz_num_frames),
         "center_overlay_dir": center_overlay_dir,
-        "num_center_overlay_pdfs": int(len(center_overlay_specs)),
+        "num_center_overlay_pdfs": int(num_center_overlay_pdfs),
+        "head_trajectory_dynamics_support_viz_enable": bool(head_trajectory_dynamics_support_viz_enable),
+        "support_viz_step": int(head_trajectory_dynamics_support_viz_step),
+        "support_viz_layer": int(head_trajectory_dynamics_support_viz_layer),
+        "support_viz_heads_input": [str(x) for x in head_trajectory_dynamics_support_viz_heads],
+        "support_viz_heads_parsed": [
+            {"layer": int(layer_index), "head": int(head_index), "head_tag": f"L{int(layer_index)}H{int(head_index)}"}
+            for layer_index, head_index in parsed_support_viz_heads
+        ],
+        "support_viz_num_frames": int(head_trajectory_dynamics_support_viz_num_frames),
+        "support_viz_contour_min_component_area": int(head_trajectory_dynamics_support_viz_contour_min_component_area),
+        "support_overlap_mask_dir": support_overlap_mask_dir,
+        "num_support_overlap_mask_pdfs": int(num_support_overlap_mask_pdfs),
+        "motion_planning_region_cache_json": motion_planning_region_cache_path,
+        "motion_planning_region_cache_hits": int(motion_planning_region_cache_hits),
+        "motion_planning_region_cache_misses": int(motion_planning_region_cache_misses),
+        "head_trajectory_dynamics_support_cache_num_workers": int(head_trajectory_dynamics_support_cache_num_workers),
+        "head_trajectory_dynamics_cache_save_interval": int(cache_save_interval),
         "num_head_records": int(len(head_map_records)),
         "num_pairwise_rows": int(len(pairwise_rows)),
         "num_consensus_rows": int(len(consensus_rows)),
@@ -1410,31 +3316,28 @@ def run_wan21_t2v_head_trajectory_dynamics(
         "num_convergence_rows": int(len(convergence_rows)),
         "num_center_rows": int(len(center_rows)),
         "plot_paths": plot_paths,
-        "head_maps_csv": os.path.join(output_dir, "head_trajectory_dynamics_head_maps.csv"),
-        "pairwise_csv": os.path.join(output_dir, "head_trajectory_dynamics_pairwise.csv"),
-        "consensus_csv": os.path.join(output_dir, "head_trajectory_dynamics_consensus.csv"),
-        "attractor_csv": os.path.join(output_dir, "head_trajectory_dynamics_attractor.csv"),
-        "reference_distance_csv": os.path.join(output_dir, "head_trajectory_dynamics_reference_distance.csv"),
-        "convergence_csv": os.path.join(output_dir, "head_trajectory_dynamics_convergence.csv"),
+        "head_maps_csv": os.path.join(metrics_output_dir, "head_trajectory_dynamics_head_maps.csv"),
+        "pairwise_csv": os.path.join(metrics_output_dir, "head_trajectory_dynamics_pairwise.csv"),
+        "consensus_csv": os.path.join(metrics_output_dir, "head_trajectory_dynamics_consensus.csv"),
+        "attractor_csv": os.path.join(metrics_output_dir, "head_trajectory_dynamics_attractor.csv"),
+        "reference_distance_csv": os.path.join(metrics_output_dir, "head_trajectory_dynamics_reference_distance.csv"),
+        "convergence_csv": os.path.join(metrics_output_dir, "head_trajectory_dynamics_convergence.csv"),
         "trajectory_centers_csv": trajectory_centers_csv_path,
         "legacy_soft_centers_csv": legacy_soft_centers_csv_path,
         "center_cache_json": center_cache_path,
+        "filtered_center_cache_json": filtered_center_cache_path,
         "center_method": center_method_name,
         "support_quantile": float(head_trajectory_dynamics_support_quantile),
         "attractor_window": int(head_trajectory_dynamics_attractor_window),
-        "center_method_params": {
-            "center_power": float(head_trajectory_dynamics_center_power),
-            "center_quantile": float(head_trajectory_dynamics_center_quantile),
-            "preprocessed_center_mode": str(head_trajectory_dynamics_preprocessed_center_mode).strip().lower(),
-            "preprocess_winsorize_quantile": float(head_trajectory_dynamics_preprocess_winsorize_quantile),
-            "preprocess_despike_quantile": float(head_trajectory_dynamics_preprocess_despike_quantile),
-            "preprocess_min_component_area": int(head_trajectory_dynamics_preprocess_min_component_area),
-        },
+        "ordinary_head_center_config": dict(ordinary_center_config),
+        "reference_center_config": dict(reference_center_config),
         "center_cache_hits": int(cache_hits),
         "center_cache_misses": int(cache_misses),
+        "filtered_center_cache_hits": int(filtered_center_cache_hits),
+        "filtered_center_cache_misses": int(filtered_center_cache_misses),
         "reference_center_stats": reference_center_stats,
     }
-    _save_json(os.path.join(output_dir, "head_trajectory_dynamics_summary.json"), summary)
+    _save_json(os.path.join(metrics_output_dir, "head_trajectory_dynamics_summary.json"), summary)
     if dist.is_initialized():
         dist.barrier()
     return summary
