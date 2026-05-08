@@ -6,6 +6,9 @@
 source ../env.sh
 cd $ROOT_DIR/projects/Wan2_1
 
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate video
+
 # size
 # t2v-A14B: '720*1280', '1280*720', '480*832', '832*480'
 # t2v-1.3b: '480*832', '832*480'

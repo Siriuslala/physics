@@ -1,6 +1,9 @@
 source ./env.sh
 cd $ROOT_DIR
 
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate video
+
 # Self-attention distribution experiment.
 # It reuses a cross_attention_token_viz directory to build the reference object
 # support mask, then probes:

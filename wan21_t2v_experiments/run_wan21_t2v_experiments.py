@@ -69,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
             "cross_attention_token_viz",
             "token_trajectory_seed_stability",
             "joint_attention_suite",
+            "rope_modification",
         ],
     )
 
@@ -105,6 +106,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Rope experiment options
     parser.add_argument("--rope_modes", type=str, default="full,no_f,no_h,no_w,only_f,only_hw")
+    parser.add_argument(
+        "--rope_modification_mode",
+        type=str,
+        default="manual",
+        choices=["manual", "step_conditioned"],
+        help="RoPE modification mode: training-free manual scaling or timestep-conditioned scale head.",
+    )
+    parser.add_argument("--rope_modification_lambda_f", type=float, default=1.0)
+    parser.add_argument("--rope_modification_lambda_h", type=float, default=1.0)
+    parser.add_argument("--rope_modification_lambda_w", type=float, default=1.0)
+    parser.add_argument(
+        "--rope_modification_steps",
+        type=str,
+        default="",
+        help="CSV diffusion-step list for rope_modification. Empty means apply to all steps.",
+    )
+    parser.add_argument("--rope_modification_step_conditioned_hidden_dim", type=int, default=128)
+    parser.add_argument(
+        "--rope_modification_step_conditioned_checkpoint",
+        type=str,
+        default="",
+        help="Optional state_dict path for the timestep-conditioned RoPE scale head.",
+    )
 
     # Motion-aligned options
     parser.add_argument("--maas_layers", type=str, default="0,10,20,30,39")
@@ -547,6 +571,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--head_trajectory_dynamics_center_cache_num_workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of CPU worker processes used to extract missing raw head center trajectories. "
+            "A non-positive value means use os.cpu_count()."
+        ),
+    )
+    parser.add_argument(
+        "--head_trajectory_dynamics_overlay_num_workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of CPU worker processes used to render head_trajectory_dynamics center/support overlays. "
+            "A non-positive value means use os.cpu_count()."
+        ),
+    )
+    parser.add_argument(
         "--head_trajectory_dynamics_cache_save_interval",
         type=int,
         default=512,
@@ -781,6 +823,7 @@ def main():
         run_wan21_t2v_head_trajectory_dynamics,
         run_wan21_t2v_joint_attention_suite,
         run_wan21_t2v_motion_aligned_attention,
+        run_wan21_t2v_rope_modification,
         run_wan21_t2v_rope_axis_ablation,
         run_wan21_t2v_rope_decay_curve,
         run_wan21_t2v_cross_attn_head_ablation,
@@ -801,6 +844,7 @@ def main():
     probe_steps = _parse_csv_ints(args.probe_steps)
     cross_attn_steps = _parse_csv_ints(args.cross_attn_steps)
     head_ablation_steps = _parse_csv_ints(args.head_ablation_steps)
+    rope_modification_steps = _parse_csv_ints(args.rope_modification_steps)
     trajectory_entropy_steps = _parse_csv_ints(args.trajectory_entropy_steps)
     trajectory_entropy_layerwise_steps = _parse_csv_ints(args.trajectory_entropy_layerwise_steps)
     head_evolution_steps = _parse_csv_ints(args.head_evolution_steps)
@@ -971,6 +1015,12 @@ def main():
             head_trajectory_dynamics_support_cache_num_workers=(
                 args.head_trajectory_dynamics_support_cache_num_workers
             ),
+            head_trajectory_dynamics_center_cache_num_workers=(
+                args.head_trajectory_dynamics_center_cache_num_workers
+            ),
+            head_trajectory_dynamics_overlay_num_workers=(
+                args.head_trajectory_dynamics_overlay_num_workers
+            ),
             head_trajectory_dynamics_cache_save_interval=(
                 args.head_trajectory_dynamics_cache_save_interval
             ),
@@ -987,6 +1037,17 @@ def main():
     elif experiment_name == "rope_decay_curve":
         run_wan21_t2v_rope_decay_curve(
             **common_kwargs,
+        )
+    elif experiment_name == "rope_modification":
+        run_wan21_t2v_rope_modification(
+            **common_kwargs,
+            rope_modification_mode=args.rope_modification_mode,
+            rope_modification_lambda_f=args.rope_modification_lambda_f,
+            rope_modification_lambda_h=args.rope_modification_lambda_h,
+            rope_modification_lambda_w=args.rope_modification_lambda_w,
+            rope_modification_steps=rope_modification_steps,
+            rope_modification_step_conditioned_hidden_dim=args.rope_modification_step_conditioned_hidden_dim,
+            rope_modification_step_conditioned_checkpoint=args.rope_modification_step_conditioned_checkpoint,
         )
     elif experiment_name == "self_attention_temporal_kernel":
         run_wan21_t2v_self_attention_temporal_kernel(

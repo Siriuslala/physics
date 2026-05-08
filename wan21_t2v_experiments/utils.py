@@ -25,12 +25,13 @@ import os
 import random
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MethodType
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.cuda.amp as amp
@@ -96,6 +97,40 @@ def ensure_wan21_t2v_repo_on_path(wan21_root: str):
 
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
+
+def _resolve_wan21_t2v_num_workers(requested_num_workers: int, task_count: int) -> int:
+    """Resolve an effective worker count for optional multi-process execution."""
+    if int(task_count) <= 0:
+        return 0
+    if int(requested_num_workers) <= 0:
+        requested_num_workers = int(os.cpu_count() or 1)
+    return max(1, min(int(requested_num_workers), int(task_count)))
+
+
+def _iter_wan21_t2v_parallel_results(
+    tasks: Sequence[Any],
+    worker_fn: Callable[[Any], Any],
+    num_workers: int,
+) -> Iterator[Any]:
+    """Yield worker results either serially or via a process pool.
+
+    The worker function must be a top-level picklable callable when `num_workers > 1`.
+    Result order is completion order in the parallel branch.
+    """
+    effective_num_workers = _resolve_wan21_t2v_num_workers(
+        requested_num_workers=int(num_workers),
+        task_count=int(len(tasks)),
+    )
+    if effective_num_workers <= 1:
+        for task in tasks:
+            yield worker_fn(task)
+        return
+
+    with ProcessPoolExecutor(max_workers=int(effective_num_workers)) as executor:
+        futures = [executor.submit(worker_fn, task) for task in tasks]
+        for future in as_completed(futures):
+            yield future.result()
 
 def _save_json(path: str, obj):
     with open(path, "w", encoding="utf-8") as f:

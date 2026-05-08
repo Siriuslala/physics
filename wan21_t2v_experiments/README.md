@@ -10,6 +10,7 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 
 - `rope_axis_ablation`
 - `rope_decay_curve`
+- `rope_modification`
 - `attention_dt_profile`
 - `trajectory_entropy`
 - `head_evolution`
@@ -53,6 +54,14 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - frame-level RoPE kernel decay vs latent frame distance
   - flattened token-level RoPE kernel decay vs relative video-token distance
   - see detailed note: `docs/rope_decay_curve.md`
+
+### 1c) `rope_modification`
+- Motivation: modify Wan2.1 T2V self-attention RoPE with axis-wise lambda scaling, optional diffusion-step gating, and an optional timestep-conditioned scale head.
+- 动机：通过轴向 lambda 缩放、可选的扩散步窗口控制、以及可选的 timestep-conditioned scale head 改造 Wan2.1 T2V 的 self-attention RoPE。
+- Modes:
+  - `manual`: training-free manual `lambda_f/lambda_h/lambda_w`
+  - `step_conditioned`: training-oriented timestep-conditioned scale head attached by monkey patch
+- See detailed note: `docs/rope_modification.md`
 
 ### 2) `attention_dt_profile`
 - Motivation: profile temporal distance preference \(P(|\Delta t|)\) in early denoising steps.

@@ -1,6 +1,9 @@
 source ./env.sh
 cd $ROOT_DIR
 
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate video
+
 # Self-attention intervention experiment.
 # Modes:
 # - postoutput_same_position_kernel

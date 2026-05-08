@@ -53,14 +53,14 @@ CLEAR_TRAJ_HEADS="L0H0,L0H1,L0H6,L0H7,L0H8,L0H9,L0H11,L1H1,L1H2,L1H3,L1H4,L1H5,L
 VAGUE_TRAJ_HEADS="L0H2,L0H4,L0H10,L1H6,L1H7,L3H3,L4H1,L4H2,L4H9,L4H11,L5H0,L5H7,L5H11,L6H1,L7H7,L7H8,L8H1,L8H4,L9H11,L10H0,L10H6,L10H8,L10H9,L10H10,L10H11,L11H1,L11H4,L12H0,L12H2,L13H2,L13H7,L14H3,L14H5,L14H8,L14H9,L14H10,L15H4,L15H7,L16H1,L16H6,L17H6,L17H9,L18H4,L18H5,L18H8,L18H9,L19H2,L19H4,L19H7,L19H8,L20H0,L20H9,L20H10,L21H3,L22H1,L22H10,L23H0,L23H10,L24H3,L24H4,L24H5,L24H6,L25H1,L25H2,L25H6,L25H11,L26H1,L26H7,L26H8,L26H9,L27H2,L28H5,L28H6,L28H7,L28H11,L29H6"
 
 # Empty -> all heads
-TRAJ_TYPE="traj_clear_vague"  # ! "", traj_clear, traj_vague, traj_clear_vague
+TRAJ_TYPE="all"  # ! all, traj_clear, traj_vague, traj_clear_vague
 if [ "$TRAJ_TYPE" == "traj_clear" ]; then
     HEAD_TRAJECTORY_DYNAMICS_HEADS="$CLEAR_TRAJ_HEADS"
 elif [ "$TRAJ_TYPE" == "traj_vague" ]; then
     HEAD_TRAJECTORY_DYNAMICS_HEADS="$VAGUE_TRAJ_HEADS"
 elif [ "$TRAJ_TYPE" == "traj_clear_vague" ]; then
     HEAD_TRAJECTORY_DYNAMICS_HEADS="$CLEAR_TRAJ_HEADS,$VAGUE_TRAJ_HEADS"
-elif [ "$TRAJ_TYPE" == "" ]; then
+elif [ "$TRAJ_TYPE" == "all" ]; then
     HEAD_TRAJECTORY_DYNAMICS_HEADS=""
 else
     echo "Unknown traj type: $TRAJ_TYPE"
@@ -127,6 +127,8 @@ HEAD_TRAJECTORY_DYNAMICS_SUPPORT_VIZ_HEADS=""
 HEAD_TRAJECTORY_DYNAMICS_SUPPORT_VIZ_NUM_FRAMES=10
 HEAD_TRAJECTORY_DYNAMICS_SUPPORT_VIZ_CONTOUR_MIN_COMPONENT_AREA=4
 HEAD_TRAJECTORY_DYNAMICS_SUPPORT_CACHE_NUM_WORKERS=16  # multi-cpu for acceleration (build motion-planning region mask)
+HEAD_TRAJECTORY_DYNAMICS_CENTER_CACHE_NUM_WORKERS=16  # multi-cpu for acceleration (center extraction)
+HEAD_TRAJECTORY_DYNAMICS_OVERLAY_NUM_WORKERS=16  # multi-cpu for acceleration (center/support overlay rendering)
 HEAD_TRAJECTORY_DYNAMICS_CACHE_SAVE_INTERVAL=512
 
 
@@ -198,6 +200,8 @@ for SEED in "${SEEDS[@]}"; do
         --head_trajectory_dynamics_support_viz_num_frames $HEAD_TRAJECTORY_DYNAMICS_SUPPORT_VIZ_NUM_FRAMES \
         --head_trajectory_dynamics_support_viz_contour_min_component_area $HEAD_TRAJECTORY_DYNAMICS_SUPPORT_VIZ_CONTOUR_MIN_COMPONENT_AREA \
         --head_trajectory_dynamics_support_cache_num_workers $HEAD_TRAJECTORY_DYNAMICS_SUPPORT_CACHE_NUM_WORKERS \
+        --head_trajectory_dynamics_center_cache_num_workers $HEAD_TRAJECTORY_DYNAMICS_CENTER_CACHE_NUM_WORKERS \
+        --head_trajectory_dynamics_overlay_num_workers $HEAD_TRAJECTORY_DYNAMICS_OVERLAY_NUM_WORKERS \
         --head_trajectory_dynamics_cache_save_interval $HEAD_TRAJECTORY_DYNAMICS_CACHE_SAVE_INTERVAL \
         --head_trajectory_dynamics_hypothesis $HEAD_TRAJECTORY_DYNAMICS_HYPOTHESIS \
         --head_trajectory_dynamics_traj_type "$TRAJ_TYPE" \

@@ -16,6 +16,7 @@ from types import MethodType
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 import os
@@ -41,6 +42,14 @@ class Wan21T2VRopePatchConfig:
     f_scale: float = 1.0
     h_scale: float = 1.0
     w_scale: float = 1.0
+    lambda_f: float = 1.0
+    lambda_h: float = 1.0
+    lambda_w: float = 1.0
+    apply_steps: Tuple[int, ...] = tuple()
+    step_conditioned: bool = False
+    step_conditioned_hidden_dim: int = 128
+    step_conditioned_module_name: str = "rope_scale_net"
+    step_conditioned_checkpoint: str = ""
 
 
 @dataclass
@@ -103,6 +112,37 @@ class Wan21T2VPatchBundleConfig:
     rope: Wan21T2VRopePatchConfig = field(default_factory=Wan21T2VRopePatchConfig)
     probe: Wan21T2VAttentionProbeConfig = field(default_factory=Wan21T2VAttentionProbeConfig)
     causal: Wan21T2VCausalAttentionConfig = field(default_factory=Wan21T2VCausalAttentionConfig)
+
+
+class Wan21T2VRopeStepConditionedScale(nn.Module):
+    """Small timestep-conditioned axis-scale head for RoPE modification."""
+
+    def __init__(self, freq_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.freq_dim = int(freq_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.net = nn.Sequential(
+            nn.Linear(self.freq_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, 3),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        last = self.net[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+        """Return positive multiplicative scales of shape [B, 3]."""
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([float(timestep)], dtype=torch.float32)
+        if timestep.ndim == 0:
+            timestep = timestep.unsqueeze(0)
+        timestep = timestep.to(dtype=torch.float32)
+        emb = wan.modules.model.sinusoidal_embedding_1d(self.freq_dim, timestep).float()
+        return torch.exp(self.net(emb))
 
 
 class Wan21T2VProbeState:
@@ -711,7 +751,11 @@ class Wan21T2VPatchHandle:
             if idx < len(self.original_attn_forwards):
                 block.self_attn.forward = self.original_attn_forwards[idx]
         for obj, name, value in self.restore_items:
-            setattr(obj, name, value)
+            if value is _RESTORE_DELETE_SENTINEL:
+                if hasattr(obj, name):
+                    delattr(obj, name)
+            else:
+                setattr(obj, name, value)
 
 
 class Wan21T2VEarlyStopRequested(RuntimeError):
@@ -742,15 +786,64 @@ def _axis_enabled(mode: str) -> Tuple[bool, bool, bool]:
     raise ValueError(f"Unknown rope mode: {mode}")
 
 
-def _rescale_complex_phase(freq: torch.Tensor, scale: float) -> torch.Tensor:
-    if scale == 1.0:
+_RESTORE_DELETE_SENTINEL = object()
+
+
+def _rescale_complex_phase(freq: torch.Tensor, scale) -> torch.Tensor:
+    if not torch.is_tensor(scale) and float(scale) == 1.0:
         return freq
+    if torch.is_tensor(scale) and scale.numel() == 1:
+        try:
+            if float(scale.detach().cpu().item()) == 1.0:
+                return freq
+        except Exception:
+            pass
     angle = torch.angle(freq)
+    if not torch.is_tensor(scale):
+        scale = torch.tensor(float(scale), dtype=angle.dtype, device=angle.device)
+    else:
+        scale = scale.to(device=angle.device, dtype=angle.dtype)
     return torch.polar(torch.ones_like(angle), angle * scale)
 
 
+def _resolve_rope_manual_scales(rope_cfg: Wan21T2VRopePatchConfig) -> Tuple[float, float, float]:
+    use_lambda_fields = (
+        rope_cfg.step_conditioned
+        or bool(rope_cfg.apply_steps)
+        or rope_cfg.lambda_f != 1.0
+        or rope_cfg.lambda_h != 1.0
+        or rope_cfg.lambda_w != 1.0
+    )
+    if use_lambda_fields:
+        return float(rope_cfg.lambda_f), float(rope_cfg.lambda_h), float(rope_cfg.lambda_w)
+    return float(rope_cfg.f_scale), float(rope_cfg.h_scale), float(rope_cfg.w_scale)
+
+
+def _maybe_get_step_conditioned_scales(
+    rope_cfg: Wan21T2VRopePatchConfig,
+    state: Optional[Wan21T2VProbeState],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    if not rope_cfg.step_conditioned:
+        return None
+    if state is None or state.current_timestep_value is None:
+        return None
+    module = getattr(rope_cfg, "step_conditioned_module", None)
+    if module is None:
+        return None
+    timestep = torch.tensor([float(state.current_timestep_value)], device=device, dtype=torch.float32)
+    return module(timestep).to(device=device, dtype=dtype).squeeze(0)
+
+
 @torch.cuda.amp.autocast(enabled=False)
-def apply_wan21_t2v_rope_patch(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor, rope_cfg: Wan21T2VRopePatchConfig):
+def apply_wan21_t2v_rope_patch(
+    x: torch.Tensor,
+    grid_sizes: torch.Tensor,
+    freqs: torch.Tensor,
+    rope_cfg: Wan21T2VRopePatchConfig,
+    state: Optional[Wan21T2VProbeState] = None,
+):
     """Apply configurable 3D RoPE intervention on q/k tensors."""
     if not rope_cfg.enabled:
         # Full RoPE behavior if patch disabled.
@@ -760,6 +853,11 @@ def apply_wan21_t2v_rope_patch(x: torch.Tensor, grid_sizes: torch.Tensor, freqs:
 
     n, c = x.size(2), x.size(3) // 2
     freqs_f, freqs_h, freqs_w = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    manual_scale_f, manual_scale_h, manual_scale_w = _resolve_rope_manual_scales(rope_cfg)
+    if rope_cfg.apply_steps and (state is None or int(state.current_step) not in {int(v) for v in rope_cfg.apply_steps}):
+        manual_scale_f = 1.0
+        manual_scale_h = 1.0
+        manual_scale_w = 1.0
 
     def _slice_freqs_for_local_shard(freq_i: torch.Tensor, local_len: int) -> torch.Tensor:
         """Slice full RoPE multipliers for a local sequence-parallel shard."""
@@ -807,9 +905,23 @@ def apply_wan21_t2v_rope_patch(x: torch.Tensor, grid_sizes: torch.Tensor, freqs:
         fh = freqs_h[:h]
         fw = freqs_w[:w]
 
-        ff = _rescale_complex_phase(ff, rope_cfg.f_scale) if enable_f else torch.ones_like(ff)
-        fh = _rescale_complex_phase(fh, rope_cfg.h_scale) if enable_h else torch.ones_like(fh)
-        fw = _rescale_complex_phase(fw, rope_cfg.w_scale) if enable_w else torch.ones_like(fw)
+        scale_f = torch.tensor(manual_scale_f, device=ff.device, dtype=torch.float64)
+        scale_h = torch.tensor(manual_scale_h, device=fh.device, dtype=torch.float64)
+        scale_w = torch.tensor(manual_scale_w, device=fw.device, dtype=torch.float64)
+        learned_scales = _maybe_get_step_conditioned_scales(
+            rope_cfg=rope_cfg,
+            state=state,
+            device=ff.device,
+            dtype=torch.float64,
+        )
+        if learned_scales is not None:
+            scale_f = scale_f * learned_scales[0]
+            scale_h = scale_h * learned_scales[1]
+            scale_w = scale_w * learned_scales[2]
+
+        ff = _rescale_complex_phase(ff, scale_f) if enable_f else torch.ones_like(ff)
+        fh = _rescale_complex_phase(fh, scale_h) if enable_h else torch.ones_like(fh)
+        fw = _rescale_complex_phase(fw, scale_w) if enable_w else torch.ones_like(fw)
 
         freq_i_full = torch.cat(
             [
@@ -1023,6 +1135,11 @@ def _rope_cfg_is_identity(rope_cfg: Wan21T2VRopePatchConfig) -> bool:
         and rope_cfg.f_scale == 1.0
         and rope_cfg.h_scale == 1.0
         and rope_cfg.w_scale == 1.0
+        and rope_cfg.lambda_f == 1.0
+        and rope_cfg.lambda_h == 1.0
+        and rope_cfg.lambda_w == 1.0
+        and not rope_cfg.apply_steps
+        and not rope_cfg.step_conditioned
     )
 
 
@@ -1057,15 +1174,57 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
     restore_items = []
     needs_custom_attn = patch_cfg.probe.enabled or patch_cfg.causal.enabled
     rope_is_identity = _rope_cfg_is_identity(patch_cfg.rope)
+    needs_rope_step_tracking = bool(patch_cfg.rope.apply_steps) or patch_cfg.rope.step_conditioned
 
     # Pure RoPE experiments: patch rope_apply only and keep Wan's original
     # attention path (including USP xFuser long-context attention).
     if not needs_custom_attn:
+        if needs_rope_step_tracking:
+            original_forward = target.forward
+
+            def patched_dit_forward(this, *args, **kwargs):
+                t = kwargs.get("t", None)
+                if t is None and len(args) > 1:
+                    t = args[1]
+                state.on_forward_start(t)
+                return original_forward(*args, **kwargs)
+
+            target.forward = MethodType(patched_dit_forward, target)
+            restore_items.append((target, "forward", original_forward))
+
+        if patch_cfg.rope.step_conditioned:
+            module_name = str(patch_cfg.rope.step_conditioned_module_name or "rope_scale_net")
+            scale_module = Wan21T2VRopeStepConditionedScale(
+                freq_dim=int(getattr(target, "freq_dim")),
+                hidden_dim=int(patch_cfg.rope.step_conditioned_hidden_dim),
+            )
+            scale_module = scale_module.to(next(target.parameters()).device)
+            checkpoint_path = str(patch_cfg.rope.step_conditioned_checkpoint).strip()
+            if checkpoint_path:
+                payload = torch.load(checkpoint_path, map_location="cpu")
+                if isinstance(payload, dict) and "state_dict" in payload and isinstance(payload["state_dict"], dict):
+                    payload = payload["state_dict"]
+                if not isinstance(payload, dict):
+                    raise TypeError(
+                        "step_conditioned_checkpoint must contain a state_dict-like object, "
+                        f"got {type(payload)!r}."
+                    )
+                cleaned = {}
+                for key, value in payload.items():
+                    if key.startswith(f"{module_name}."):
+                        cleaned[key[len(module_name) + 1:]] = value
+                    else:
+                        cleaned[key] = value
+                scale_module.load_state_dict(cleaned, strict=False)
+            setattr(target, module_name, scale_module)
+            restore_items.append((target, module_name, _RESTORE_DELETE_SENTINEL))
+            patch_cfg.rope.step_conditioned_module = scale_module
+
         if not rope_is_identity:
             original_model_rope_apply = wan.modules.model.rope_apply
 
             def patched_model_rope_apply(x, grid_sizes, freqs):
-                return apply_wan21_t2v_rope_patch(x, grid_sizes, freqs, patch_cfg.rope)
+                return apply_wan21_t2v_rope_patch(x, grid_sizes, freqs, patch_cfg.rope, state=state)
 
             wan.modules.model.rope_apply = patched_model_rope_apply
             restore_items.append((wan.modules.model, "rope_apply", original_model_rope_apply))
@@ -1076,7 +1235,7 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
                 original_usp_rope_apply = usp_module.rope_apply
 
                 def patched_usp_rope_apply(x, grid_sizes, freqs):
-                    return apply_wan21_t2v_rope_patch(x, grid_sizes, freqs, patch_cfg.rope)
+                    return apply_wan21_t2v_rope_patch(x, grid_sizes, freqs, patch_cfg.rope, state=state)
 
                 usp_module.rope_apply = patched_usp_rope_apply
                 restore_items.append((usp_module, "rope_apply", original_usp_rope_apply))
@@ -1123,8 +1282,8 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
 
-            q = apply_wan21_t2v_rope_patch(q, grid_sizes, freqs, patch_cfg.rope)
-            k = apply_wan21_t2v_rope_patch(k, grid_sizes, freqs, patch_cfg.rope)
+            q = apply_wan21_t2v_rope_patch(q, grid_sizes, freqs, patch_cfg.rope, state=state)
+            k = apply_wan21_t2v_rope_patch(k, grid_sizes, freqs, patch_cfg.rope, state=state)
 
             state.collect(layer_idx=layer_idx, q=q, k=k, seq_lens=seq_lens, grid_sizes=grid_sizes)
 

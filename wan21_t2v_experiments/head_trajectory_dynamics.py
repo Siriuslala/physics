@@ -19,7 +19,6 @@ import re
 import sys
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Sequence, Tuple
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
 import torch.cuda.amp as amp
@@ -38,7 +37,9 @@ from .utils import (
     _mean_wan21_t2v_head_maps_for_words,
     _normalize_wan21_t2v_attention_map_per_frame,
     _parse_wan21_t2v_layer_head_specs,
+    _iter_wan21_t2v_parallel_results,
     _resolve_wan21_t2v_viz_frame_indices,
+    _resolve_wan21_t2v_num_workers,
     _save_csv,
     _save_json,
     _trajectory_distance_wan21_t2v_soft_centers,
@@ -409,13 +410,62 @@ def _build_wan21_t2v_motion_planning_region_mask_task(
     return key, mask
 
 
+def _build_wan21_t2v_head_center_extraction_task(
+    task: Tuple[int, int, int, torch.Tensor, Dict[str, object]],
+) -> Tuple[Tuple[int, int, int], List[Tuple[float, float]]]:
+    """Worker task used to extract one raw head center trajectory."""
+    step, layer, head, map_fhw, center_config = task
+    key = (int(step), int(layer), int(head))
+    trajectory, _ = _extract_wan21_t2v_head_trajectory_centers(
+        map_fhw=map_fhw,
+        center_method=str(center_config["center_method"]),
+        center_power=float(center_config["center_power"]),
+        center_quantile=float(center_config["center_quantile"]),
+        preprocessed_center_mode=str(center_config["preprocessed_center_mode"]),
+        preprocess_winsorize_quantile=float(center_config["preprocess_winsorize_quantile"]),
+        preprocess_despike_quantile=float(center_config["preprocess_despike_quantile"]),
+        preprocess_min_component_area=int(center_config["preprocess_min_component_area"]),
+    )
+    return key, trajectory
+
+
+def _render_wan21_t2v_center_overlay_task(
+    task: Tuple[torch.Tensor, torch.Tensor, str, str, int, Optional[int]],
+) -> str:
+    """Worker task used to render one center-overlay PDF."""
+    probability_map_fhw, center_f2, save_file, title, num_frames, video_frame_count = task
+    return _plot_wan21_t2v_head_trajectory_center_overlay(
+        probability_map_fhw=probability_map_fhw,
+        center_f2=center_f2,
+        save_file=save_file,
+        title=title,
+        num_frames=int(num_frames),
+        video_frame_count=video_frame_count,
+    )
+
+
+def _render_wan21_t2v_support_overlay_task(
+    task: Tuple[torch.Tensor, str, str, int, int, Optional[int]],
+) -> str:
+    """Worker task used to render one support-overlay PDF."""
+    binary_mask_fhw, save_file, title, num_frames, contour_min_component_area, video_frame_count = task
+    return _plot_wan21_t2v_support_overlap_mask_panels(
+        binary_mask_fhw=binary_mask_fhw,
+        save_file=save_file,
+        title=title,
+        num_frames=int(num_frames),
+        contour_min_component_area=int(contour_min_component_area),
+        draw_contours=True,
+        video_frame_count=video_frame_count,
+    )
+
+
 def _resolve_wan21_t2v_motion_planning_region_num_workers(requested_num_workers: int, task_count: int) -> int:
     """Resolve the effective number of worker processes for support-cache building."""
-    if int(task_count) <= 0:
-        return 0
-    if int(requested_num_workers) <= 0:
-        requested_num_workers = int(os.cpu_count() or 1)
-    return max(1, min(int(requested_num_workers), int(task_count)))
+    return _resolve_wan21_t2v_num_workers(
+        requested_num_workers=int(requested_num_workers),
+        task_count=int(task_count),
+    )
 
 
 def _materialize_wan21_t2v_motion_planning_region_masks(
@@ -480,47 +530,26 @@ def _materialize_wan21_t2v_motion_planning_region_masks(
             requested_num_workers=int(num_workers),
             task_count=int(len(missing_tasks)),
         )
-        if effective_num_workers <= 1:
-            for task in missing_tasks:
-                key, mask = _build_wan21_t2v_motion_planning_region_mask_task(task)
-                mask_by_key[key] = mask
-                _set_wan21_t2v_cached_motion_planning_region_mask(
-                    cache_payload=cache_payload,
-                    step=int(key[0]),
-                    layer=int(key[1]),
-                    head=int(key[2]),
-                    mask_fhw=mask,
-                )
-                cache_misses += 1
-                pending_cache_writes += 1
-                if pending_cache_writes >= int(cache_save_interval):
-                    _save_wan21_t2v_motion_planning_region_cache(cache_path, cache_payload)
-                    pending_cache_writes = 0
-                if progress_bar is not None:
-                    progress_bar.update(1)
-        else:
-            with ProcessPoolExecutor(max_workers=int(effective_num_workers)) as executor:
-                futures = [
-                    executor.submit(_build_wan21_t2v_motion_planning_region_mask_task, task)
-                    for task in missing_tasks
-                ]
-                for future in as_completed(futures):
-                    key, mask = future.result()
-                    mask_by_key[key] = mask
-                    _set_wan21_t2v_cached_motion_planning_region_mask(
-                        cache_payload=cache_payload,
-                        step=int(key[0]),
-                        layer=int(key[1]),
-                        head=int(key[2]),
-                        mask_fhw=mask,
-                    )
-                    cache_misses += 1
-                    pending_cache_writes += 1
-                    if pending_cache_writes >= int(cache_save_interval):
-                        _save_wan21_t2v_motion_planning_region_cache(cache_path, cache_payload)
-                        pending_cache_writes = 0
-                    if progress_bar is not None:
-                        progress_bar.update(1)
+        for key, mask in _iter_wan21_t2v_parallel_results(
+            tasks=missing_tasks,
+            worker_fn=_build_wan21_t2v_motion_planning_region_mask_task,
+            num_workers=int(effective_num_workers),
+        ):
+            mask_by_key[key] = mask
+            _set_wan21_t2v_cached_motion_planning_region_mask(
+                cache_payload=cache_payload,
+                step=int(key[0]),
+                layer=int(key[1]),
+                head=int(key[2]),
+                mask_fhw=mask,
+            )
+            cache_misses += 1
+            pending_cache_writes += 1
+            if pending_cache_writes >= int(cache_save_interval):
+                _save_wan21_t2v_motion_planning_region_cache(cache_path, cache_payload)
+                pending_cache_writes = 0
+            if progress_bar is not None:
+                progress_bar.update(1)
         if pending_cache_writes > 0:
             _save_wan21_t2v_motion_planning_region_cache(cache_path, cache_payload)
             pending_cache_writes = 0
@@ -1625,6 +1654,7 @@ def _render_wan21_t2v_head_trajectory_overlays(
     head_trajectory_dynamics_support_quantile: float,
     head_trajectory_dynamics_skip_existing_plots: bool,
     reuse_video_frame_count: int,
+    overlay_num_workers: int,
 ) -> Tuple[List[str], str, str, int, int]:
     """Render center/support overlays from raw maps, raw centers, and precomputed support masks."""
     center_overlay_dir = os.path.join(output_dir, "head_trajectory_dynamics_head_center_overlays")
@@ -1667,6 +1697,9 @@ def _render_wan21_t2v_head_trajectory_overlays(
         except Exception:
             support_overlay_progress_bar = None
 
+    center_overlay_tasks: List[Tuple[torch.Tensor, torch.Tensor, str, str, int, Optional[int]]] = []
+    support_overlay_tasks: List[Tuple[torch.Tensor, str, str, int, int, Optional[int]]] = []
+
     try:
         for step_index, layer_index, head_idx in center_overlay_specs:
             probability_map = probability_maps_by_step_layer_head[(int(step_index), int(layer_index), int(head_idx))]
@@ -1679,19 +1712,19 @@ def _render_wan21_t2v_head_trajectory_overlays(
             )
             if _maybe_skip_wan21_t2v_existing_plot(save_file, bool(head_trajectory_dynamics_skip_existing_plots)):
                 plot_paths.append(save_file)
+                if center_overlay_progress_bar is not None:
+                    center_overlay_progress_bar.update(1)
             else:
-                plot_path = _plot_wan21_t2v_head_trajectory_center_overlay(
-                    probability_map_fhw=probability_map,
-                    center_f2=center_trajectory,
-                    save_file=save_file,
-                    title=f"Center Overlay | step={int(step_index)} layer={int(layer_index)} head={int(head_idx)}",
-                    num_frames=head_trajectory_dynamics_center_viz_num_frames,
-                    video_frame_count=int(reuse_video_frame_count),
+                center_overlay_tasks.append(
+                    (
+                        probability_map,
+                        center_trajectory,
+                        save_file,
+                        f"Center Overlay | step={int(step_index)} layer={int(layer_index)} head={int(head_idx)}",
+                        int(head_trajectory_dynamics_center_viz_num_frames),
+                        int(reuse_video_frame_count),
+                    )
                 )
-                if plot_path:
-                    plot_paths.append(plot_path)
-            if center_overlay_progress_bar is not None:
-                center_overlay_progress_bar.update(1)
 
         for step_index, layer_index, head_idx in support_viz_specs:
             support_mask_fhw = _build_wan21_t2v_support_mask_fhw(
@@ -1709,21 +1742,40 @@ def _render_wan21_t2v_head_trajectory_overlays(
             )
             if _maybe_skip_wan21_t2v_existing_plot(contour_save_file, bool(head_trajectory_dynamics_skip_existing_plots)):
                 plot_paths.append(contour_save_file)
+                if support_overlay_progress_bar is not None:
+                    support_overlay_progress_bar.update(1)
             else:
-                plot_path = _plot_wan21_t2v_support_overlap_mask_panels(
-                    binary_mask_fhw=support_mask_fhw,
-                    save_file=contour_save_file,
-                    title=(
+                support_overlay_tasks.append(
+                    (
+                        support_mask_fhw,
+                        contour_save_file,
+                        (
                         f"Support Mask + Contour | step={int(step_index)} layer={int(layer_index)} "
                         f"head={int(head_idx)} q={float(head_trajectory_dynamics_support_quantile):.3f}"
-                    ),
-                    num_frames=int(head_trajectory_dynamics_support_viz_num_frames),
-                    contour_min_component_area=int(head_trajectory_dynamics_support_viz_contour_min_component_area),
-                    draw_contours=True,
-                    video_frame_count=int(reuse_video_frame_count),
+                        ),
+                        int(head_trajectory_dynamics_support_viz_num_frames),
+                        int(head_trajectory_dynamics_support_viz_contour_min_component_area),
+                        int(reuse_video_frame_count),
+                    )
                 )
-                if plot_path:
-                    plot_paths.append(plot_path)
+
+        for plot_path in _iter_wan21_t2v_parallel_results(
+            tasks=center_overlay_tasks,
+            worker_fn=_render_wan21_t2v_center_overlay_task,
+            num_workers=int(overlay_num_workers),
+        ):
+            if plot_path:
+                plot_paths.append(plot_path)
+            if center_overlay_progress_bar is not None:
+                center_overlay_progress_bar.update(1)
+
+        for plot_path in _iter_wan21_t2v_parallel_results(
+            tasks=support_overlay_tasks,
+            worker_fn=_render_wan21_t2v_support_overlay_task,
+            num_workers=int(overlay_num_workers),
+        ):
+            if plot_path:
+                plot_paths.append(plot_path)
             if support_overlay_progress_bar is not None:
                 support_overlay_progress_bar.update(1)
     finally:
@@ -2224,6 +2276,8 @@ def run_wan21_t2v_head_trajectory_dynamics(
     head_trajectory_dynamics_support_viz_num_frames: int = 10,
     head_trajectory_dynamics_support_viz_contour_min_component_area: int = 4,
     head_trajectory_dynamics_support_cache_num_workers: int = 0,
+    head_trajectory_dynamics_center_cache_num_workers: int = 0,
+    head_trajectory_dynamics_overlay_num_workers: int = 0,
     head_trajectory_dynamics_cache_save_interval: int = 512,
     head_trajectory_dynamics_hypothesis: str = "attractor",
     head_trajectory_dynamics_traj_type: str = "",
@@ -2269,6 +2323,10 @@ def run_wan21_t2v_head_trajectory_dynamics(
             computed from attention maps masked by the contour-filtered support region.
         head_trajectory_dynamics_support_cache_num_workers: number of CPU worker processes used
             to build missing motion-planning-region masks. A non-positive value means use os.cpu_count().
+        head_trajectory_dynamics_center_cache_num_workers: number of CPU worker processes used
+            to extract missing raw head center trajectories. A non-positive value means use os.cpu_count().
+        head_trajectory_dynamics_overlay_num_workers: number of CPU worker processes used
+            to render center/support overlay PDFs. A non-positive value means use os.cpu_count().
         head_trajectory_dynamics_cache_save_interval: flush caches every N newly materialized
             entries. Larger values reduce disk-write frequency but increase the amount of work
             lost if the run is interrupted mid-cache-build.
@@ -2643,6 +2701,7 @@ def run_wan21_t2v_head_trajectory_dynamics(
         except Exception:
             extraction_progress_bar = None
 
+    center_missing_tasks: List[Tuple[int, int, int, torch.Tensor, Dict[str, object]]] = []
     try:
         for step_index in resolved_steps:
             for layer_index in available_layers:
@@ -2654,7 +2713,6 @@ def run_wan21_t2v_head_trajectory_dynamics(
                 )
                 if object_head_maps is None:
                     continue
-                cache_dirty = False
                 for head_index in range(int(object_head_maps.size(0))):
                     if requested_head_set and (int(layer_index), int(head_index)) not in requested_head_set:
                         continue
@@ -2667,36 +2725,23 @@ def run_wan21_t2v_head_trajectory_dynamics(
                         head=int(head_index),
                     )
                     if cached_trajectory is None:
-                        extracted_trajectory, _ = _extract_wan21_t2v_head_trajectory_centers(
-                            map_fhw=map_fhw,
-                            center_method=str(ordinary_center_config["center_method"]),
-                            center_power=float(ordinary_center_config["center_power"]),
-                            center_quantile=float(ordinary_center_config["center_quantile"]),
-                            preprocessed_center_mode=str(ordinary_center_config["preprocessed_center_mode"]),
-                            preprocess_winsorize_quantile=float(ordinary_center_config["preprocess_winsorize_quantile"]),
-                            preprocess_despike_quantile=float(ordinary_center_config["preprocess_despike_quantile"]),
-                            preprocess_min_component_area=int(ordinary_center_config["preprocess_min_component_area"]),
+                        center_missing_tasks.append(
+                            (
+                                int(step_index),
+                                int(layer_index),
+                                int(head_index),
+                                map_fhw,
+                                dict(ordinary_center_config),
+                            )
                         )
-                        _set_wan21_t2v_cached_center_trajectory(
-                            cache_payload=center_cache_payload,
-                            step=int(step_index),
-                            layer=int(layer_index),
-                            head=int(head_index),
-                            trajectory=extracted_trajectory,
-                        )
-                        cached_trajectory = extracted_trajectory
-                        cache_dirty = True
-                        cache_misses += 1
-                        pending_cache_writes += 1
-                        if pending_cache_writes >= int(cache_save_interval):
-                            _save_wan21_t2v_head_trajectory_cache(center_cache_path, center_cache_payload)
-                            pending_cache_writes = 0
                     else:
                         cache_hits += 1
-                    center_trajectory = _center_trajectory_wan21_t2v_to_tensor(cached_trajectory)
                     key = (int(step_index), int(layer_index), int(head_index))
                     probability_maps_by_step_layer_head[key] = probability_map
-                    center_trajectories_by_step_layer_head[key] = center_trajectory
+                    if cached_trajectory is not None:
+                        center_trajectories_by_step_layer_head[key] = _center_trajectory_wan21_t2v_to_tensor(
+                            cached_trajectory
+                        )
                     head_map_records.append(
                         {
                             "step": int(step_index),
@@ -2708,11 +2753,30 @@ def run_wan21_t2v_head_trajectory_dynamics(
                             "token_grid_w": int(probability_map.size(2)),
                         }
                     )
-                    if extraction_progress_bar is not None:
-                        extraction_progress_bar.update(1)
-                if cache_dirty:
-                    _save_wan21_t2v_head_trajectory_cache(center_cache_path, center_cache_payload)
-                    pending_cache_writes = 0
+
+        for key, extracted_trajectory in _iter_wan21_t2v_parallel_results(
+            tasks=center_missing_tasks,
+            worker_fn=_build_wan21_t2v_head_center_extraction_task,
+            num_workers=int(head_trajectory_dynamics_center_cache_num_workers),
+        ):
+            _set_wan21_t2v_cached_center_trajectory(
+                cache_payload=center_cache_payload,
+                step=int(key[0]),
+                layer=int(key[1]),
+                head=int(key[2]),
+                trajectory=extracted_trajectory,
+            )
+            center_trajectories_by_step_layer_head[key] = _center_trajectory_wan21_t2v_to_tensor(extracted_trajectory)
+            cache_misses += 1
+            pending_cache_writes += 1
+            if pending_cache_writes >= int(cache_save_interval):
+                _save_wan21_t2v_head_trajectory_cache(center_cache_path, center_cache_payload)
+                pending_cache_writes = 0
+            if extraction_progress_bar is not None:
+                extraction_progress_bar.update(1)
+
+        if extraction_progress_bar is not None:
+            extraction_progress_bar.update(int(cache_hits))
     finally:
         if pending_cache_writes > 0:
             _save_wan21_t2v_head_trajectory_cache(center_cache_path, center_cache_payload)
@@ -2766,6 +2830,7 @@ def run_wan21_t2v_head_trajectory_dynamics(
         head_trajectory_dynamics_support_quantile=float(head_trajectory_dynamics_support_quantile),
         head_trajectory_dynamics_skip_existing_plots=bool(head_trajectory_dynamics_skip_existing_plots),
         reuse_video_frame_count=int(reuse_video_frame_count),
+        overlay_num_workers=int(head_trajectory_dynamics_overlay_num_workers),
     )
 
     if bool(head_trajectory_dynamics_overlay_only):
@@ -2785,6 +2850,8 @@ def run_wan21_t2v_head_trajectory_dynamics(
                 "num_support_overlap_mask_pdfs": int(num_support_overlap_mask_pdfs),
                 "center_cache_json": center_cache_path,
                 "motion_planning_region_cache_json": motion_planning_region_cache_path,
+                "head_trajectory_dynamics_center_cache_num_workers": int(head_trajectory_dynamics_center_cache_num_workers),
+                "head_trajectory_dynamics_overlay_num_workers": int(head_trajectory_dynamics_overlay_num_workers),
                 "plot_paths": overlay_plot_paths,
                 "reuse_cross_attention_dir": cross_attention_dir,
                 "reuse_cross_attention_summary_path": cross_attention_summary_path,
@@ -3307,6 +3374,8 @@ def run_wan21_t2v_head_trajectory_dynamics(
         "motion_planning_region_cache_hits": int(motion_planning_region_cache_hits),
         "motion_planning_region_cache_misses": int(motion_planning_region_cache_misses),
         "head_trajectory_dynamics_support_cache_num_workers": int(head_trajectory_dynamics_support_cache_num_workers),
+        "head_trajectory_dynamics_center_cache_num_workers": int(head_trajectory_dynamics_center_cache_num_workers),
+        "head_trajectory_dynamics_overlay_num_workers": int(head_trajectory_dynamics_overlay_num_workers),
         "head_trajectory_dynamics_cache_save_interval": int(cache_save_interval),
         "num_head_records": int(len(head_map_records)),
         "num_pairwise_rows": int(len(pairwise_rows)),
