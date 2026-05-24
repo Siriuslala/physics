@@ -90,10 +90,7 @@ be the number of complex pairs on that axis.
 
 Then the angular frequency of the \(r\)-th complex pair is
 
-\[
-\theta_{a,r} = b_a^{-2r/d_a},
-\qquad r = 0, 1, \dots, m_a - 1.
-\]
+\[ \theta_{a,r} = b_a^{-2r/d_a}, \qquad r = 0, 1, \dots, m_a - 1. \]
 
 So:
 
@@ -153,21 +150,7 @@ In the current code, this is implemented by rescaling the RoPE complex phase dir
 After the phase is defined, the query and key are rotated in the standard RoPE form.
 For one real pair \((x_1, x_2)\), the rotated pair is
 
-\[
-\begin{bmatrix}
-x_1' \\
-x_2'
-\end{bmatrix}
-=
-\begin{bmatrix}
-\cos \phi & -\sin \phi \\
-\sin \phi & \cos \phi
-\end{bmatrix}
-\begin{bmatrix}
-x_1 \\
-x_2
-\end{bmatrix}.
-\]
+\[ \begin{bmatrix} x_1' \\ x_2' \end{bmatrix} = \begin{bmatrix} \cos \phi & -\sin \phi \\ \sin \phi & \cos \phi \end{bmatrix} \begin{bmatrix} x_1 \\ x_2 \end{bmatrix}. \]
 
 Then the model still computes
 
@@ -191,13 +174,7 @@ be the set of diffusion steps on which the modification is active, where \(K\) i
 If \(S\) is empty, the modification is applied to all diffusion steps.
 If \(S\) is non-empty, then the effective scale is
 
-\[
-\lambda_a^{\text{used}}(t) =
-\begin{cases}
-\lambda_a, & t \in S, \\
-1, & t \notin S.
-\end{cases}
-\]
+\[ \lambda_a^{\text{used}}(t) = \begin{cases} \lambda_a, & t \in S, \\ 1, & t \notin S. \end{cases} \]
 
 This means that outside the selected steps, the model falls back to the original Wan2.1 RoPE.
 
@@ -229,16 +206,7 @@ g(e_t) \in \mathbb{R}^3.
 
 Its output is converted into positive dynamic scales:
 
-\[
-\lambda^{\text{dyn}}(t) =
-\exp(g(e_t))
-=
-\big[
-\lambda_f^{\text{dyn}}(t),
-\lambda_h^{\text{dyn}}(t),
-\lambda_w^{\text{dyn}}(t)
-\big].
-\]
+\[ \lambda^{\text{dyn}}(t) = \exp(g(e_t)) = \big[ \lambda_f^{\text{dyn}}(t), \lambda_h^{\text{dyn}}(t), \lambda_w^{\text{dyn}}(t) \big]. \]
 
 Here:
 
@@ -251,10 +219,7 @@ Here:
 Scheme 2 still uses the manual scales as a base.
 The final scale applied at diffusion step \(t\) is
 
-\[
-\lambda_a^{\text{eff}}(t) =
-\lambda_a \cdot \lambda_a^{\text{dyn}}(t).
-\]
+\[ \lambda_a^{\text{eff}}(t) = \lambda_a \cdot \lambda_a^{\text{dyn}}(t). \]
 
 So:
 
@@ -264,13 +229,7 @@ So:
 
 If a diffusion-step window \(S\) is also specified, then
 
-\[
-\lambda_a^{\text{used}}(t) =
-\begin{cases}
-\lambda_a^{\text{eff}}(t), & t \in S, \\
-1, & t \notin S.
-\end{cases}
-\]
+\[ \lambda_a^{\text{used}}(t) = \begin{cases} \lambda_a^{\text{eff}}(t), & t \in S, \\ 1, & t \notin S. \end{cases} \]
 
 ### 6.4 Engineering implementation
 
@@ -308,16 +267,7 @@ The goal is to let different heads prefer different RoPE scale patterns without 
 
 For layer \(\ell\), head \(m\), and diffusion step \(t\), define a router output
 
-\[
-\beta_{\ell,m}(t)
-=
-\big[
-\beta_{\ell,m}^{(f)}(t),
-\beta_{\ell,m}^{(s)}(t),
-\beta_{\ell,m}^{(j)}(t)
-\big]
-\in \mathbb{R}^3,
-\]
+\[ \beta_{\ell,m}(t) = \big[ \beta_{\ell,m}^{(f)}(t), \beta_{\ell,m}^{(s)}(t), \beta_{\ell,m}^{(j)}(t) \big] \in \mathbb{R}^3, \]
 
 where:
 
@@ -337,32 +287,11 @@ so its three coordinates are nonnegative and sum to \(1\).
 
 Define three reference scale triplets:
 
-\[
-\lambda^{(f)} =
-\big[
-\lambda_f^{(f)},
-\lambda_h^{(f)},
-\lambda_w^{(f)}
-\big],
-\]
+\[ \lambda^{(f)} = \big[ \lambda_f^{(f)}, \lambda_h^{(f)}, \lambda_w^{(f)} \big], \]
 
-\[
-\lambda^{(s)} =
-\big[
-\lambda_f^{(s)},
-\lambda_h^{(s)},
-\lambda_w^{(s)}
-\big],
-\]
+\[ \lambda^{(s)} = \big[ \lambda_f^{(s)}, \lambda_h^{(s)}, \lambda_w^{(s)} \big], \]
 
-\[
-\lambda^{(j)} =
-\big[
-\lambda_f^{(j)},
-\lambda_h^{(j)},
-\lambda_w^{(j)}
-\big].
-\]
+\[ \lambda^{(j)} = \big[ \lambda_f^{(j)}, \lambda_h^{(j)}, \lambda_w^{(j)} \big]. \]
 
 Their meanings are:
 
@@ -374,15 +303,7 @@ Their meanings are:
 
 The effective scale triplet for layer \(\ell\), head \(m\), and step \(t\) is
 
-\[
-\lambda_{\ell,m}(t)
-=
-\beta_{\ell,m}^{(f)}(t)\lambda^{(f)}
-+
-\beta_{\ell,m}^{(s)}(t)\lambda^{(s)}
-+
-\beta_{\ell,m}^{(j)}(t)\lambda^{(j)}.
-\]
+\[ \lambda_{\ell,m}(t) = \beta_{\ell,m}^{(f)}(t)\lambda^{(f)} + \beta_{\ell,m}^{(s)}(t)\lambda^{(s)} + \beta_{\ell,m}^{(j)}(t)\lambda^{(j)}. \]
 
 This formula means:
 

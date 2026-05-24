@@ -38,11 +38,13 @@ from .utils import (
     _generate_wan21_t2v_video,
     _init_wan21_t2v_runtime,
     _install_wan21_t2v_cross_attention_viz_patch,
+    _iter_wan21_t2v_parallel_results,
     _load_wan21_t2v_cross_attention_mean_maps_from_disk,
     _load_wan21_t2v_cross_attention_token_meta,
     _locate_wan21_t2v_prompt_words,
     _normalize_wan21_t2v_attention_map_per_frame,
     _resolve_wan21_t2v_offload_model,
+    _resolve_wan21_t2v_num_workers,
     _resolve_wan21_t2v_viz_frame_indices,
     _sanitize_wan21_t2v_token_name,
     _save_csv,
@@ -55,6 +57,183 @@ from .utils import (
     _subsample_wan21_t2v_trajectory,
     _trajectory_stats_wan21_t2v,
 )
+
+def _resolve_wan21_t2v_cross_attention_token_viz_num_workers(
+    requested_num_workers: int,
+    task_count: int,
+) -> int:
+    """Resolve the CPU worker count used to render cross-attention PDFs and trajectories."""
+    return _resolve_wan21_t2v_num_workers(
+        requested_num_workers=int(requested_num_workers),
+        task_count=int(task_count),
+    )
+
+
+def _materialize_wan21_t2v_cross_attention_token_viz_task(task: Dict[str, object]) -> Dict[str, object]:
+    """Render one cross-attention head/mean bundle and return its materialized rows."""
+    step = int(task["step"])
+    layer = int(task["layer"])
+    word = str(task["word"])
+    head = task["head"]
+    head_name = str(task["head_name"])
+    head_sort_index = int(task["head_sort_index"])
+    token_type = str(task["token_type"])
+    token_positions = list(task["token_positions"])
+    map_fhw: torch.Tensor = task["map_fhw"]  # type: ignore[assignment]
+    frame_num = int(task["frame_num"])
+    num_viz_frames = int(task["num_viz_frames"])
+    viz_frame_indices = task["viz_frame_indices"]
+    trajectory_enable = bool(task["trajectory_enable"])
+    trajectory_style = str(task["trajectory_style"])
+    trajectory_num_frames = int(task["trajectory_num_frames"])
+    trajectory_smooth_radius = int(task["trajectory_smooth_radius"])
+    trajectory_power = float(task["trajectory_power"])
+    trajectory_quantile = float(task["trajectory_quantile"])
+    trajectory_arrow_stride = int(task["trajectory_arrow_stride"])
+    trajectory_timeline_num_frames = int(task["trajectory_timeline_num_frames"])
+    trajectory_include_head_mean = bool(task["trajectory_include_head_mean"])
+    attention_pdf_per_frame_normalize = bool(task["attention_pdf_per_frame_normalize"])
+    attention_pdf_share_color_scale = bool(task["attention_pdf_share_color_scale"])
+    skip_existing_pdfs = bool(task["skip_existing_pdfs"])
+    plot_attention_now = bool(task["plot_attention_now"])
+    plot_trajectory_now = bool(task["plot_trajectory_now"])
+    plot_trajectory_timeline_now = bool(task["plot_trajectory_timeline_now"])
+
+    token_dir = os.path.join(
+        str(task["visualization_output_dir"]),
+        f"timestep_{step:03d}",
+        f"token_{token_type}_{_sanitize_wan21_t2v_token_name(word)}",
+    )
+    _ensure_dir(token_dir)
+
+    attention_frame_indices, video_frame_labels = _resolve_wan21_t2v_viz_frame_indices(
+        attention_frame_count=int(map_fhw.size(0)),
+        video_frame_count=frame_num,
+        num_frames=num_viz_frames,
+        explicit_indices=viz_frame_indices,
+    )
+
+    row: Dict[str, object] = {
+        "step": step,
+        "layer": layer,
+        "head": head,
+        "token": word,
+        "token_type": token_type,
+        "token_positions": token_positions,
+        "pdf_path": "",
+        "frame_indices": video_frame_labels,
+        "attention_frame_indices": attention_frame_indices,
+    }
+
+    if plot_attention_now:
+        map_pdf_path = os.path.join(token_dir, f"layer_{layer:02d}_head_{head_name}.pdf")
+        if (not skip_existing_pdfs) or (not os.path.exists(map_pdf_path)):
+            _save_wan21_t2v_cross_attention_pdf(
+                map_hfhw=(
+                    _normalize_wan21_t2v_attention_map_per_frame(map_fhw)
+                    if attention_pdf_per_frame_normalize
+                    else map_fhw
+                ),
+                frame_indices=attention_frame_indices,
+                frame_labels=video_frame_labels,
+                save_file=map_pdf_path,
+                title=f"step={step} layer={layer} head={head_name} token={word}",
+                share_color_scale=attention_pdf_share_color_scale,
+            )
+        row["pdf_path"] = map_pdf_path
+
+    trajectory_rows: List[Dict[str, object]] = []
+    trajectory_path_length = None
+    if trajectory_enable and token_type == "object" and (head != "mean" or trajectory_include_head_mean):
+        trajectory_raw = _extract_wan21_t2v_attention_region_center_trajectory(
+            map_fhw=map_fhw,
+            power=trajectory_power,
+            quantile=trajectory_quantile,
+        )
+        # Export trajectory CSV from raw per-frame centers so downstream stages use
+        # frame-local centers unaffected by temporal smoothing.
+        export_frame_indices, export_points = _subsample_wan21_t2v_trajectory(
+            trajectory_raw,
+            num_points=0,
+        )
+        trajectory = _smooth_wan21_t2v_trajectory(trajectory_raw, radius=trajectory_smooth_radius)
+        trajectory_frame_indices, trajectory_points = _subsample_wan21_t2v_trajectory(
+            trajectory,
+            num_points=trajectory_num_frames,
+        )
+        timeline_attention_indices, timeline_video_labels = _resolve_wan21_t2v_viz_frame_indices(
+            attention_frame_count=len(trajectory),
+            video_frame_count=frame_num,
+            num_frames=trajectory_timeline_num_frames,
+            explicit_indices=None,
+        )
+
+        trajectory_pdf_path = os.path.join(token_dir, f"layer_{layer:02d}_head_{head_name}_trajectory.pdf")
+        trajectory_timeline_pdf_path = os.path.join(
+            token_dir,
+            f"layer_{layer:02d}_head_{head_name}_trajectory_timeline.pdf",
+        )
+        if plot_trajectory_now:
+            if (not skip_existing_pdfs) or (not os.path.exists(trajectory_pdf_path)):
+                _save_wan21_t2v_token_trajectory_pdf(
+                    trajectory=trajectory_points,
+                    frame_indices=trajectory_frame_indices,
+                    mean_map_hw=map_fhw.mean(dim=0),
+                    save_file=trajectory_pdf_path,
+                    title=f"step={step} layer={layer} head={head_name} token={word}",
+                    style=trajectory_style,
+                    arrow_stride=trajectory_arrow_stride,
+                )
+            row["trajectory_pdf_path"] = trajectory_pdf_path
+        else:
+            row["trajectory_pdf_path"] = ""
+
+        if plot_trajectory_timeline_now:
+            if (not skip_existing_pdfs) or (not os.path.exists(trajectory_timeline_pdf_path)):
+                _save_wan21_t2v_token_trajectory_timeline_pdf(
+                    map_fhw=map_fhw,
+                    trajectory=trajectory_raw,
+                    attention_frame_indices=timeline_attention_indices,
+                    frame_labels=timeline_video_labels,
+                    save_file=trajectory_timeline_pdf_path,
+                    title=f"step={step} layer={layer} head={head_name} token={word}",
+                )
+            row["trajectory_timeline_pdf_path"] = trajectory_timeline_pdf_path
+        else:
+            row["trajectory_timeline_pdf_path"] = ""
+
+        trajectory_stats = _trajectory_stats_wan21_t2v(trajectory_points)
+        row.update(
+            {
+                "trajectory_path_length": trajectory_stats["path_length"],
+                "trajectory_net_displacement": trajectory_stats["net_displacement"],
+                "trajectory_mean_step_displacement": trajectory_stats["mean_step_displacement"],
+            }
+        )
+        for frame_idx, (y, x) in zip(export_frame_indices, export_points):
+            trajectory_rows.append(
+                {
+                    "step": step,
+                    "layer": layer,
+                    "head": head,
+                    "token": word,
+                    "token_type": token_type,
+                    "frame": int(frame_idx),
+                    "y": float(y),
+                    "x": float(x),
+                    "trajectory_pdf_path": row["trajectory_pdf_path"],
+                }
+            )
+        trajectory_path_length = float(trajectory_stats["path_length"])
+
+    return {
+        "sort_key": (step, layer, word, head_sort_index),
+        "summary_key": (step, layer, word),
+        "row": row,
+        "trajectory_rows": trajectory_rows,
+        "trajectory_path_length": trajectory_path_length,
+        "pdf_units": int(task["pdf_units"]),
+    }
 
 def run_wan21_t2v_cross_attention_token_viz(
     wan21_root: str,
@@ -100,12 +279,18 @@ def run_wan21_t2v_cross_attention_token_viz(
     draw_attention_map_only: bool = False,
     draw_attention_maps_path: str = "",
     visualization_output_dir: str = "",
+    cross_attention_token_viz_num_workers: int = 0,
     parallel_cfg: Optional[Wan21T2VParallelConfig] = None,
 ):
     """Visualize video-to-text cross-attention maps for user-selected prompt words.
 
     Output structure:
     - output_dir/timestep_xxx/token_<word>/layer_XX_head_YY.pdf
+
+    CPU parallelism:
+    - cross_attention_token_viz_num_workers: number of CPU worker processes used
+      to render PDFs and extract per-head trajectories after map collection.
+      A non-positive value means use os.cpu_count().
     """
     parallel_cfg = parallel_cfg or Wan21T2VParallelConfig()
     runtime = _init_wan21_t2v_runtime(parallel_cfg, explicit_device_id=device_id)
@@ -192,25 +377,103 @@ def run_wan21_t2v_cross_attention_token_viz(
         plot_trajectory_now = bool(allow_plot and save_trajectory_pdfs)
         plot_trajectory_timeline_now = bool(allow_plot and save_trajectory_timeline_pdfs)
 
+        tasks: List[Dict[str, object]] = []
         total_pdf_tasks = 0
-        if plot_attention_now or plot_trajectory_now or plot_trajectory_timeline_now:
-            for (_, _, word), maps in mean_maps.items():
-                heads = int(maps.size(0))
-                token_type = word_to_type.get(word, "unknown")
+        for (step, layer, word), maps in sorted(mean_maps.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
+            heads = int(maps.size(0))
+            token_type = word_to_type.get(word, "unknown")
+            token_positions = word_to_positions.get(word, [])
+            for head in range(heads):
+                pdf_units = 0
                 if plot_attention_now:
-                    total_pdf_tasks += heads
-                    if heads > 1:
-                        total_pdf_tasks += 1
+                    pdf_units += 1
                 if trajectory_enable and token_type == "object":
                     if plot_trajectory_now:
-                        total_pdf_tasks += heads
+                        pdf_units += 1
                     if plot_trajectory_timeline_now:
-                        total_pdf_tasks += heads
-                    if trajectory_include_head_mean and heads > 1:
-                        if plot_trajectory_now:
-                            total_pdf_tasks += 1
-                        if plot_trajectory_timeline_now:
-                            total_pdf_tasks += 1
+                        pdf_units += 1
+                tasks.append(
+                    {
+                        "step": int(step),
+                        "layer": int(layer),
+                        "word": str(word),
+                        "head": int(head),
+                        "head_name": f"{int(head):02d}",
+                        "head_sort_index": int(head),
+                        "token_type": token_type,
+                        "token_positions": list(token_positions),
+                        "map_fhw": maps[head],
+                        "frame_num": int(frame_num),
+                        "num_viz_frames": int(num_viz_frames),
+                        "viz_frame_indices": None
+                        if not viz_frame_indices
+                        else [int(i) for i in viz_frame_indices],
+                        "trajectory_enable": bool(trajectory_enable),
+                        "trajectory_style": trajectory_style,
+                        "trajectory_num_frames": int(trajectory_num_frames),
+                        "trajectory_smooth_radius": int(trajectory_smooth_radius),
+                        "trajectory_power": float(trajectory_power),
+                        "trajectory_quantile": float(trajectory_quantile),
+                        "trajectory_arrow_stride": int(trajectory_arrow_stride),
+                        "trajectory_timeline_num_frames": int(trajectory_timeline_num_frames),
+                        "trajectory_include_head_mean": bool(trajectory_include_head_mean),
+                        "attention_pdf_per_frame_normalize": bool(attention_pdf_per_frame_normalize),
+                        "attention_pdf_share_color_scale": bool(attention_pdf_share_color_scale),
+                        "skip_existing_pdfs": bool(skip_existing_pdfs),
+                        "plot_attention_now": bool(plot_attention_now),
+                        "plot_trajectory_now": bool(plot_trajectory_now),
+                        "plot_trajectory_timeline_now": bool(plot_trajectory_timeline_now),
+                        "visualization_output_dir": str(visualization_output_dir),
+                        "pdf_units": int(pdf_units),
+                    }
+                )
+                total_pdf_tasks += pdf_units
+
+            if heads > 1:
+                pdf_units = 0
+                if plot_attention_now:
+                    pdf_units += 1
+                if trajectory_enable and token_type == "object" and trajectory_include_head_mean:
+                    if plot_trajectory_now:
+                        pdf_units += 1
+                    if plot_trajectory_timeline_now:
+                        pdf_units += 1
+                tasks.append(
+                    {
+                        "step": int(step),
+                        "layer": int(layer),
+                        "word": str(word),
+                        "head": "mean",
+                        "head_name": "mean",
+                        "head_sort_index": int(heads),
+                        "token_type": token_type,
+                        "token_positions": list(token_positions),
+                        "map_fhw": maps.mean(dim=0),
+                        "frame_num": int(frame_num),
+                        "num_viz_frames": int(num_viz_frames),
+                        "viz_frame_indices": None
+                        if not viz_frame_indices
+                        else [int(i) for i in viz_frame_indices],
+                        "trajectory_enable": bool(trajectory_enable),
+                        "trajectory_style": trajectory_style,
+                        "trajectory_num_frames": int(trajectory_num_frames),
+                        "trajectory_smooth_radius": int(trajectory_smooth_radius),
+                        "trajectory_power": float(trajectory_power),
+                        "trajectory_quantile": float(trajectory_quantile),
+                        "trajectory_arrow_stride": int(trajectory_arrow_stride),
+                        "trajectory_timeline_num_frames": int(trajectory_timeline_num_frames),
+                        "trajectory_include_head_mean": bool(trajectory_include_head_mean),
+                        "attention_pdf_per_frame_normalize": bool(attention_pdf_per_frame_normalize),
+                        "attention_pdf_share_color_scale": bool(attention_pdf_share_color_scale),
+                        "skip_existing_pdfs": bool(skip_existing_pdfs),
+                        "plot_attention_now": bool(plot_attention_now),
+                        "plot_trajectory_now": bool(plot_trajectory_now),
+                        "plot_trajectory_timeline_now": bool(plot_trajectory_timeline_now),
+                        "visualization_output_dir": str(visualization_output_dir),
+                        "pdf_units": int(pdf_units),
+                    }
+                )
+                total_pdf_tasks += pdf_units
 
         pbar = None
         if total_pdf_tasks > 0:
@@ -223,253 +486,28 @@ def run_wan21_t2v_cross_attention_token_viz(
             )
 
         try:
-            for (step, layer, word), maps in sorted(mean_maps.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
-                _, f, _, _ = maps.shape
-                attention_frame_indices, video_frame_labels = _resolve_wan21_t2v_viz_frame_indices(
-                    attention_frame_count=f,
-                    video_frame_count=frame_num,
-                    num_frames=num_viz_frames,
-                    explicit_indices=viz_frame_indices,
+            if tasks:
+                num_workers = _resolve_wan21_t2v_cross_attention_token_viz_num_workers(
+                    requested_num_workers=int(cross_attention_token_viz_num_workers),
+                    task_count=int(len(tasks)),
                 )
-                token_type = word_to_type.get(word, "unknown")
-                token_dir = os.path.join(
-                    visualization_output_dir,
-                    f"timestep_{step:03d}",
-                    f"token_{token_type}_{_sanitize_wan21_t2v_token_name(word)}",
-                )
-                _ensure_dir(token_dir)
+                task_results_by_key: Dict[Tuple[int, int, str, int], Dict[str, object]] = {}
+                for result in _iter_wan21_t2v_parallel_results(
+                    tasks=tasks,
+                    worker_fn=_materialize_wan21_t2v_cross_attention_token_viz_task,
+                    num_workers=int(num_workers),
+                ):
+                    task_results_by_key[result["sort_key"]] = result
+                    if pbar is not None:
+                        pbar.update(int(result["pdf_units"]))
 
-                for head in range(maps.size(0)):
-                    map_pdf_path = os.path.join(token_dir, f"layer_{layer:02d}_head_{head:02d}.pdf")
-                    if plot_attention_now:
-                        if (not skip_existing_pdfs) or (not os.path.exists(map_pdf_path)):
-                            _save_wan21_t2v_cross_attention_pdf(
-                                map_hfhw=(
-                                    _normalize_wan21_t2v_attention_map_per_frame(maps[head])
-                                    if attention_pdf_per_frame_normalize
-                                    else maps[head]
-                                ),
-                                frame_indices=attention_frame_indices,
-                                frame_labels=video_frame_labels,
-                                save_file=map_pdf_path,
-                                title=f"step={step} layer={layer} head={head} token={word}",
-                                share_color_scale=attention_pdf_share_color_scale,
-                            )
-                        if pbar is not None:
-                            pbar.update(1)
-                    rows.append(
-                        {
-                            "step": step,
-                            "layer": layer,
-                            "head": head,
-                            "token": word,
-                            "token_type": token_type,
-                            "token_positions": word_to_positions.get(word, []),
-                            "pdf_path": map_pdf_path if plot_attention_now else "",
-                            "frame_indices": video_frame_labels,
-                            "attention_frame_indices": attention_frame_indices,
-                        }
-                    )
-
-                    if trajectory_enable and token_type == "object":
-                        trajectory_raw = _extract_wan21_t2v_attention_region_center_trajectory(
-                            map_fhw=maps[head],
-                            power=trajectory_power,
-                            quantile=trajectory_quantile,
-                        )
-                        # Export trajectory CSV from raw per-frame centers so downstream
-                        # stages use frame-local centers unaffected by temporal smoothing.
-                        export_frame_indices, export_points = _subsample_wan21_t2v_trajectory(
-                            trajectory_raw,
-                            num_points=0,
-                        )
-                        trajectory = _smooth_wan21_t2v_trajectory(trajectory_raw, radius=trajectory_smooth_radius)
-                        trajectory_frame_indices, trajectory_points = _subsample_wan21_t2v_trajectory(
-                            trajectory,
-                            num_points=trajectory_num_frames,
-                        )
-                        timeline_attention_indices, timeline_video_labels = _resolve_wan21_t2v_viz_frame_indices(
-                            attention_frame_count=len(trajectory),
-                            video_frame_count=frame_num,
-                            num_frames=trajectory_timeline_num_frames,
-                            explicit_indices=None,
-                        )
-
-                        trajectory_pdf_path = os.path.join(token_dir, f"layer_{layer:02d}_head_{head:02d}_trajectory.pdf")
-                        trajectory_timeline_pdf_path = os.path.join(
-                            token_dir,
-                            f"layer_{layer:02d}_head_{head:02d}_trajectory_timeline.pdf",
-                        )
-                        if plot_trajectory_now:
-                            if (not skip_existing_pdfs) or (not os.path.exists(trajectory_pdf_path)):
-                                _save_wan21_t2v_token_trajectory_pdf(
-                                    trajectory=trajectory_points,
-                                    frame_indices=trajectory_frame_indices,
-                                    mean_map_hw=maps[head].mean(dim=0),
-                                    save_file=trajectory_pdf_path,
-                                    title=f"step={step} layer={layer} head={head} token={word}",
-                                    style=trajectory_style,
-                                    arrow_stride=trajectory_arrow_stride,
-                                )
-                            if pbar is not None:
-                                pbar.update(1)
-                        if plot_trajectory_timeline_now:
-                            if (not skip_existing_pdfs) or (not os.path.exists(trajectory_timeline_pdf_path)):
-                                _save_wan21_t2v_token_trajectory_timeline_pdf(
-                                    map_fhw=maps[head],
-                                    trajectory=trajectory_raw,
-                                    attention_frame_indices=timeline_attention_indices,
-                                    frame_labels=timeline_video_labels,
-                                    save_file=trajectory_timeline_pdf_path,
-                                    title=f"step={step} layer={layer} head={head} token={word}",
-                                )
-                            if pbar is not None:
-                                pbar.update(1)
-
-                        trajectory_stats = _trajectory_stats_wan21_t2v(trajectory_points)
-                        rows[-1]["trajectory_pdf_path"] = trajectory_pdf_path if plot_trajectory_now else ""
-                        rows[-1]["trajectory_timeline_pdf_path"] = (
-                            trajectory_timeline_pdf_path if plot_trajectory_timeline_now else ""
-                        )
-                        rows[-1].update(
-                            {
-                                "trajectory_path_length": trajectory_stats["path_length"],
-                                "trajectory_net_displacement": trajectory_stats["net_displacement"],
-                                "trajectory_mean_step_displacement": trajectory_stats["mean_step_displacement"],
-                            }
-                        )
-                        trajectory_summary_acc[(step, layer, word)].append(trajectory_stats["path_length"])
-
-                        for frame_idx, (y, x) in zip(export_frame_indices, export_points):
-                            trajectory_rows.append(
-                                {
-                                    "step": step,
-                                    "layer": layer,
-                                    "head": head,
-                                    "token": word,
-                                    "token_type": token_type,
-                                    "frame": int(frame_idx),
-                                    "y": float(y),
-                                    "x": float(x),
-                                    "trajectory_pdf_path": trajectory_pdf_path if plot_trajectory_now else "",
-                                }
-                            )
-
-                if maps.size(0) > 1:
-                    mean_map = maps.mean(dim=0)
-                    mean_map_pdf_path = os.path.join(token_dir, f"layer_{layer:02d}_head_mean.pdf")
-                    if plot_attention_now:
-                        if (not skip_existing_pdfs) or (not os.path.exists(mean_map_pdf_path)):
-                            _save_wan21_t2v_cross_attention_pdf(
-                                map_hfhw=(
-                                    _normalize_wan21_t2v_attention_map_per_frame(mean_map)
-                                    if attention_pdf_per_frame_normalize
-                                    else mean_map
-                                ),
-                                frame_indices=attention_frame_indices,
-                                frame_labels=video_frame_labels,
-                                save_file=mean_map_pdf_path,
-                                title=f"step={step} layer={layer} head=mean token={word}",
-                                share_color_scale=attention_pdf_share_color_scale,
-                            )
-                        if pbar is not None:
-                            pbar.update(1)
-
-                    mean_row = {
-                        "step": step,
-                        "layer": layer,
-                        "head": "mean",
-                        "token": word,
-                        "token_type": token_type,
-                        "token_positions": word_to_positions.get(word, []),
-                        "pdf_path": mean_map_pdf_path if plot_attention_now else "",
-                        "frame_indices": video_frame_labels,
-                        "attention_frame_indices": attention_frame_indices,
-                    }
-
-                    if trajectory_enable and token_type == "object" and trajectory_include_head_mean:
-                        mean_trajectory_raw = _extract_wan21_t2v_attention_region_center_trajectory(
-                            map_fhw=mean_map,
-                            power=trajectory_power,
-                            quantile=trajectory_quantile,
-                        )
-                        export_mean_indices, export_mean_points = _subsample_wan21_t2v_trajectory(
-                            mean_trajectory_raw,
-                            num_points=0,
-                        )
-                        mean_trajectory = _smooth_wan21_t2v_trajectory(
-                            mean_trajectory_raw,
-                            radius=trajectory_smooth_radius,
-                        )
-                        mean_frame_indices, mean_points = _subsample_wan21_t2v_trajectory(
-                            mean_trajectory,
-                            num_points=trajectory_num_frames,
-                        )
-                        mean_timeline_attention_indices, mean_timeline_video_labels = _resolve_wan21_t2v_viz_frame_indices(
-                            attention_frame_count=len(mean_trajectory_raw),
-                            video_frame_count=frame_num,
-                            num_frames=trajectory_timeline_num_frames,
-                            explicit_indices=None,
-                        )
-                        mean_trajectory_pdf_path = os.path.join(token_dir, f"layer_{layer:02d}_head_mean_trajectory.pdf")
-                        mean_trajectory_timeline_pdf_path = os.path.join(
-                            token_dir,
-                            f"layer_{layer:02d}_head_mean_trajectory_timeline.pdf",
-                        )
-                        if plot_trajectory_now:
-                            if (not skip_existing_pdfs) or (not os.path.exists(mean_trajectory_pdf_path)):
-                                _save_wan21_t2v_token_trajectory_pdf(
-                                    trajectory=mean_points,
-                                    frame_indices=mean_frame_indices,
-                                    mean_map_hw=mean_map.mean(dim=0),
-                                    save_file=mean_trajectory_pdf_path,
-                                    title=f"step={step} layer={layer} head=mean token={word}",
-                                    style=trajectory_style,
-                                    arrow_stride=trajectory_arrow_stride,
-                                )
-                            if pbar is not None:
-                                pbar.update(1)
-                        if plot_trajectory_timeline_now:
-                            if (not skip_existing_pdfs) or (not os.path.exists(mean_trajectory_timeline_pdf_path)):
-                                _save_wan21_t2v_token_trajectory_timeline_pdf(
-                                    map_fhw=mean_map,
-                                    trajectory=mean_trajectory_raw,
-                                    attention_frame_indices=mean_timeline_attention_indices,
-                                    frame_labels=mean_timeline_video_labels,
-                                    save_file=mean_trajectory_timeline_pdf_path,
-                                    title=f"step={step} layer={layer} head=mean token={word}",
-                                )
-                            if pbar is not None:
-                                pbar.update(1)
-                        mean_stats = _trajectory_stats_wan21_t2v(mean_points)
-                        mean_row.update(
-                            {
-                                "trajectory_pdf_path": mean_trajectory_pdf_path if plot_trajectory_now else "",
-                                "trajectory_timeline_pdf_path": (
-                                    mean_trajectory_timeline_pdf_path if plot_trajectory_timeline_now else ""
-                                ),
-                                "trajectory_path_length": mean_stats["path_length"],
-                                "trajectory_net_displacement": mean_stats["net_displacement"],
-                                "trajectory_mean_step_displacement": mean_stats["mean_step_displacement"],
-                            }
-                        )
-                        for frame_idx, (y, x) in zip(export_mean_indices, export_mean_points):
-                            trajectory_rows.append(
-                                {
-                                    "step": step,
-                                    "layer": layer,
-                                    "head": "mean",
-                                    "token": word,
-                                    "token_type": token_type,
-                                    "frame": int(frame_idx),
-                                    "y": float(y),
-                                    "x": float(x),
-                                    "trajectory_pdf_path": mean_trajectory_pdf_path if plot_trajectory_now else "",
-                                }
-                            )
-                        trajectory_summary_acc[(step, layer, word)].append(mean_stats["path_length"])
-
-                    rows.append(mean_row)
+                for sort_key in sorted(task_results_by_key.keys()):
+                    result = task_results_by_key[sort_key]
+                    rows.append(result["row"])
+                    trajectory_rows.extend(result["trajectory_rows"])
+                    trajectory_path_length = result["trajectory_path_length"]
+                    if trajectory_path_length is not None:
+                        trajectory_summary_acc[result["summary_key"]].append(float(trajectory_path_length))
         finally:
             if pbar is not None:
                 pbar.close()
@@ -618,6 +656,7 @@ def run_wan21_t2v_cross_attention_token_viz(
             "loaded_maps_source": loaded_maps_source,
             "visualization_output_dir": visualization_output_dir,
             "artifact_output_dir": artifact_output_dir,
+            "cross_attention_token_viz_num_workers": int(cross_attention_token_viz_num_workers),
             "stream_flush_per_step": bool(stream_flush_per_step),
             "plot_during_sampling": bool(plot_during_sampling),
             "stream_maps_dir": stream_maps_dir if stream_flush_per_step else "",

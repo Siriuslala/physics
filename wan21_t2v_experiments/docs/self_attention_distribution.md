@@ -13,9 +13,7 @@
 
 实验先复用 `cross_attention_token_viz` 的输出，在 `(reference_step, reference_layer)` 处取目标 object words 的 head-mean cross-attention map：
 
-\[
-A^{\mathrm{ref}} \in \mathbb{R}_{\ge 0}^{F \times H \times W}.
-\]
+\[ A^{\mathrm{ref}} \in \mathbb{R}_{\ge 0}^{F \times H \times W}. \]
 
 其中：
 
@@ -30,15 +28,11 @@ A^{\mathrm{ref}} \in \mathbb{R}_{\ge 0}^{F \times H \times W}.
 
 记预处理前 reference map 为
 
-\[
-A^{\mathrm{ref}},
-\]
+\[ A^{\mathrm{ref}}, \]
 
 预处理后的 map 为
 
-\[
-\tilde A^{\mathrm{ref}}.
-\]
+\[ \tilde A^{\mathrm{ref}}. \]
 
 预处理步骤是：
 
@@ -59,23 +53,15 @@ A^{\mathrm{ref}},
 
 得到参考轨迹
 
-\[
-\mathcal{C}^{\mathrm{ref}} = \{c_f^{\mathrm{ref}}\}_{f=1}^{F},
-\qquad
-c_f^{\mathrm{ref}} = (y_f^{\mathrm{ref}}, x_f^{\mathrm{ref}}).
-\]
+\[ \mathcal{C}^{\mathrm{ref}} = \{c_f^{\mathrm{ref}}\}_{f=1}^{F}, \qquad c_f^{\mathrm{ref}} = (y_f^{\mathrm{ref}}, x_f^{\mathrm{ref}}). \]
 
 再围绕每一帧的参考中心构建圆盘支撑区域
 
-\[
-M_f^{\mathrm{obj}}(y,x) \in \{0,1\},
-\]
+\[ M_f^{\mathrm{obj}}(y,x) \in \{0,1\}, \]
 
 把所有帧拼起来得到 object support mask
 
-\[
-M^{\mathrm{obj}} \in \{0,1\}^{F \times H \times W}.
-\]
+\[ M^{\mathrm{obj}} \in \{0,1\}^{F \times H \times W}. \]
 
 这个 mask 后面既用于选 query tokens，也用于定义 key 端的 object / non-object 区域。
 
@@ -89,9 +75,7 @@ M^{\mathrm{obj}} \in \{0,1\}^{F \times H \times W}.
 
 对 step \(s\)、layer \(\ell\)、head \(h\)，记 query / key logits 为
 
-\[
-\ell_{h}(i,j)=\frac{\langle q_{i,h}, k_{j,h}\rangle}{\sqrt d},
-\]
+\[ \ell_{h}(i,j)=\frac{\langle q_{i,h}, k_{j,h}\rangle}{\sqrt d}, \]
 
 其中：
 
@@ -101,11 +85,19 @@ M^{\mathrm{obj}} \in \{0,1\}^{F \times H \times W}.
 
 attention 概率为
 
-\[
-\alpha_h(i,j)=\operatorname{softmax}_{j}\big(\ell_h(i,j)\big).
-\]
+\[ \alpha_h(i,j)=\operatorname{softmax}_{j}\big(\ell_h(i,j)\big). \]
 
-我们不显式保存完整 \(L \times L\) attention matrix，而是在 probe 时对选定 query 集合直接计算它们对全部 key 的 attention 分布。
+Let the latent token grid for one sample be
+
+\[ \mathcal{T}=\{(f,y,x)\mid 0 \le f < F,\; 0 \le y < H,\; 0 \le x < W\}. \]
+
+Then the key index \(j\) ranges over the entire video-token sequence \(\mathcal{T}\), not only over other frames. Therefore:
+
+- the key set includes the query frame itself,
+- the key set also includes the query token itself when \(j=i\),
+- the diagonal self-copy term is one ordinary entry inside the same-frame block.
+
+We do not save the full \(L \times L\) attention matrix explicitly. Instead, for each selected query subset we recompute the logits against all video keys in \(\mathcal{T}\), apply the exact softmax over that full key set, and then aggregate the resulting probability mass into frame-level summaries.
 
 ## 4. Object-Region Query Analysis
 
@@ -113,17 +105,13 @@ attention 概率为
 
 在若干个均匀采样的 query frames 上，选出所有落在 object support 里的 token：
 
-\[
-Q_f^{\mathrm{obj}}=\{(f,y,x)\mid M_f^{\mathrm{obj}}(y,x)=1\}.
-\]
+\[ Q_f^{\mathrm{obj}}=\{(f,y,x)\mid M_f^{\mathrm{obj}}(y,x)=1\}. \]
 
 这里的 `query_frame` 指的是 latent token frame，不是最终导出视频的 RGB frame。
 
 如果本次采样的 latent-frame 数是 \(F\)，那么实际参与 object-query 统计的 query frames 个数至多为
 
-\[
-\min(F,\texttt{distribution\_query\_frame\_count}).
-\]
+\[ \min(F,\texttt{distribution\_query\_frame\_count}). \]
 
 如果某一帧内 token 太多，则按近似均匀间隔下采样到上限 `distribution_object_query_token_limit_per_frame`。
 
@@ -136,32 +124,19 @@ Q_f^{\mathrm{obj}}=\{(f,y,x)\mid M_f^{\mathrm{obj}}(y,x)=1\}.
 
 对一个 query token \(i \in Q_f^{\mathrm{obj}}\)，其在 key frame \(f'\) 上的总注意力质量定义为
 
-\[
-A_{h}^{\mathrm{frame}}(i,f')=\sum_{y=1}^{H}\sum_{x=1}^{W}\alpha_h\big(i,(f',y,x)\big).
-\]
+\[ A_{h}^{\mathrm{frame}}(i,f')=\sum_{y=1}^{H}\sum_{x=1}^{W}\alpha_h\big(i,(f',y,x)\big). \]
 
 其中落在 reference object support 内的质量定义为
 
-\[
-A_{h}^{\mathrm{obj}}(i,f')=
-\sum_{y=1}^{H}\sum_{x=1}^{W}
-\alpha_h\big(i,(f',y,x)\big)\,M_{f'}^{\mathrm{obj}}(y,x).
-\]
+\[ A_{h}^{\mathrm{obj}}(i,f')= \sum_{y=1}^{H}\sum_{x=1}^{W} \alpha_h\big(i,(f',y,x)\big)\,M_{f'}^{\mathrm{obj}}(y,x). \]
 
 non-object 质量为
 
-\[
-A_{h}^{\mathrm{nonobj}}(i,f')=
-A_{h}^{\mathrm{frame}}(i,f')-A_{h}^{\mathrm{obj}}(i,f').
-\]
+\[ A_{h}^{\mathrm{nonobj}}(i,f')= A_{h}^{\mathrm{frame}}(i,f')-A_{h}^{\mathrm{obj}}(i,f'). \]
 
 object fraction 定义为
 
-\[
-R_h(i,f')=
-\frac{A_{h}^{\mathrm{obj}}(i,f')}
-{A_{h}^{\mathrm{frame}}(i,f')+\varepsilon}.
-\]
+\[ R_h(i,f')= \frac{A_{h}^{\mathrm{obj}}(i,f')}{A_{h}^{\mathrm{frame}}(i,f')+\varepsilon}. \]
 
 实验会对同一 `(step, layer, query_frame)` 内的所有 object queries 求平均，输出：
 
@@ -172,9 +147,7 @@ R_h(i,f')=
 
 并同时按 signed dt 聚合：
 
-\[
-\Delta t = f' - f.
-\]
+\[ \Delta t = f' - f. \]
 
 这样就能看 object query 是更偏向看别的帧里的 object 区域，还是更偏向看背景。
 
@@ -190,9 +163,7 @@ R_h(i,f')=
 
 然后把该 `query_frame=f` 中所有被选中的 object queries 的统计量做平均，得到一行：
 
-\[
-(\texttt{step}, \texttt{layer}, \texttt{head}, \texttt{query\_frame}=f, \texttt{key\_frame}=f').
-\]
+\[ (\texttt{step}, \texttt{layer}, \texttt{head}, \texttt{query\_frame}=f, \texttt{key\_frame}=f'). \]
 
 这一行里会记录：
 
@@ -215,9 +186,7 @@ R_h(i,f')=
 
 对于若干个均匀采样的 query frames，每帧在整个 \(H \times W\) token 网格上均匀采样若干 query tokens，记为
 
-\[
-Q_f^{\mathrm{global}}.
-\]
+\[ Q_f^{\mathrm{global}}. \]
 
 每帧最多采样 `distribution_global_query_tokens_per_frame` 个 token。
 
@@ -227,16 +196,11 @@ Q_f^{\mathrm{global}}.
 
 对于任意全局 query token \(i \in Q_f^{\mathrm{global}}\)，定义其对 key frame \(f'\) 的总注意力质量
 
-\[
-A_h^{\mathrm{global}}(i,f')=
-\sum_{y=1}^{H}\sum_{x=1}^{W}\alpha_h\big(i,(f',y,x)\big).
-\]
+\[ A_h^{\mathrm{global}}(i,f')= \sum_{y=1}^{H}\sum_{x=1}^{W}\alpha_h\big(i,(f',y,x)\big). \]
 
 再按 signed dt
 
-\[
-\Delta t=f'-f
-\]
+\[ \Delta t=f'-f \]
 
 聚合，得到 head 对不同时间偏移的全局注意力分布。
 
@@ -266,9 +230,7 @@ A_h^{\mathrm{global}}(i,f')=
 
 这些图默认保存在：
 
-\[
-\texttt{output\_dir/self\_attention\_distribution\_plots/step\_xxx/layer\_xx/}
-\]
+\[ \texttt{output\_dir/self\_attention\_distribution\_plots/step\_xxx/layer\_xx/} \]
 
 如果打开逐 head 可视化开关：
 
@@ -276,9 +238,7 @@ A_h^{\mathrm{global}}(i,f')=
 
 则还会额外生成：
 
-\[
-\texttt{output\_dir/self\_attention\_distribution\_plots/step\_xxx/layer\_xx/head\_xx/}
-\]
+\[ \texttt{output\_dir/self\_attention\_distribution\_plots/step\_xxx/layer\_xx/head\_xx/} \]
 
 下面同名的 heatmap / curve 会在该目录下按单个 head 输出。
 
@@ -308,9 +268,7 @@ A_h^{\mathrm{global}}(i,f')=
 
 因此热图尺寸是
 
-\[
-(\#\text{sampled query frames}) \times (\#\text{all key frames}).
-\]
+\[ (\#\text{sampled query frames}) \times (\#\text{all key frames}). \]
 
 更具体地说：
 
@@ -319,15 +277,11 @@ A_h^{\mathrm{global}}(i,f')=
 
 例如 Wan2.1 T2V 常见设置 `frame_num=81`，而 VAE stride 在时间维是 4，则 latent-frame 数通常是
 
-\[
-F = \frac{81-1}{4} + 1 = 21.
-\]
+\[ F = \frac{81-1}{4} + 1 = 21. \]
 
 如果 `distribution_query_frame_count=8`，那么常见的 heatmap 尺寸更接近
 
-\[
-8 \times 21,
-\]
+\[ 8 \times 21, \]
 
 而不是最终视频帧意义下的 \(81 \times 81\)，更不是 token-level 的 \(L \times L\)。
 
@@ -350,9 +304,7 @@ F = \frac{81-1}{4} + 1 = 21.
 
 这张图把 `object_rows.csv` 里原本按 `(query_frame, key_frame)` 保存的统计，进一步按
 
-\[
-dt = key\_frame - query\_frame
-\]
+\[ dt = key\_frame - query\_frame \]
 
 聚合，画出：
 
@@ -428,6 +380,8 @@ dt = key\_frame - query\_frame
 
 随 signed `dt` 的变化曲线。
 
+The current implementation normalizes each signed-`dt` bin by the number of query tokens that actually have a valid `(query_frame, key_frame)` pair for that `dt`. In particular, large \(|dt|\) bins near sequence boundaries are no longer divided by the total query count of the whole layer.
+
 ### 7.3 `global dt curves`
 
 这张图不再区分 object / non-object，只看全局均匀采样 queries 对不同 signed `dt` 的 frame-level attention mass 分布。
@@ -441,6 +395,8 @@ dt = key\_frame - query\_frame
 
 用来检查 query 所处序列位置是否影响时间偏移偏好。
 
+The same signed-`dt` normalization rule is used here as well: each bin is averaged over the subset of sampled global queries for which that temporal offset exists.
+
 ## 8. Key Parameters
 
 ### 8.1 `SELF_ATTENTION_DISTRIBUTION_QUERY_FRAME_COUNT`
@@ -449,9 +405,7 @@ dt = key\_frame - query\_frame
 
 设 latent-frame 数为 \(F\)，则实际使用的 query-frame 个数是
 
-\[
-\min(F,\texttt{SELF\_ATTENTION\_DISTRIBUTION\_QUERY\_FRAME\_COUNT}).
-\]
+\[ \min(F,\texttt{SELF\_ATTENTION\_DISTRIBUTION\_QUERY\_FRAME\_COUNT}). \]
 
 影响：
 

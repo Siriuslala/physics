@@ -1,0 +1,5311 @@
+"""Wan2.1-T2V experiment: trajectory_consensus_dynamics.
+
+Main entry:
+- run_wan21_t2v_trajectory_consensus_dynamics
+
+This experiment is a stage-based 2.0 framework for motion-planning analysis.
+The initial implementation focuses on two stages:
+1) candidate_consensus: offline candidate-region extraction and winner-gap analysis
+2) head_contribution: runtime head-wise contribution analysis via exact zero-ablation,
+   first-order Taylor approximation, and direct-proxy readout
+
+Later stages documented in the technical note can be added on the same
+engineering scaffold without modifying the official Wan2.1 source tree.
+"""
+
+import json
+import math
+import os
+import pickle
+import random
+import re
+import sys
+from collections import defaultdict
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from types import MethodType
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.cuda.amp as amp
+import torch.distributed as dist
+
+from .head_evolution import (
+    _build_wan21_t2v_trajectory_support_mask_from_centers,
+    _extract_wan21_t2v_connected_components,
+    _extract_wan21_t2v_reference_peak_and_centroid_trajectory,
+    _preprocess_wan21_t2v_attention_map_fhw,
+)
+from .self_attention_distribution import (
+    _build_wan21_t2v_self_attention_distribution_reference_support,
+)
+from .utils import (
+    Wan21T2VParallelConfig,
+    _broadcast_seed_if_needed,
+    _build_wan21_t2v_pipeline,
+    _dedup_wan21_t2v_int_list,
+    _encode_wan21_t2v_text_context_once,
+    _ensure_dir,
+    _generate_wan21_t2v_video,
+    _generate_wan21_t2v_video_with_initial_noise,
+    _init_wan21_t2v_runtime,
+    _iter_wan21_t2v_parallel_results,
+    _load_wan21_t2v_cross_attention_mean_maps_from_disk,
+    _load_wan21_t2v_cross_attention_token_meta,
+    _load_wan21_t2v_csv_rows,
+    _mean_wan21_t2v_head_maps_for_words,
+    _mean_wan21_t2v_headmean_map_for_words,
+    _normalize_wan21_t2v_attention_map_per_frame,
+    _parse_wan21_t2v_layer_head_specs,
+    _resolve_wan21_t2v_branch_from_forward_call_index,
+    _resolve_wan21_t2v_num_workers,
+    _resolve_wan21_t2v_offload_model,
+    _save_csv,
+    _save_json,
+    _unwrap_wan21_t2v_dit_model_for_runtime_patch,
+    _wan21_t2v_branch_matches,
+)
+from .wan21_t2v_experiment_patch import Wan21T2VEarlyStopRequested
+from projects.Wan2_1.wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
+from projects.Wan2_1.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+def _maybe_skip_wan21_t2v_existing_plot(save_file: str, skip_existing_plots: bool) -> bool:
+    """Return True when a plot already exists and should be reused."""
+    return bool(skip_existing_plots) and os.path.exists(save_file)
+
+
+def _load_wan21_t2v_torch_cache(path: str) -> Any:
+    """Load one local torch cache with compatibility for PyTorch 2.6+.
+
+    Newer PyTorch versions default `weights_only=True`, which rejects our older
+    candidate-cache files because they may contain numpy arrays. These files are
+    generated locally by this experiment, so it is safe to fall back to
+    `weights_only=False` for trusted local caches.
+    """
+    try:
+        return torch.load(path, map_location="cpu")
+    except pickle.UnpicklingError:
+        try:
+            return torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+
+
+def _resolve_wan21_t2v_selected_head_specs_from_layer_counts(
+    explicit_head_specs: Optional[Sequence[str]],
+    num_heads_per_layer: Dict[int, int],
+) -> List[Tuple[int, int]]:
+    """Resolve explicit head specs with `all` / `none` semantics.
+
+    Semantics:
+    - `None`: analyze no heads
+    - empty sequence: analyze all heads in all provided layers
+    - non-empty sequence: analyze the explicitly listed heads
+    """
+    if explicit_head_specs is None:
+        return []
+    if explicit_head_specs:
+        return _parse_wan21_t2v_layer_head_specs(explicit_head_specs)
+    resolved: List[Tuple[int, int]] = []
+    for layer in sorted(int(x) for x in num_heads_per_layer.keys()):
+        for head in range(int(num_heads_per_layer[int(layer)])):
+            resolved.append((int(layer), int(head)))
+    return resolved
+
+def _plot_wan21_t2v_trajectory_consensus_heatmap(
+    matrix_rows: Sequence[Dict[str, object]],
+    save_file: str,
+    title: str,
+    row_key: str,
+    col_key: str,
+    value_key: str,
+    row_label: str,
+    col_label: str,
+):
+    """Render a heatmap from flat row dictionaries."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not matrix_rows:
+        return ""
+
+    row_values = sorted(set(int(row[row_key]) for row in matrix_rows))
+    col_values = sorted(set(int(row[col_key]) for row in matrix_rows))
+    row_to_index = {value: idx for idx, value in enumerate(row_values)}
+    col_to_index = {value: idx for idx, value in enumerate(col_values)}
+
+    heatmap = torch.full((len(row_values), len(col_values)), float("nan"), dtype=torch.float32)
+    for row in matrix_rows:
+        if value_key not in row or row[value_key] == "":
+            continue
+        heatmap[row_to_index[int(row[row_key])], col_to_index[int(row[col_key])]] = float(row[value_key])
+
+    fig_width = max(6.4, 0.32 * len(col_values))
+    fig_height = max(4.8, 0.25 * len(row_values))
+    fig, axis = plt.subplots(1, 1, figsize=(fig_width, fig_height))
+    heatmap_np = heatmap.numpy()
+    finite_values = heatmap[~torch.isnan(heatmap)]
+    if finite_values.numel() > 0:
+        data_min = float(finite_values.min().item())
+        data_max = float(finite_values.max().item())
+        if data_min < 0.0 < data_max:
+            bound = max(abs(data_min), abs(data_max))
+            image = axis.imshow(heatmap_np, cmap="bwr", aspect="auto", vmin=-bound, vmax=bound)
+        else:
+            image = axis.imshow(heatmap_np, cmap="bwr", aspect="auto", vmin=data_min, vmax=data_max)
+    else:
+        image = axis.imshow(heatmap_np, cmap="bwr", aspect="auto")
+    axis.set_title(title)
+    axis.set_xlabel(col_label)
+    axis.set_ylabel(row_label)
+    axis.set_xticks(list(range(len(col_values))))
+    axis.set_xticklabels([str(v) for v in col_values], rotation=45, ha="right", fontsize=8)
+    axis.set_yticks(list(range(len(row_values))))
+    axis.set_yticklabels([str(v) for v in row_values], fontsize=8)
+    fig.colorbar(image, ax=axis, shrink=0.82)
+    fig.tight_layout()
+
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _trajectory_consensus_extract_candidate_task(task: Tuple) -> Tuple[int, int, Dict[str, object]]:
+    """Worker task for candidate-region extraction on one `(step, layer)` pair."""
+    (
+        step,
+        layer,
+        headmean_map,
+        base_quantile,
+        split_quantiles,
+        min_component_area,
+        smooth_radius,
+        stable_peak_min_levels,
+        peak_merge_distance,
+        preprocess_winsorize_quantile,
+        preprocess_despike_quantile,
+        preprocess_min_component_area,
+    ) = task
+    preprocessed_headmean_map, preprocess_stats = _preprocess_wan21_t2v_attention_map_fhw(
+        map_fhw=headmean_map.float(),
+        winsorize_quantile=float(preprocess_winsorize_quantile),
+        despike_quantile=float(preprocess_despike_quantile),
+        min_component_area=int(preprocess_min_component_area),
+    )
+    candidate_data = _extract_wan21_t2v_candidate_regions_for_map(
+        map_fhw=preprocessed_headmean_map,
+        base_quantile=float(base_quantile),
+        split_quantiles=split_quantiles,
+        min_component_area=int(min_component_area),
+        smooth_radius=int(smooth_radius),
+        stable_peak_min_levels=int(stable_peak_min_levels),
+        peak_merge_distance=float(peak_merge_distance),
+    )
+    return (
+        int(step),
+        int(layer),
+        {
+            # Returning torch tensors from forked workers can hang in this
+            # environment. Return numpy / Python objects and rebuild torch
+            # tensors on the parent process.
+            "label_map_fhw_np": candidate_data["label_map_fhw"].detach().cpu().numpy().astype(np.int16, copy=False),
+            "frame_metadata": candidate_data["frame_metadata"],
+        },
+    )
+
+
+def _trajectory_consensus_extract_head_specific_candidate_task(
+    task: Tuple,
+) -> Tuple[int, int, int, Dict[str, object]]:
+    """Worker task for per-head candidate extraction on one `(step, layer, head)`."""
+    (
+        step,
+        layer,
+        head,
+        head_map,
+        base_quantile,
+        split_quantiles,
+        min_component_area,
+        smooth_radius,
+        stable_peak_min_levels,
+        peak_merge_distance,
+        preprocess_winsorize_quantile,
+        preprocess_despike_quantile,
+        preprocess_min_component_area,
+    ) = task
+    preprocessed_head_map, _ = _preprocess_wan21_t2v_attention_map_fhw(
+        map_fhw=head_map.float(),
+        winsorize_quantile=float(preprocess_winsorize_quantile),
+        despike_quantile=float(preprocess_despike_quantile),
+        min_component_area=int(preprocess_min_component_area),
+    )
+    candidate_data = _extract_wan21_t2v_candidate_regions_for_map(
+        map_fhw=preprocessed_head_map,
+        base_quantile=float(base_quantile),
+        split_quantiles=split_quantiles,
+        min_component_area=int(min_component_area),
+        smooth_radius=int(smooth_radius),
+        stable_peak_min_levels=int(stable_peak_min_levels),
+        peak_merge_distance=float(peak_merge_distance),
+    )
+    return (
+        int(step),
+        int(layer),
+        int(head),
+        {
+            "label_map_fhw_np": candidate_data["label_map_fhw"].detach().cpu().numpy().astype(np.int16, copy=False),
+            "frame_metadata": candidate_data["frame_metadata"],
+        },
+    )
+
+
+def _trajectory_consensus_extract_layer_head_candidates_task(
+    task: Tuple,
+) -> Tuple[int, int, List[Tuple[int, Dict[str, object]]]]:
+    """Worker task for per-head candidate extraction on one `(step, layer)` group."""
+    (
+        step,
+        layer,
+        head_payloads,
+        base_quantile,
+        split_quantiles,
+        min_component_area,
+        smooth_radius,
+        stable_peak_min_levels,
+        peak_merge_distance,
+        preprocess_winsorize_quantile,
+        preprocess_despike_quantile,
+        preprocess_min_component_area,
+    ) = task
+    results: List[Tuple[int, Dict[str, object]]] = []
+    for head, head_map in head_payloads:
+        preprocessed_head_map, _ = _preprocess_wan21_t2v_attention_map_fhw(
+            map_fhw=head_map.float(),
+            winsorize_quantile=float(preprocess_winsorize_quantile),
+            despike_quantile=float(preprocess_despike_quantile),
+            min_component_area=int(preprocess_min_component_area),
+        )
+        candidate_data = _extract_wan21_t2v_candidate_regions_for_map(
+            map_fhw=preprocessed_head_map,
+            base_quantile=float(base_quantile),
+            split_quantiles=split_quantiles,
+            min_component_area=int(min_component_area),
+            smooth_radius=int(smooth_radius),
+            stable_peak_min_levels=int(stable_peak_min_levels),
+            peak_merge_distance=float(peak_merge_distance),
+        )
+        results.append(
+            (
+                int(head),
+                {
+                    "label_map_fhw_np": candidate_data["label_map_fhw"].detach().cpu().numpy().astype(
+                        np.int16,
+                        copy=False,
+                    ),
+                    "frame_metadata": candidate_data["frame_metadata"],
+                },
+            )
+        )
+    return int(step), int(layer), results
+
+
+def _trajectory_consensus_render_candidate_viz_task(task: Tuple) -> str:
+    """Worker task for one candidate-region visualization."""
+    (
+        raw_map_fhw,
+        label_map_fhw,
+        save_file,
+        title,
+        frame_indices,
+        draw_candidate_contours,
+        raw_map_cmap,
+    ) = task
+    return _plot_wan21_t2v_candidate_region_viz(
+        raw_map_fhw=raw_map_fhw,
+        label_map_fhw=label_map_fhw,
+        save_file=save_file,
+        title=title,
+        frame_indices=frame_indices,
+        draw_candidate_contours=bool(draw_candidate_contours),
+        raw_map_cmap=str(raw_map_cmap),
+    )
+
+def _pack_wan21_t2v_candidate_viz_arrays(
+    raw_map_fhw: torch.Tensor,
+    label_map_fhw: torch.Tensor,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert plot inputs into compact CPU numpy arrays for process workers."""
+    raw_map_np = np.ascontiguousarray(
+        raw_map_fhw.detach().cpu().numpy().astype(np.float16, copy=False)
+    )
+    label_map_np = np.ascontiguousarray(
+        label_map_fhw.detach().cpu().numpy().astype(np.int16, copy=False)
+    )
+    return raw_map_np, label_map_np
+
+
+def _trajectory_consensus_render_head_specific_candidate_viz_task(task: Tuple) -> str:
+    """Worker task that renders one per-head candidate-region plot."""
+    (
+        raw_map_fhw,
+        label_map_fhw,
+        save_file,
+        title,
+        frame_indices,
+        draw_candidate_contours,
+        raw_map_cmap,
+    ) = task
+    return _plot_wan21_t2v_candidate_region_viz(
+        raw_map_fhw=raw_map_fhw,
+        label_map_fhw=label_map_fhw,
+        save_file=save_file,
+        title=title,
+        frame_indices=frame_indices,
+        draw_candidate_contours=bool(draw_candidate_contours),
+        raw_map_cmap=str(raw_map_cmap),
+    )
+
+
+def _plot_wan21_t2v_trajectory_consensus_curve(
+    rows: Sequence[Dict[str, object]],
+    save_file: str,
+    x_key: str,
+    y_key: str,
+    title: str,
+    x_label: str,
+    y_label: str,
+    group_key: str = "",
+):
+    """Render one or multiple line curves from row dictionaries."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not rows:
+        return ""
+
+    if not group_key:
+        grouped_rows = {"all": list(rows)}
+    else:
+        grouped_rows = defaultdict(list)
+        for row in rows:
+            grouped_rows[str(row[group_key])].append(row)
+
+    fig, axis = plt.subplots(1, 1, figsize=(8.2, 5.0))
+    color_map = plt.get_cmap("gist_ncar")
+    group_names = sorted(grouped_rows.keys())
+    for group_index, group_name in enumerate(group_names):
+        plot_rows = [row for row in grouped_rows[group_name] if x_key in row and y_key in row and row[y_key] != ""]
+        if not plot_rows:
+            continue
+        plot_rows = sorted(plot_rows, key=lambda row: float(row[x_key]))
+        xs = [float(row[x_key]) for row in plot_rows]
+        ys = [float(row[y_key]) for row in plot_rows]
+        axis.plot(xs, ys, marker="o", linewidth=1.5, color=color_map((group_index + 0.5) / max(1, len(group_names))), label=group_name)
+
+    axis.set_title(title)
+    axis.set_xlabel(x_label)
+    axis.set_ylabel(y_label)
+    axis.grid(alpha=0.22, linestyle="--")
+    if group_key and len(group_names) <= 20:
+        axis.legend(fontsize=7, ncol=2)
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _plot_wan21_t2v_trajectory_consensus_scatter(
+    rows: Sequence[Dict[str, object]],
+    save_file: str,
+    x_key: str,
+    y_key: str,
+    title: str,
+    x_label: str,
+    y_label: str,
+):
+    """Render a scatter plot from row dictionaries."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_rows = [row for row in rows if row.get(x_key, "") != "" and row.get(y_key, "") != ""]
+    if not plot_rows:
+        return ""
+
+    xs = [float(row[x_key]) for row in plot_rows]
+    ys = [float(row[y_key]) for row in plot_rows]
+
+    fig, axis = plt.subplots(1, 1, figsize=(6.8, 5.2))
+    axis.scatter(xs, ys, s=20, alpha=0.82, color="#0f766e", edgecolors="none")
+    axis.set_title(title)
+    axis.set_xlabel(x_label)
+    axis.set_ylabel(y_label)
+    axis.grid(alpha=0.22, linestyle="--")
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
+    rows: Sequence[Dict[str, object]],
+    save_file: str,
+    x_key: str,
+    y_key: str,
+    title: str,
+    x_label: str,
+    y_label: str,
+):
+    """Render an interactive HTML scatter plot with hover tips."""
+    plot_rows = [row for row in rows if row.get(x_key, "") != "" and row.get(y_key, "") != ""]
+    if not plot_rows:
+        return ""
+
+    try:
+        import plotly.graph_objects as go
+    except Exception:
+        return ""
+
+    ordered_rows = sorted(
+        plot_rows,
+        key=lambda row: (int(row.get("step", -1)), str(row.get("head_tag", ""))),
+    )
+    xs = [float(row[x_key]) for row in ordered_rows]
+    ys = [float(row[y_key]) for row in ordered_rows]
+    steps = [int(row.get("step", -1)) for row in ordered_rows]
+    labels = [
+        f"T{int(row.get('step', -1))}{str(row.get('head_tag', ''))}"
+        for row in ordered_rows
+    ]
+    customdata = [
+        [
+            labels[index],
+            steps[index],
+            str(row.get("module", "")),
+            str(row.get("branch", "")),
+            str(row.get("metric", "")),
+        ]
+        for index, row in enumerate(ordered_rows)
+    ]
+    figure = go.Figure(
+        data=[
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="markers",
+                marker=dict(
+                    size=7,
+                    color=steps,
+                    colorscale="Viridis",
+                    showscale=True,
+                    colorbar=dict(title="step"),
+                    opacity=0.82,
+                ),
+                customdata=customdata,
+                hovertemplate=(
+                    "id=%{customdata[0]}<br>"
+                    "step=%{customdata[1]}<br>"
+                    "module=%{customdata[2]}<br>"
+                    "branch=%{customdata[3]}<br>"
+                    "metric=%{customdata[4]}<br>"
+                    f"{x_label}=%{{x:.6g}}<br>"
+                    f"{y_label}=%{{y:.6g}}<extra></extra>"
+                ),
+            )
+        ]
+    )
+    figure.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        template="plotly_white",
+    )
+    _ensure_dir(os.path.dirname(save_file))
+    figure.write_html(save_file, include_plotlyjs="cdn")
+    return save_file
+
+
+def _smooth_wan21_t2v_map_fhw(map_fhw: torch.Tensor, smooth_radius: int) -> torch.Tensor:
+    """Apply small average smoothing over spatial dimensions when requested."""
+    if int(smooth_radius) <= 0:
+        return map_fhw.detach().float()
+    kernel_size = 2 * int(smooth_radius) + 1
+    x = map_fhw.detach().float().unsqueeze(1)
+    x = torch.nn.functional.avg_pool2d(
+        x,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=int(smooth_radius),
+    )
+    return x.squeeze(1)
+
+
+def _wan21_t2v_candidate_mask_from_points(
+    points_hw: Sequence[Tuple[int, int]],
+    shape_hw: Tuple[int, int],
+) -> torch.Tensor:
+    """Build a boolean mask from a list of token-grid coordinates."""
+    mask = torch.zeros((int(shape_hw[0]), int(shape_hw[1])), dtype=torch.bool)
+    for point_y, point_x in points_hw:
+        if 0 <= int(point_y) < int(shape_hw[0]) and 0 <= int(point_x) < int(shape_hw[1]):
+            mask[int(point_y), int(point_x)] = True
+    return mask
+
+
+def _wan21_t2v_candidate_mask_largest_component(mask_hw: torch.Tensor) -> torch.Tensor:
+    """Keep only the largest 8-neighborhood connected component of one mask."""
+    components = _extract_wan21_t2v_connected_components(mask_hw)
+    if not components:
+        return torch.zeros_like(mask_hw, dtype=torch.bool)
+    largest_component = max(components, key=len)
+    out = torch.zeros_like(mask_hw, dtype=torch.bool)
+    for point_y, point_x in largest_component:
+        out[int(point_y), int(point_x)] = True
+    return out
+
+
+def _wan21_t2v_candidate_mask_bbox_stats(mask_hw: torch.Tensor) -> Dict[str, float]:
+    """Compute bounding-box statistics for one boolean candidate mask."""
+    if mask_hw.dim() != 2:
+        raise ValueError(f"Expected [H, W] mask, got shape={tuple(mask_hw.shape)}")
+    points = torch.nonzero(mask_hw, as_tuple=False)
+    if int(points.numel()) <= 0:
+        return {
+            "bbox_height": 0.0,
+            "bbox_width": 0.0,
+            "bbox_y_min": 0.0,
+            "bbox_y_max": 0.0,
+            "bbox_x_min": 0.0,
+            "bbox_x_max": 0.0,
+        }
+    y_min = int(points[:, 0].min().item())
+    y_max = int(points[:, 0].max().item())
+    x_min = int(points[:, 1].min().item())
+    x_max = int(points[:, 1].max().item())
+    return {
+        "bbox_height": float(y_max - y_min + 1),
+        "bbox_width": float(x_max - x_min + 1),
+        "bbox_y_min": float(y_min),
+        "bbox_y_max": float(y_max),
+        "bbox_x_min": float(x_min),
+        "bbox_x_max": float(x_max),
+    }
+
+
+def _wan21_t2v_candidate_local_maxima_mask(
+    score_hw: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """Return an 8-neighborhood local-maxima mask above a score threshold."""
+    if score_hw.dim() != 2:
+        raise ValueError(f"Expected [H, W], got shape={tuple(score_hw.shape)}")
+    if float(score_hw.max().item()) <= float(threshold):
+        return torch.zeros_like(score_hw, dtype=torch.bool)
+    pooled = torch.nn.functional.max_pool2d(
+        score_hw.unsqueeze(0).unsqueeze(0),
+        kernel_size=3,
+        stride=1,
+        padding=1,
+    ).squeeze(0).squeeze(0)
+    return (score_hw >= float(threshold)) & torch.isclose(score_hw, pooled)
+
+
+@dataclass
+class Wan21T2VCandidateSeedProposal:
+    """One local-maximum proposal used to seed candidate clustering."""
+
+    y: float
+    x: float
+    score: float
+    support_level: float
+    support_count: int = 1
+    weight_sum: float = 0.0
+
+    def __post_init__(self):
+        if float(self.weight_sum) <= 0.0:
+            self.weight_sum = float(self.score)
+
+    @property
+    def center(self) -> torch.Tensor:
+        return torch.tensor([float(self.y), float(self.x)], dtype=torch.float32)
+
+
+def _wan21_t2v_merge_candidate_seed_proposals(
+    proposals: Sequence[Wan21T2VCandidateSeedProposal],
+    merge_distance: float,
+    min_support_levels: int,
+    max_seeds: int,
+) -> List[Wan21T2VCandidateSeedProposal]:
+    """Greedily merge seed proposals using a spatial non-maximum suppression rule."""
+    if not proposals:
+        return []
+
+    kept: List[Wan21T2VCandidateSeedProposal] = []
+    max_distance = max(1e-6, float(merge_distance))
+    for proposal in sorted(proposals, key=lambda item: (float(item.score), float(item.support_count)), reverse=True):
+        assigned_index = -1
+        for idx, kept_seed in enumerate(kept):
+            distance = float(torch.norm(proposal.center - kept_seed.center).item())
+            if distance <= max_distance:
+                assigned_index = idx
+                break
+        if assigned_index < 0:
+            kept.append(
+                Wan21T2VCandidateSeedProposal(
+                    y=float(proposal.y),
+                    x=float(proposal.x),
+                    score=float(proposal.score),
+                    support_level=float(proposal.support_level),
+                    support_count=int(proposal.support_count),
+                    weight_sum=float(proposal.weight_sum),
+                )
+            )
+            continue
+
+        seed = kept[assigned_index]
+        new_support_count = int(seed.support_count) + int(proposal.support_count)
+        new_weight_sum = float(seed.weight_sum) + float(proposal.weight_sum)
+        if new_weight_sum <= 0.0:
+            new_weight_sum = float(seed.weight_sum + proposal.weight_sum + 1e-12)
+        seed.y = float(
+            (float(seed.y) * float(seed.weight_sum) + float(proposal.y) * float(proposal.weight_sum))
+            / max(1e-12, new_weight_sum)
+        )
+        seed.x = float(
+            (float(seed.x) * float(seed.weight_sum) + float(proposal.x) * float(proposal.weight_sum))
+            / max(1e-12, new_weight_sum)
+        )
+        seed.score = float(max(float(seed.score), float(proposal.score)))
+        seed.support_level = float(max(float(seed.support_level), float(proposal.support_level)))
+        seed.support_count = int(new_support_count)
+        seed.weight_sum = float(new_weight_sum)
+
+    filtered = [seed for seed in kept if int(seed.support_count) >= int(max(1, min_support_levels))]
+    if not filtered and kept:
+        filtered = [max(kept, key=lambda item: (int(item.support_count), float(item.score)))]
+    filtered = sorted(filtered, key=lambda item: (int(item.support_count), float(item.score)), reverse=True)
+    if int(max_seeds) > 0:
+        filtered = filtered[: int(max_seeds)]
+    return filtered
+
+
+def _wan21_t2v_weighted_kmeans_from_seeds(
+    point_yx: torch.Tensor,
+    point_weights: torch.Tensor,
+    initial_centers_yx: torch.Tensor,
+    max_iter: int = 10,
+    center_tol: float = 0.25,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run a seeded weighted k-means update on token-grid points.
+
+    The cluster assignment is computed on the high-confidence support set only.
+    Cluster centers are updated by weighted averaging, using the local attention
+    score as point weight.
+    """
+    if point_yx.numel() <= 0 or initial_centers_yx.numel() <= 0:
+        return torch.zeros((0, 2), dtype=torch.float32), torch.zeros((0,), dtype=torch.long)
+    centers = initial_centers_yx.detach().float().clone()
+    points = point_yx.detach().float()
+    weights = point_weights.detach().float().clamp_min(0.0)
+    max_iter = max(1, int(max_iter))
+    center_tol = max(0.0, float(center_tol))
+
+    for _ in range(max_iter):
+        distances = torch.cdist(points, centers)
+        assignments = distances.argmin(dim=1)
+        new_centers: List[torch.Tensor] = []
+        max_shift = 0.0
+        for center_index in range(int(centers.shape[0])):
+            cluster_mask = assignments == int(center_index)
+            if not bool(cluster_mask.any().item()):
+                continue
+            cluster_points = points[cluster_mask]
+            cluster_weights = weights[cluster_mask]
+            weight_sum = float(cluster_weights.sum().item())
+            if weight_sum <= 1e-12:
+                new_center = cluster_points.mean(dim=0)
+            else:
+                new_center = (cluster_points * cluster_weights.unsqueeze(1)).sum(dim=0) / weight_sum
+            new_centers.append(new_center)
+            max_shift = max(max_shift, float(torch.norm(new_center - centers[center_index]).item()))
+        if not new_centers:
+            return torch.zeros((0, 2), dtype=torch.float32), torch.zeros((0,), dtype=torch.long)
+        new_centers_tensor = torch.stack(new_centers, dim=0)
+        if int(new_centers_tensor.shape[0]) == int(centers.shape[0]) and max_shift <= center_tol:
+            centers = new_centers_tensor
+            break
+        centers = new_centers_tensor
+
+    final_distances = torch.cdist(points, centers)
+    final_assignments = final_distances.argmin(dim=1)
+    return centers, final_assignments
+
+
+def _extract_wan21_t2v_candidate_regions_for_frame(
+    frame_hw: torch.Tensor,
+    base_quantile: float,
+    split_quantiles: Sequence[float],
+    min_component_area: int,
+    stable_peak_min_levels: int,
+    peak_merge_distance: float,
+) -> Tuple[torch.Tensor, List[Dict[str, object]]]:
+    """Extract candidate regions on one frame as an integer label map.
+
+    The current implementation uses a peak-seeded weighted clustering scheme:
+    1. suppress background with a quantile-based contrast transform;
+    2. propose local maxima at several seed-support levels;
+    3. greedily merge repeated proposals into stable seeds;
+    4. run seeded weighted k-means on the high-confidence support set;
+    5. trim each cluster to a compact core and reject wide / thin / tiny regions.
+    """
+    frame = frame_hw.detach().float().clamp_min(0.0)
+    token_grid_height, token_grid_width = frame.shape
+    base_quantile = max(0.0, min(1.0, float(base_quantile)))
+    area_threshold = max(1, int(min_component_area))
+    max_seed_count = 5
+    background_quantile = max(0.5, min(float(base_quantile) - 0.10, 0.92))
+    seed_quantiles = sorted(
+        {
+            max(float(base_quantile), min(0.995, float(level)))
+            for level in split_quantiles
+            if str(level).strip() != ""
+        }
+    )
+    if not seed_quantiles:
+        seed_quantiles = [max(float(base_quantile), min(0.995, float(base_quantile) + 0.08))]
+    seed_quantiles = seed_quantiles[: max_seed_count]
+    core_mass_fraction = 0.80
+    max_width_ratio = 0.40
+    max_height_ratio = 0.95
+    if int(peak_merge_distance) <= 0:
+        peak_merge_distance = 2.0
+    seed_merge_distance = max(1.0, float(peak_merge_distance))
+
+    if float(frame.max().item()) <= 0.0:
+        label_map = torch.zeros_like(frame, dtype=torch.int64)
+        peak_index = int(frame.reshape(-1).argmax().item())
+        peak_y = int(peak_index // int(token_grid_width))
+        peak_x = int(peak_index % int(token_grid_width))
+        label_map[peak_y, peak_x] = 1
+        return label_map, [{
+            "candidate_index": 1,
+            "area": 1,
+            "peak_y": float(peak_y),
+            "peak_x": float(peak_x),
+            "centroid_y": float(peak_y),
+            "centroid_x": float(peak_x),
+        }]
+
+    background_threshold = float(torch.quantile(frame.reshape(-1), background_quantile).item())
+    contrast_map = torch.clamp(frame - background_threshold, min=0.0)
+    if float(contrast_map.max().item()) <= 0.0:
+        peak_index = int(frame.reshape(-1).argmax().item())
+        peak_y = int(peak_index // int(token_grid_width))
+        peak_x = int(peak_index % int(token_grid_width))
+        label_map = torch.zeros_like(frame, dtype=torch.int64)
+        label_map[peak_y, peak_x] = 1
+        return label_map, [{
+            "candidate_index": 1,
+            "area": 1,
+            "peak_y": float(peak_y),
+            "peak_x": float(peak_x),
+            "centroid_y": float(peak_y),
+            "centroid_x": float(peak_x),
+        }]
+    contrast_max = float(contrast_map.max().item())
+    if contrast_max > 0.0:
+        contrast_map = contrast_map / contrast_max
+    contrast_map = contrast_map.pow(2.0)
+
+    positive_values = contrast_map[contrast_map > 0.0]
+    if int(positive_values.numel()) <= 0:
+        peak_index = int(frame.reshape(-1).argmax().item())
+        peak_y = int(peak_index // int(token_grid_width))
+        peak_x = int(peak_index % int(token_grid_width))
+        label_map = torch.zeros_like(frame, dtype=torch.int64)
+        label_map[peak_y, peak_x] = 1
+        return label_map, [{
+            "candidate_index": 1,
+            "area": 1,
+            "peak_y": float(peak_y),
+            "peak_x": float(peak_x),
+            "centroid_y": float(peak_y),
+            "centroid_x": float(peak_x),
+        }]
+
+    support_threshold = float(torch.quantile(positive_values.reshape(-1), base_quantile).item())
+    support_mask = contrast_map >= support_threshold
+    support_points = torch.nonzero(support_mask, as_tuple=False).long()
+    support_weights = contrast_map[support_mask].reshape(-1)
+    if int(support_points.shape[0]) <= 0 or float(support_weights.sum().item()) <= 0.0:
+        peak_index = int(frame.reshape(-1).argmax().item())
+        peak_y = int(peak_index // int(token_grid_width))
+        peak_x = int(peak_index % int(token_grid_width))
+        label_map = torch.zeros_like(frame, dtype=torch.int64)
+        label_map[peak_y, peak_x] = 1
+        return label_map, [{
+            "candidate_index": 1,
+            "area": 1,
+            "peak_y": float(peak_y),
+            "peak_x": float(peak_x),
+            "centroid_y": float(peak_y),
+            "centroid_x": float(peak_x),
+        }]
+
+    seed_proposals: List[Wan21T2VCandidateSeedProposal] = []
+    for support_level in seed_quantiles:
+        level_threshold = float(torch.quantile(positive_values.reshape(-1), support_level).item())
+        level_mask = support_mask & (contrast_map >= level_threshold)
+        local_max_mask = _wan21_t2v_candidate_local_maxima_mask(
+            contrast_map,
+            threshold=float(level_threshold),
+        ) & level_mask
+        if not bool(local_max_mask.any().item()):
+            continue
+        for component in _extract_wan21_t2v_connected_components(local_max_mask):
+            if not component:
+                continue
+            peak_y, peak_x = max(
+                component,
+                key=lambda point: float(contrast_map[int(point[0]), int(point[1])].item()),
+            )
+            peak_score = float(contrast_map[int(peak_y), int(peak_x)].item())
+            if peak_score <= 0.0:
+                continue
+            seed_proposals.append(
+                Wan21T2VCandidateSeedProposal(
+                    y=float(peak_y),
+                    x=float(peak_x),
+                    score=float(peak_score),
+                    support_level=float(support_level),
+                    support_count=1,
+                    weight_sum=float(peak_score),
+                )
+            )
+
+    if not seed_proposals:
+        peak_index = int(frame.reshape(-1).argmax().item())
+        peak_y = int(peak_index // int(token_grid_width))
+        peak_x = int(peak_index % int(token_grid_width))
+        label_map = torch.zeros_like(frame, dtype=torch.int64)
+        label_map[peak_y, peak_x] = 1
+        return label_map, [{
+            "candidate_index": 1,
+            "area": 1,
+            "peak_y": float(peak_y),
+            "peak_x": float(peak_x),
+            "centroid_y": float(peak_y),
+            "centroid_x": float(peak_x),
+        }]
+
+    stable_seeds = _wan21_t2v_merge_candidate_seed_proposals(
+        proposals=seed_proposals,
+        merge_distance=float(seed_merge_distance),
+        min_support_levels=int(stable_peak_min_levels),
+        max_seeds=int(max_seed_count),
+    )
+    if not stable_seeds:
+        stable_seeds = [
+            max(seed_proposals, key=lambda item: (float(item.score), int(item.support_count)))
+        ]
+
+    stable_seed_tensor = torch.stack([seed.center for seed in stable_seeds], dim=0).to(dtype=torch.float32)
+
+    label_map = torch.zeros_like(frame, dtype=torch.int64)
+    candidate_metadata: List[Dict[str, object]] = []
+    next_candidate_index = 1
+
+    cluster_centers, cluster_assignments = _wan21_t2v_weighted_kmeans_from_seeds(
+        point_yx=support_points.to(dtype=torch.float32),
+        point_weights=support_weights.to(dtype=torch.float32),
+        initial_centers_yx=stable_seed_tensor,
+        max_iter=10,
+        center_tol=0.25,
+    )
+
+    if int(cluster_centers.shape[0]) <= 0:
+        peak_index = int(frame.reshape(-1).argmax().item())
+        peak_y = int(peak_index // int(token_grid_width))
+        peak_x = int(peak_index % int(token_grid_width))
+        label_map[peak_y, peak_x] = 1
+        candidate_metadata.append({
+            "candidate_index": 1,
+            "area": 1,
+            "mass": float(frame[peak_y, peak_x].item()),
+            "density": float(frame[peak_y, peak_x].item()),
+            "bbox_height": 1.0,
+            "bbox_width": 1.0,
+            "bbox_y_min": float(peak_y),
+            "bbox_y_max": float(peak_y),
+            "bbox_x_min": float(peak_x),
+            "bbox_x_max": float(peak_x),
+            "peak_y": float(peak_y),
+            "peak_x": float(peak_x),
+            "centroid_y": float(peak_y),
+            "centroid_x": float(peak_x),
+            "seed_y": float(peak_y),
+            "seed_x": float(peak_x),
+            "seed_score": float(frame[peak_y, peak_x].item()),
+            "support_count": 1,
+        })
+        return label_map, candidate_metadata
+
+    cluster_infos: List[Dict[str, object]] = []
+    for cluster_index in range(int(cluster_centers.shape[0])):
+        cluster_mask = cluster_assignments == int(cluster_index)
+        if not bool(cluster_mask.any().item()):
+            continue
+        cluster_points = support_points[cluster_mask]
+        cluster_weights = support_weights[cluster_mask]
+        cluster_center = cluster_centers[cluster_index]
+        cluster_mass = float(cluster_weights.sum().item())
+        if cluster_mass <= 0.0:
+            continue
+        distances = torch.norm(cluster_points.to(dtype=torch.float32) - cluster_center.unsqueeze(0), dim=1)
+        sorted_indices = torch.argsort(distances)
+        sorted_weights = cluster_weights[sorted_indices]
+        cumulative_mass = torch.cumsum(sorted_weights, dim=0)
+        target_mass = float(cluster_mass * float(core_mass_fraction))
+        keep_count = int(torch.searchsorted(cumulative_mass, torch.tensor(target_mass, dtype=torch.float32), right=False).item()) + 1
+        keep_count = max(1, min(int(keep_count), int(sorted_indices.numel())))
+        selected_points = cluster_points[sorted_indices[:keep_count]]
+        selected_weights = cluster_weights[sorted_indices[:keep_count]]
+        selected_mask = _wan21_t2v_candidate_mask_from_points(
+            points_hw=[(int(point[0].item()), int(point[1].item())) for point in selected_points],
+            shape_hw=(int(token_grid_height), int(token_grid_width)),
+        )
+        selected_mask = _wan21_t2v_candidate_mask_largest_component(selected_mask)
+        selected_points = torch.nonzero(selected_mask, as_tuple=False).long()
+        if int(selected_points.shape[0]) < int(area_threshold):
+            continue
+        selected_weights = contrast_map[selected_mask].reshape(-1)
+        if float(selected_weights.sum().item()) <= 0.0:
+            continue
+        candidate_mass = float(selected_weights.sum().item())
+        candidate_area = int(selected_points.shape[0])
+        candidate_density = float(candidate_mass / max(1, candidate_area))
+        support_density = float(cluster_mass / max(1, int(cluster_points.shape[0])))
+        if candidate_density < support_density:
+            continue
+        peak_y, peak_x = max(
+            [(int(point[0].item()), int(point[1].item())) for point in selected_points],
+            key=lambda point: float(contrast_map[int(point[0]), int(point[1])].item()),
+        )
+        bbox_stats = _wan21_t2v_candidate_mask_bbox_stats(selected_mask)
+        bbox_height_ratio = float(bbox_stats["bbox_height"]) / max(1.0, float(token_grid_height))
+        bbox_width_ratio = float(bbox_stats["bbox_width"]) / max(1.0, float(token_grid_width))
+        if bbox_width_ratio > float(max_width_ratio) or bbox_height_ratio > float(max_height_ratio):
+            continue
+        candidate_mask = torch.zeros_like(frame, dtype=torch.bool)
+        for point_y, point_x in selected_points.tolist():
+            candidate_mask[int(point_y), int(point_x)] = True
+        candidate_points = torch.nonzero(candidate_mask, as_tuple=False).long()
+        if int(candidate_points.shape[0]) < int(area_threshold):
+            continue
+        label_map[candidate_mask] = int(next_candidate_index)
+        centroid_y = float(candidate_points[:, 0].float().mean().item())
+        centroid_x = float(candidate_points[:, 1].float().mean().item())
+        cluster_seed = min(
+            stable_seeds,
+            key=lambda seed: float((seed.center - cluster_center).norm().item()),
+        )
+        cluster_infos.append({
+            "candidate_index": int(next_candidate_index),
+            "area": int(candidate_points.shape[0]),
+            "mass": float(candidate_mass),
+            "density": float(candidate_density),
+            "bbox_height": float(bbox_stats["bbox_height"]),
+            "bbox_width": float(bbox_stats["bbox_width"]),
+            "bbox_y_min": float(bbox_stats["bbox_y_min"]),
+            "bbox_y_max": float(bbox_stats["bbox_y_max"]),
+            "bbox_x_min": float(bbox_stats["bbox_x_min"]),
+            "bbox_x_max": float(bbox_stats["bbox_x_max"]),
+            "peak_y": float(peak_y),
+            "peak_x": float(peak_x),
+            "centroid_y": float(centroid_y),
+            "centroid_x": float(centroid_x),
+            "seed_y": float(cluster_seed.y),
+            "seed_x": float(cluster_seed.x),
+            "seed_score": float(cluster_seed.score),
+            "support_count": int(cluster_seed.support_count),
+            "support_level": float(cluster_seed.support_level),
+        })
+        next_candidate_index += 1
+
+    candidate_metadata.extend(cluster_infos)
+
+    if not candidate_metadata:
+        peak_index = int(frame.reshape(-1).argmax().item())
+        peak_y = int(peak_index // int(token_grid_width))
+        peak_x = int(peak_index % int(token_grid_width))
+        label_map[peak_y, peak_x] = 1
+        candidate_metadata.append({
+            "candidate_index": 1,
+            "area": 1,
+            "mass": float(frame[peak_y, peak_x].item()),
+            "density": float(frame[peak_y, peak_x].item()),
+            "bbox_height": 1.0,
+            "bbox_width": 1.0,
+            "bbox_y_min": float(peak_y),
+            "bbox_y_max": float(peak_y),
+            "bbox_x_min": float(peak_x),
+            "bbox_x_max": float(peak_x),
+            "peak_y": float(peak_y),
+            "peak_x": float(peak_x),
+            "centroid_y": float(peak_y),
+            "centroid_x": float(peak_x),
+            "seed_y": float(peak_y),
+            "seed_x": float(peak_x),
+            "seed_score": float(frame[peak_y, peak_x].item()),
+            "support_count": 1,
+            "support_level": float(base_quantile),
+        })
+
+    return label_map, candidate_metadata
+
+
+def _extract_wan21_t2v_candidate_regions_for_map(
+    map_fhw: torch.Tensor,
+    base_quantile: float,
+    split_quantiles: Sequence[float],
+    min_component_area: int,
+    smooth_radius: int,
+    stable_peak_min_levels: int,
+    peak_merge_distance: float,
+) -> Dict[str, object]:
+    """Extract candidate-region label maps for all frames of one `[F, H, W]` map."""
+    preprocessed = _smooth_wan21_t2v_map_fhw(map_fhw, smooth_radius=int(smooth_radius))
+    frame_count = int(preprocessed.shape[0])
+    label_maps = []
+    frame_metadata: List[List[Dict[str, object]]] = []
+    for frame_index in range(frame_count):
+        label_map_hw, metadata = _extract_wan21_t2v_candidate_regions_for_frame(
+            frame_hw=preprocessed[frame_index],
+            base_quantile=float(base_quantile),
+            split_quantiles=split_quantiles,
+            min_component_area=int(min_component_area),
+            stable_peak_min_levels=int(stable_peak_min_levels),
+            peak_merge_distance=float(peak_merge_distance),
+        )
+        label_maps.append(label_map_hw.to(torch.int64))
+        frame_metadata.append(metadata)
+    return {
+        "label_map_fhw": torch.stack(label_maps, dim=0),
+        "frame_metadata": frame_metadata,
+        "preprocessed_map_fhw": preprocessed,
+    }
+
+
+def _compute_wan21_t2v_candidate_weights_for_head_map(
+    probability_map_fhw: torch.Tensor,
+    label_map_fhw: torch.Tensor,
+) -> List[List[float]]:
+    """Return candidate weights per frame for one normalized head map."""
+    frame_count = int(probability_map_fhw.shape[0])
+    all_weights: List[List[float]] = []
+    for frame_index in range(frame_count):
+        frame_prob = probability_map_fhw[frame_index]
+        frame_labels = label_map_fhw[frame_index]
+        candidate_count = int(frame_labels.max().item())
+        frame_weights: List[float] = []
+        for candidate_index in range(1, candidate_count + 1):
+            frame_weights.append(float(frame_prob[frame_labels == int(candidate_index)].sum().item()))
+        all_weights.append(frame_weights)
+    return all_weights
+
+
+def _plot_wan21_t2v_candidate_region_viz(
+    raw_map_fhw: torch.Tensor,
+    label_map_fhw: torch.Tensor,
+    save_file: str,
+    title: str,
+    frame_indices: Sequence[int],
+    draw_candidate_contours: bool = False,
+    raw_map_cmap: str = "magma",
+):
+    """Render two-row candidate-region visualization for one map.
+
+    The first row shows the raw attention map with per-frame autoscaling.
+    The second row shows the extracted binary candidate support.
+    When `draw_candidate_contours=True`, each candidate label is additionally
+    outlined with a green contour so that touching candidates remain visible.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not frame_indices:
+        return ""
+
+    raw_map_fhw = torch.as_tensor(raw_map_fhw)
+    label_map_fhw = torch.as_tensor(label_map_fhw)
+    raw_map_cmap = str(raw_map_cmap).strip() or "magma"
+    num_frames = len(frame_indices)
+    fig, axes = plt.subplots(2, num_frames, figsize=(max(3.0 * num_frames, 6.0), 5.6))
+    if num_frames == 1:
+        axes = axes.reshape(2, 1)
+
+    for col_index, frame_index in enumerate(frame_indices):
+        raw_frame = raw_map_fhw[int(frame_index)].detach().cpu().float()
+        label_frame = label_map_fhw[int(frame_index)].detach().cpu().long()
+        support_frame = (label_frame > 0).float()
+
+        axis_raw = axes[0, col_index]
+        axis_raw.imshow(raw_frame.numpy(), cmap=raw_map_cmap)
+        axis_raw.set_title(f"frame={int(frame_index)}", fontsize=9)
+        axis_raw.set_xticks([])
+        axis_raw.set_yticks([])
+
+        axis_mask = axes[1, col_index]
+        axis_mask.imshow(support_frame.numpy(), cmap="gray", vmin=0.0, vmax=1.0)
+        if bool(draw_candidate_contours):
+            candidate_count = int(label_frame.max().item())
+            for candidate_index in range(1, candidate_count + 1):
+                candidate_mask = (label_frame == int(candidate_index))
+                if not bool(candidate_mask.any().item()):
+                    continue
+                axis_mask.contour(
+                    candidate_mask.float().numpy(),
+                    levels=[0.5],
+                    colors=["#22c55e"],
+                    linewidths=1.3,
+                )
+        axis_mask.set_xticks([])
+        axis_mask.set_yticks([])
+        axis_mask.set_xlabel(f"K={int(label_frame.max().item())}", fontsize=8)
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _upsample_wan21_t2v_token_mask_to_vpred(
+    token_mask_fhw: torch.Tensor,
+    patch_size: Sequence[int],
+) -> torch.Tensor:
+    """Upsample token-grid mask to Wan `v_pred` spatial resolution."""
+    patch_t, patch_h, patch_w = [int(x) for x in patch_size]
+    out = token_mask_fhw.detach().float()
+    if patch_t > 1:
+        out = out.repeat_interleave(int(patch_t), dim=0)
+    if patch_h > 1:
+        out = out.repeat_interleave(int(patch_h), dim=1)
+    if patch_w > 1:
+        out = out.repeat_interleave(int(patch_w), dim=2)
+    return out
+
+
+def _subset_wan21_t2v_token_mask_by_frames(
+    token_mask_fhw: torch.Tensor,
+    selected_frame_indices: Sequence[int],
+) -> torch.Tensor:
+    """Keep only the requested latent-frame slices inside a token-grid mask."""
+    frame_count = int(token_mask_fhw.shape[0])
+    out = torch.zeros_like(token_mask_fhw, dtype=token_mask_fhw.dtype)
+    if frame_count <= 0:
+        return out
+    kept = sorted(
+        {
+            int(frame_index)
+            for frame_index in selected_frame_indices
+            if 0 <= int(frame_index) < frame_count
+        }
+    )
+    if not kept:
+        return out
+    out[kept] = token_mask_fhw[kept]
+    return out
+
+
+def _token_grid_mask_to_wan21_t2v_sequence_indices(
+    token_mask_fhw: torch.Tensor,
+) -> torch.Tensor:
+    """Convert a `[F, H, W]` token-grid mask into Wan sequence-token indices."""
+    flat_mask = token_mask_fhw.detach().reshape(-1) > 0
+    if not bool(flat_mask.any().item()):
+        return torch.zeros((0,), dtype=torch.long)
+    return torch.nonzero(flat_mask, as_tuple=False).reshape(-1).long().cpu()
+
+
+def _compute_wan21_t2v_attribution_patch_object_metrics(
+    masked_clean_vpred: torch.Tensor,
+    head_writes: torch.Tensor,
+    head_writes_grad_obj: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Compute object-only attribution-patching metrics for all heads."""
+    clean_obj = masked_clean_vpred.detach().float().reshape(-1)
+    dot_obj_clean = float(torch.dot(clean_obj, clean_obj).item())
+    head_writes = head_writes.detach().float()
+    head_writes_grad_obj = head_writes_grad_obj.detach().float()
+    dot_obj = -torch.einsum("bthd,bthd->h", head_writes_grad_obj, head_writes)
+    ablate_dot_obj = torch.full_like(dot_obj, dot_obj_clean) - dot_obj
+    return {
+        "dot_obj": dot_obj.cpu(),
+        "ablate_dot_obj": ablate_dot_obj.cpu(),
+    }
+
+
+def _safe_wan21_t2v_cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Return cosine similarity between two tensors flattened to vectors."""
+    a_flat = a.detach().float().reshape(-1)
+    b_flat = b.detach().float().reshape(-1)
+    denom = float(a_flat.norm().item()) * float(b_flat.norm().item())
+    if denom <= 1e-12:
+        return 0.0
+    return float(torch.dot(a_flat, b_flat).item() / denom)
+
+
+def _safe_wan21_t2v_dot(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Return flattened dot product between two tensors."""
+    return float(torch.dot(a.detach().float().reshape(-1), b.detach().float().reshape(-1)).item())
+
+
+def _compute_wan21_t2v_contribution_metrics(
+    delta_vpred: torch.Tensor,
+    clean_vpred: torch.Tensor,
+    object_mask_fhw: Optional[torch.Tensor],
+    ablated_vpred: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    """Compute full-field and object-masked contribution metrics."""
+    delta_vpred = delta_vpred.detach().float()
+    clean_vpred = clean_vpred.detach().float()
+    ablated_vpred_local = None if ablated_vpred is None else ablated_vpred.detach().float()
+    metrics = {
+        "cos_full": abs(_safe_wan21_t2v_cosine(delta_vpred, clean_vpred)),
+        "dot_full": abs(_safe_wan21_t2v_dot(delta_vpred, clean_vpred)),
+    }
+    if ablated_vpred_local is not None:
+        metrics["ablate_cos_full"] = _safe_wan21_t2v_cosine(ablated_vpred_local, clean_vpred)
+        metrics["ablate_dot_full"] = _safe_wan21_t2v_dot(ablated_vpred_local, clean_vpred)
+    else:
+        metrics["ablate_cos_full"] = float("nan")
+        metrics["ablate_dot_full"] = float("nan")
+    if object_mask_fhw is None:
+        metrics["cos_obj"] = float("nan")
+        metrics["dot_obj"] = float("nan")
+        metrics["ablate_cos_obj"] = float("nan")
+        metrics["ablate_dot_obj"] = float("nan")
+        return metrics
+
+    mask = object_mask_fhw.detach().float().unsqueeze(0)
+    masked_delta = delta_vpred * mask
+    masked_clean = clean_vpred * mask
+    metrics["cos_obj"] = abs(_safe_wan21_t2v_cosine(masked_delta, masked_clean))
+    metrics["dot_obj"] = abs(_safe_wan21_t2v_dot(masked_delta, masked_clean))
+    if ablated_vpred_local is not None:
+        masked_ablated = ablated_vpred_local * mask
+        metrics["ablate_cos_obj"] = _safe_wan21_t2v_cosine(masked_ablated, masked_clean)
+        metrics["ablate_dot_obj"] = _safe_wan21_t2v_dot(masked_ablated, masked_clean)
+    else:
+        metrics["ablate_cos_obj"] = float("nan")
+        metrics["ablate_dot_obj"] = float("nan")
+    return metrics
+
+
+@dataclass
+class Wan21T2VTrajectoryConsensusContributionState:
+    """Runtime state for one targeted contribution run."""
+
+    target_step: int
+    target_layer: int
+    target_head: int
+    target_module: str
+    target_branch: str
+    ablate_position: str
+    ablate_head: bool
+    capture_selected_head_write: bool
+    capture_all_head_writes: bool
+    capture_suffix_payload: bool
+
+    current_step: int = 0
+    current_timestep_value: Optional[float] = None
+    forward_call_index_in_step: int = 0
+    captured_vpred: Optional[torch.Tensor] = None
+    captured_grid_sizes: Optional[torch.Tensor] = None
+    captured_head_e: Optional[torch.Tensor] = None
+    captured_selected_head_write: Optional[torch.Tensor] = None
+    captured_all_head_writes: Optional[torch.Tensor] = None
+    captured_suffix_payload: Optional[Dict[str, Any]] = None
+
+    def on_forward_start(self, t_tensor):
+        """Track current diffusion step and branch index."""
+        t_value = float(t_tensor.flatten()[0].item()) if t_tensor is not None else None
+        if self.current_timestep_value is None or t_value != self.current_timestep_value:
+            self.current_step += 1
+            self.current_timestep_value = t_value
+            self.forward_call_index_in_step = 0
+        else:
+            self.forward_call_index_in_step += 1
+
+    @property
+    def current_branch(self) -> str:
+        return _resolve_wan21_t2v_branch_from_forward_call_index(self.forward_call_index_in_step)
+
+    def is_target_forward(self) -> bool:
+        """Whether the currently executing DiT forward is the target step and branch."""
+        return (
+            int(self.current_step) == int(self.target_step)
+            and _wan21_t2v_branch_matches(self.target_branch, self.forward_call_index_in_step)
+        )
+
+
+@dataclass
+class Wan21T2VTrajectoryConsensusAttributionState:
+    """Runtime state for one attribution-patching clean forward."""
+
+    target_step: int
+    target_layer: int
+    target_module: str
+    target_branch: str
+    attribution_position: str
+    token_indices: Optional[torch.Tensor] = None
+
+    current_step: int = 0
+    current_timestep_value: Optional[float] = None
+    forward_call_index_in_step: int = 0
+
+    captured_clean_vpred: Optional[torch.Tensor] = None
+    captured_head_writes: Optional[torch.Tensor] = None
+    captured_head_writes_grad: Optional[torch.Tensor] = None
+
+    def on_forward_start(self, t_tensor):
+        """Track current diffusion step and branch index."""
+        t_value = float(t_tensor.flatten()[0].item()) if t_tensor is not None else None
+        if self.current_timestep_value is None or t_value != self.current_timestep_value:
+            self.current_step += 1
+            self.current_timestep_value = t_value
+            self.forward_call_index_in_step = 0
+        else:
+            self.forward_call_index_in_step += 1
+
+    def is_target_forward(self) -> bool:
+        """Whether the currently executing DiT forward matches the target scope."""
+        return (
+            int(self.current_step) == int(self.target_step)
+            and _wan21_t2v_branch_matches(self.target_branch, self.forward_call_index_in_step)
+        )
+
+
+@dataclass
+class Wan21T2VTrajectoryConsensusGlobalAttributionState:
+    """Runtime state for one global attribution-patching clean forward on a whole step."""
+
+    target_step: int
+    target_branch: str
+    attribution_position: str
+    selected_modules: Tuple[str, ...]
+    token_indices: Optional[torch.Tensor] = None
+
+    current_step: int = 0
+    current_timestep_value: Optional[float] = None
+    forward_call_index_in_step: int = 0
+
+    captured_clean_vpred: Optional[torch.Tensor] = None
+    captured_head_writes: Dict[Tuple[int, str], torch.Tensor] = field(default_factory=dict)
+    captured_head_writes_grad_obj: Dict[Tuple[int, str], torch.Tensor] = field(default_factory=dict)
+
+    def on_forward_start(self, t_tensor):
+        """Track current diffusion step and branch index."""
+        t_value = float(t_tensor.flatten()[0].item()) if t_tensor is not None else None
+        if self.current_timestep_value is None or t_value != self.current_timestep_value:
+            self.current_step += 1
+            self.current_timestep_value = t_value
+            self.forward_call_index_in_step = 0
+        else:
+            self.forward_call_index_in_step += 1
+
+    def is_target_forward(self) -> bool:
+        """Whether the currently executing DiT forward matches the target step and branch."""
+        return (
+            int(self.current_step) == int(self.target_step)
+            and _wan21_t2v_branch_matches(self.target_branch, self.forward_call_index_in_step)
+        )
+
+
+@dataclass
+class Wan21T2VTrajectoryConsensusGlobalDirectProxyState:
+    """Runtime state for one global direct-proxy clean forward on a whole step."""
+
+    target_step: int
+    target_branch: str
+    selected_modules: Tuple[str, ...]
+
+    current_step: int = 0
+    current_timestep_value: Optional[float] = None
+    forward_call_index_in_step: int = 0
+
+    captured_clean_vpred: Optional[torch.Tensor] = None
+    captured_head_e: Optional[torch.Tensor] = None
+    captured_grid_sizes: Optional[torch.Tensor] = None
+    captured_post_o_head_writes: Dict[Tuple[int, str], torch.Tensor] = field(default_factory=dict)
+
+    def on_forward_start(self, t_tensor):
+        """Track current diffusion step and branch index."""
+        t_value = float(t_tensor.flatten()[0].item()) if t_tensor is not None else None
+        if self.current_timestep_value is None or t_value != self.current_timestep_value:
+            self.current_step += 1
+            self.current_timestep_value = t_value
+            self.forward_call_index_in_step = 0
+        else:
+            self.forward_call_index_in_step += 1
+
+    def is_target_forward(self) -> bool:
+        """Whether the currently executing DiT forward matches the target step and branch."""
+        return (
+            int(self.current_step) == int(self.target_step)
+            and _wan21_t2v_branch_matches(self.target_branch, self.forward_call_index_in_step)
+        )
+
+
+class Wan21T2VTrajectoryConsensusContributionHandle:
+    """Restore handle for one targeted contribution patch."""
+
+    def __init__(self, target_model, state, original_forward, original_head_forward, original_unpatchify, original_block_forward):
+        self.target_model = target_model
+        self.state = state
+        self.original_forward = original_forward
+        self.original_head_forward = original_head_forward
+        self.original_unpatchify = original_unpatchify
+        self.original_block_forward = original_block_forward
+
+    def restore(self):
+        self.target_model.forward = self.original_forward
+        self.target_model.head.forward = self.original_head_forward
+        self.target_model.unpatchify = self.original_unpatchify
+        self.target_model.blocks[int(self.state.target_layer)].forward = self.original_block_forward
+
+
+class Wan21T2VTrajectoryConsensusAttributionHandle:
+    """Restore handle for one targeted attribution patch."""
+
+    def __init__(self, target_model, state, original_forward, original_block_forward, original_downstream_block_forwards):
+        self.target_model = target_model
+        self.state = state
+        self.original_forward = original_forward
+        self.original_block_forward = original_block_forward
+        self.original_downstream_block_forwards = original_downstream_block_forwards
+
+    def restore(self):
+        self.target_model.forward = self.original_forward
+        self.target_model.blocks[int(self.state.target_layer)].forward = self.original_block_forward
+        for block_index, original_forward in self.original_downstream_block_forwards.items():
+            self.target_model.blocks[int(block_index)].forward = original_forward
+
+
+class Wan21T2VTrajectoryConsensusGlobalAttributionHandle:
+    """Restore handle for one global attribution patch over multiple layers/modules."""
+
+    def __init__(self, target_model, state, original_forward, original_block_forwards, original_downstream_block_forwards):
+        self.target_model = target_model
+        self.state = state
+        self.original_forward = original_forward
+        self.original_block_forwards = original_block_forwards
+        self.original_downstream_block_forwards = original_downstream_block_forwards
+
+    def restore(self):
+        self.target_model.forward = self.original_forward
+        for block_index, original_forward in self.original_block_forwards.items():
+            self.target_model.blocks[int(block_index)].forward = original_forward
+        for block_index, original_forward in self.original_downstream_block_forwards.items():
+            self.target_model.blocks[int(block_index)].forward = original_forward
+
+
+class Wan21T2VTrajectoryConsensusGlobalDirectProxyHandle:
+    """Restore handle for one global direct-proxy patch over multiple layers/modules."""
+
+    def __init__(
+        self,
+        target_model,
+        state,
+        original_forward,
+        original_head_forward,
+        original_unpatchify,
+        original_block_forwards,
+    ):
+        self.target_model = target_model
+        self.state = state
+        self.original_forward = original_forward
+        self.original_head_forward = original_head_forward
+        self.original_unpatchify = original_unpatchify
+        self.original_block_forwards = original_block_forwards
+
+    def restore(self):
+        self.target_model.forward = self.original_forward
+        self.target_model.head.forward = self.original_head_forward
+        self.target_model.unpatchify = self.original_unpatchify
+        for block_index, original_forward in self.original_block_forwards.items():
+            self.target_model.blocks[int(block_index)].forward = original_forward
+
+
+def _install_wan21_t2v_trajectory_consensus_contribution_patch(
+    model,
+    target_step: int,
+    target_layer: int,
+    target_head: int,
+    target_module: str,
+    target_branch: str,
+    ablate_position: str,
+    ablate_head: bool,
+    capture_selected_head_write: bool,
+    capture_all_head_writes: bool = False,
+    capture_suffix_payload: bool = False,
+) -> Wan21T2VTrajectoryConsensusContributionHandle:
+    """Install a targeted runtime patch for one contribution run."""
+    from projects.Wan2_1.wan.modules.attention import flash_attention
+    from projects.Wan2_1.wan.modules.model import T5_CONTEXT_TOKEN_NUMBER, rope_apply
+
+    target = _unwrap_wan21_t2v_dit_model_for_runtime_patch(model)
+    if not hasattr(target, "blocks"):
+        raise RuntimeError("Invalid DiT model: missing blocks.")
+    if int(target_layer) < 0 or int(target_layer) >= len(target.blocks):
+        raise ValueError(f"target_layer out of range: {target_layer}, num_layers={len(target.blocks)}")
+
+    block = target.blocks[int(target_layer)]
+    attn_module = block.self_attn if str(target_module) == "self" else block.cross_attn
+    if int(target_head) < 0 or int(target_head) >= int(attn_module.num_heads):
+        raise ValueError(
+            f"target_head out of range for module={target_module}, layer={target_layer}: "
+            f"head={target_head}, num_heads={attn_module.num_heads}"
+        )
+
+    state = Wan21T2VTrajectoryConsensusContributionState(
+        target_step=int(target_step),
+        target_layer=int(target_layer),
+        target_head=int(target_head),
+        target_module=str(target_module),
+        target_branch=str(target_branch),
+        ablate_position=str(ablate_position).strip().lower(),
+        ablate_head=bool(ablate_head),
+        capture_selected_head_write=bool(capture_selected_head_write),
+        capture_all_head_writes=bool(capture_all_head_writes),
+        capture_suffix_payload=bool(capture_suffix_payload),
+    )
+
+    original_forward = target.forward
+    original_head_forward = target.head.forward
+    original_unpatchify = target.unpatchify
+    original_block_forward = block.forward
+
+    def patched_dit_forward(this, *args, **kwargs):
+        t = kwargs.get("t", None)
+        if t is None and len(args) > 1:
+            t = args[1]
+        state.on_forward_start(t)
+        result = original_forward(*args, **kwargs)
+        if state.is_target_forward():
+            if isinstance(result, list) and result:
+                state.captured_vpred = result[0].detach().float().cpu()
+            raise Wan21T2VEarlyStopRequested(
+                completed_step=int(state.current_step),
+                requested_last_step=int(state.target_step),
+            )
+        return result
+
+    def patched_head_forward(self, x, e):
+        if state.is_target_forward():
+            state.captured_head_e = e.detach().float().cpu()
+        return original_head_forward(x, e)
+
+    def patched_unpatchify(self, x, grid_sizes):
+        if state.is_target_forward():
+            state.captured_grid_sizes = grid_sizes.detach().cpu()
+        return original_unpatchify(x, grid_sizes)
+
+    def _project_selected_head_write(z_selected: torch.Tensor, linear_module) -> torch.Tensor:
+        start = int(state.target_head) * int(linear_module.head_dim)
+        end = start + int(linear_module.head_dim)
+        weight_slice = linear_module.o.weight[:, start:end].transpose(0, 1).contiguous()
+        return torch.matmul(z_selected, weight_slice)
+
+    def _project_all_head_writes(
+        z_bthd: torch.Tensor,
+        linear_module,
+        post_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        num_heads = int(linear_module.num_heads)
+        head_dim = int(linear_module.head_dim)
+        weight = linear_module.o.weight.view(
+            linear_module.o.out_features,
+            num_heads,
+            head_dim,
+        ).permute(1, 2, 0).contiguous()
+        head_writes = torch.einsum("bthd,hdo->btho", z_bthd, weight)
+        if post_scale is not None:
+            head_writes = head_writes * post_scale.unsqueeze(2)
+        return head_writes
+
+    def _run_manual_cross_attn(cross_attn_module, x_input, context, context_lens):
+        b, n, d = x_input.size(0), cross_attn_module.num_heads, cross_attn_module.head_dim
+        q = cross_attn_module.norm_q(cross_attn_module.q(x_input)).view(b, -1, n, d)
+        if hasattr(cross_attn_module, "k_img") and hasattr(cross_attn_module, "v_img"):
+            image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
+            context_img = context[:, :image_context_length]
+            context_txt = context[:, image_context_length:]
+
+            k = cross_attn_module.norm_k(cross_attn_module.k(context_txt)).view(b, -1, n, d)
+            v = cross_attn_module.v(context_txt).view(b, -1, n, d)
+            k_img = cross_attn_module.norm_k_img(cross_attn_module.k_img(context_img)).view(b, -1, n, d)
+            v_img = cross_attn_module.v_img(context_img).view(b, -1, n, d)
+
+            head_output = flash_attention(q, k, v, k_lens=context_lens)
+            head_output = head_output + flash_attention(q, k_img, v_img, k_lens=None)
+        else:
+            k = cross_attn_module.norm_k(cross_attn_module.k(context)).view(b, -1, n, d)
+            v = cross_attn_module.v(context).view(b, -1, n, d)
+            head_output = flash_attention(q, k, v, k_lens=context_lens)
+        return head_output
+
+    def patched_block_forward(
+        self,
+        x,
+        e,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        context,
+        context_lens,
+    ):
+        if not state.is_target_forward():
+            return original_block_forward(x, e, seq_lens, grid_sizes, freqs, context, context_lens)
+
+        assert e.dtype == torch.float32
+        with amp.autocast(dtype=torch.float32):
+            modulation = (self.modulation + e).chunk(6, dim=1)
+
+        if str(state.target_module) == "self":
+            sa_input = self.norm1(x).float() * (1 + modulation[1]) + modulation[0]
+            batch_size, seq_len = sa_input.shape[:2]
+            num_heads = self.self_attn.num_heads
+            head_dim = self.self_attn.head_dim
+            q = self.self_attn.norm_q(self.self_attn.q(sa_input)).view(batch_size, seq_len, num_heads, head_dim)
+            k = self.self_attn.norm_k(self.self_attn.k(sa_input)).view(batch_size, seq_len, num_heads, head_dim)
+            v = self.self_attn.v(sa_input).view(batch_size, seq_len, num_heads, head_dim)
+            head_output = flash_attention(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.self_attn.window_size,
+            )
+
+            if state.capture_selected_head_write:
+                selected_head_output = head_output[:, :, int(state.target_head), :]
+                selected_write = _project_selected_head_write(selected_head_output, self.self_attn)
+                with amp.autocast(dtype=torch.float32):
+                    selected_write = selected_write * modulation[2]
+                state.captured_selected_head_write = selected_write.detach().float().cpu()
+
+            all_head_writes = None
+            need_all_head_writes = (
+                state.capture_all_head_writes
+                or state.capture_suffix_payload
+                or str(state.ablate_position) == "post_o"
+            )
+            if need_all_head_writes:
+                all_head_writes = _project_all_head_writes(
+                    head_output,
+                    self.self_attn,
+                    post_scale=modulation[2],
+                )
+                if state.capture_all_head_writes:
+                    state.captured_all_head_writes = all_head_writes.detach().float().cpu()
+
+            if state.capture_suffix_payload:
+                state.captured_suffix_payload = {
+                    "target_layer": int(state.target_layer),
+                    "x_before": x.detach().float().cpu(),
+                    "e": e.detach().float().cpu(),
+                    "head_e": e[:, 0, :].detach().float().cpu(),
+                    "seq_lens": seq_lens.detach().cpu(),
+                    "grid_sizes": grid_sizes.detach().cpu(),
+                    "freqs": freqs.detach().float().cpu(),
+                    "context": context.detach().float().cpu(),
+                    "context_lens": None if context_lens is None else context_lens.detach().cpu(),
+                    "modulation2": modulation[2].detach().float().cpu(),
+                    "modulation3": modulation[3].detach().float().cpu(),
+                    "modulation4": modulation[4].detach().float().cpu(),
+                    "modulation5": modulation[5].detach().float().cpu(),
+                    "norm3_module": self.norm3,
+                    "cross_attn_module": self.cross_attn,
+                    "norm2_module": self.norm2,
+                    "ffn_module": self.ffn,
+                    "all_head_writes": None if all_head_writes is None else all_head_writes.detach().float().cpu(),
+                }
+
+            if str(state.ablate_position) == "post_o":
+                if all_head_writes is None:
+                    all_head_writes = _project_all_head_writes(
+                        head_output,
+                        self.self_attn,
+                        post_scale=modulation[2],
+                    )
+                if state.ablate_head:
+                    all_head_writes = all_head_writes.clone()
+                    all_head_writes[:, :, int(state.target_head), :] = 0
+                sa_output = all_head_writes.sum(dim=2)
+                with amp.autocast(dtype=torch.float32):
+                    x = x + sa_output
+            else:
+                if state.ablate_head:
+                    head_output = head_output.clone()
+                    head_output[:, :, int(state.target_head), :] = 0
+                sa_output = self.self_attn.o(head_output.flatten(2))
+                with amp.autocast(dtype=torch.float32):
+                    x = x + sa_output * modulation[2]
+            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            y = self.ffn(self.norm2(x).float() * (1 + modulation[4]) + modulation[3])
+            with amp.autocast(dtype=torch.float32):
+                x = x + y * modulation[5]
+            return x
+
+        sa_output = self.self_attn(
+            self.norm1(x).float() * (1 + modulation[1]) + modulation[0],
+            seq_lens,
+            grid_sizes,
+            freqs,
+        )
+        with amp.autocast(dtype=torch.float32):
+            x = x + sa_output * modulation[2]
+
+        cross_input = self.norm3(x)
+        head_output = _run_manual_cross_attn(self.cross_attn, cross_input, context, context_lens)
+
+        if state.capture_selected_head_write:
+            selected_head_output = head_output[:, :, int(state.target_head), :]
+            selected_write = _project_selected_head_write(selected_head_output, self.cross_attn)
+            state.captured_selected_head_write = selected_write.detach().float().cpu()
+
+        all_head_writes = None
+        need_all_head_writes = (
+            state.capture_all_head_writes
+            or state.capture_suffix_payload
+            or str(state.ablate_position) == "post_o"
+        )
+        if need_all_head_writes:
+            all_head_writes = _project_all_head_writes(head_output, self.cross_attn, post_scale=None)
+            if state.capture_all_head_writes:
+                state.captured_all_head_writes = all_head_writes.detach().float().cpu()
+
+        if state.capture_suffix_payload:
+            state.captured_suffix_payload = {
+                "target_layer": int(state.target_layer),
+                "x_before_cross": x.detach().float().cpu(),
+                "e": e.detach().float().cpu(),
+                "head_e": e[:, 0, :].detach().float().cpu(),
+                "seq_lens": seq_lens.detach().cpu(),
+                "grid_sizes": grid_sizes.detach().cpu(),
+                "freqs": freqs.detach().float().cpu(),
+                "context": context.detach().float().cpu(),
+                "context_lens": None if context_lens is None else context_lens.detach().cpu(),
+                "modulation3": modulation[3].detach().float().cpu(),
+                "modulation4": modulation[4].detach().float().cpu(),
+                "modulation5": modulation[5].detach().float().cpu(),
+                "norm2_module": self.norm2,
+                "ffn_module": self.ffn,
+                "all_head_writes": None if all_head_writes is None else all_head_writes.detach().float().cpu(),
+            }
+
+        if str(state.ablate_position) == "post_o":
+            if all_head_writes is None:
+                all_head_writes = _project_all_head_writes(head_output, self.cross_attn, post_scale=None)
+            if state.ablate_head:
+                all_head_writes = all_head_writes.clone()
+                all_head_writes[:, :, int(state.target_head), :] = 0
+            cross_output = all_head_writes.sum(dim=2)
+        else:
+            if state.ablate_head:
+                head_output = head_output.clone()
+                head_output[:, :, int(state.target_head), :] = 0
+            cross_output = self.cross_attn.o(head_output.flatten(2))
+        x = x + cross_output
+        y = self.ffn(self.norm2(x).float() * (1 + modulation[4]) + modulation[3])
+        with amp.autocast(dtype=torch.float32):
+            x = x + y * modulation[5]
+        return x
+
+    target.forward = MethodType(patched_dit_forward, target)
+    target.head.forward = MethodType(patched_head_forward, target.head)
+    target.unpatchify = MethodType(patched_unpatchify, target)
+    target.blocks[int(target_layer)].forward = MethodType(patched_block_forward, target.blocks[int(target_layer)])
+
+    return Wan21T2VTrajectoryConsensusContributionHandle(
+        target_model=target,
+        state=state,
+        original_forward=original_forward,
+        original_head_forward=original_head_forward,
+        original_unpatchify=original_unpatchify,
+        original_block_forward=original_block_forward,
+    )
+
+
+def _install_wan21_t2v_trajectory_consensus_attribution_patch(
+    model,
+    target_step: int,
+    target_layer: int,
+    target_module: str,
+    target_branch: str,
+    attribution_position: str,
+    token_indices: Optional[torch.Tensor],
+    use_gradient_checkpointing: bool,
+) -> Wan21T2VTrajectoryConsensusAttributionHandle:
+    """Install the clean attribution patch for one `(step, layer, module, branch)` scope.
+
+    This patch follows standard attribution patching:
+    - run one clean forward for the selected step and branch;
+    - capture all heads in the target module as residual-stream writes
+      `U[B, T, H, D]`;
+    - retain gradients on that clean activation tensor;
+    - continue the same clean forward to the final `v_pred`.
+    """
+    from projects.Wan2_1.wan.modules.attention import flash_attention
+    from projects.Wan2_1.wan.modules.model import T5_CONTEXT_TOKEN_NUMBER, rope_apply
+    from torch.utils.checkpoint import checkpoint
+
+    target = _unwrap_wan21_t2v_dit_model_for_runtime_patch(model)
+    if not hasattr(target, "blocks"):
+        raise RuntimeError("Invalid DiT model: missing blocks.")
+    if int(target_layer) < 0 or int(target_layer) >= len(target.blocks):
+        raise ValueError(f"target_layer out of range: {target_layer}, num_layers={len(target.blocks)}")
+
+    block = target.blocks[int(target_layer)]
+    state = Wan21T2VTrajectoryConsensusAttributionState(
+        target_step=int(target_step),
+        target_layer=int(target_layer),
+        target_module=str(target_module),
+        target_branch=str(target_branch),
+        attribution_position=str(attribution_position).strip().lower(),
+        token_indices=None if token_indices is None else token_indices.detach().long().cpu(),
+    )
+
+    original_forward = target.forward
+    original_block_forward = block.forward
+    original_downstream_block_forwards: Dict[int, Any] = {}
+
+    def patched_dit_forward(this, *args, **kwargs):
+        t = kwargs.get("t", None)
+        if t is None and len(args) > 1:
+            t = args[1]
+        state.on_forward_start(t)
+        result = original_forward(*args, **kwargs)
+        if state.is_target_forward():
+            if isinstance(result, list) and result:
+                state.captured_clean_vpred = result[0]
+        return result
+
+    def _project_all_head_writes(z_bthd: torch.Tensor, linear_module, post_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Project per-head values into per-head residual writes.
+
+        Args:
+            z_bthd: `[B, T, H, d_head]`
+            post_scale: optional multiplicative scale broadcastable to `[B, T, 1, D]`
+
+        Returns:
+            `[B, T, H, D]`
+        """
+        num_heads = int(linear_module.num_heads)
+        head_dim = int(linear_module.head_dim)
+        weight = linear_module.o.weight.view(linear_module.o.out_features, num_heads, head_dim).permute(1, 2, 0).contiguous()
+        head_writes = torch.einsum("bthd,hdo->btho", z_bthd, weight)
+        if post_scale is not None:
+            head_writes = head_writes * post_scale.unsqueeze(2)
+        return head_writes
+
+    def _run_manual_cross_attn(cross_attn_module, x_input, context, context_lens):
+        b, n, d = x_input.size(0), cross_attn_module.num_heads, cross_attn_module.head_dim
+        q = cross_attn_module.norm_q(cross_attn_module.q(x_input)).view(b, -1, n, d)
+        if hasattr(cross_attn_module, "k_img") and hasattr(cross_attn_module, "v_img"):
+            image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
+            context_img = context[:, :image_context_length]
+            context_txt = context[:, image_context_length:]
+
+            k = cross_attn_module.norm_k(cross_attn_module.k(context_txt)).view(b, -1, n, d)
+            v = cross_attn_module.v(context_txt).view(b, -1, n, d)
+            k_img = cross_attn_module.norm_k_img(cross_attn_module.k_img(context_img)).view(b, -1, n, d)
+            v_img = cross_attn_module.v_img(context_img).view(b, -1, n, d)
+
+            head_output = flash_attention(q, k, v, k_lens=context_lens)
+            head_output = head_output + flash_attention(q, k_img, v_img, k_lens=None)
+        else:
+            k = cross_attn_module.norm_k(cross_attn_module.k(context)).view(b, -1, n, d)
+            v = cross_attn_module.v(context).view(b, -1, n, d)
+            head_output = flash_attention(q, k, v, k_lens=context_lens)
+        return head_output
+
+    def _capture_grad(grad: torch.Tensor):
+        state.captured_head_writes_grad = grad.detach().float().cpu()
+
+    def _build_gradient_subset_activation(activation: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if state.token_indices is None or int(state.token_indices.numel()) <= 0:
+            activation_leaf = activation.detach().requires_grad_(True)
+            return activation_leaf, activation_leaf
+        token_indices_device = state.token_indices.to(device=activation.device)
+        activation_subset = activation.index_select(dim=1, index=token_indices_device).detach().requires_grad_(True)
+        activation_full = activation.detach().clone()
+        activation_full.index_copy_(1, token_indices_device, activation_subset)
+        return activation_full, activation_subset
+
+    def patched_block_forward(
+        self,
+        x,
+        e,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        context,
+        context_lens,
+    ):
+        if not state.is_target_forward():
+            return original_block_forward(x, e, seq_lens, grid_sizes, freqs, context, context_lens)
+
+        assert e.dtype == torch.float32
+        with amp.autocast(dtype=torch.float32):
+            modulation = (self.modulation + e).chunk(6, dim=1)
+
+        if str(state.target_module).strip().lower() == "self":
+            sa_input = self.norm1(x).float() * (1 + modulation[1]) + modulation[0]
+            batch_size, seq_len = sa_input.shape[:2]
+            num_heads = self.self_attn.num_heads
+            head_dim = self.self_attn.head_dim
+            q = self.self_attn.norm_q(self.self_attn.q(sa_input)).view(batch_size, seq_len, num_heads, head_dim)
+            k = self.self_attn.norm_k(self.self_attn.k(sa_input)).view(batch_size, seq_len, num_heads, head_dim)
+            v = self.self_attn.v(sa_input).view(batch_size, seq_len, num_heads, head_dim)
+            z = flash_attention(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.self_attn.window_size,
+            )
+            if str(state.attribution_position) == "post_o":
+                full_activation, tracked_activation = _build_gradient_subset_activation(
+                    _project_all_head_writes(z, self.self_attn, post_scale=modulation[2])
+                )
+                state.captured_head_writes = tracked_activation.detach().float().cpu()
+                tracked_activation.register_hook(_capture_grad)
+                sa_output = full_activation.sum(dim=2)
+                with amp.autocast(dtype=torch.float32):
+                    x = x + sa_output
+            else:
+                full_activation, tracked_activation = _build_gradient_subset_activation(z)
+                state.captured_head_writes = tracked_activation.detach().float().cpu()
+                tracked_activation.register_hook(_capture_grad)
+                sa_output = self.self_attn.o(full_activation.flatten(2))
+                with amp.autocast(dtype=torch.float32):
+                    x = x + sa_output * modulation[2]
+            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            y = self.ffn(self.norm2(x).float() * (1 + modulation[4]) + modulation[3])
+            with amp.autocast(dtype=torch.float32):
+                x = x + y * modulation[5]
+            return x
+
+        sa_output = self.self_attn(
+            self.norm1(x).float() * (1 + modulation[1]) + modulation[0],
+            seq_lens,
+            grid_sizes,
+            freqs,
+        )
+        with amp.autocast(dtype=torch.float32):
+            x = x + sa_output * modulation[2]
+
+        cross_input = self.norm3(x)
+        z = _run_manual_cross_attn(self.cross_attn, cross_input, context, context_lens)
+        if str(state.attribution_position) == "post_o":
+            full_activation, tracked_activation = _build_gradient_subset_activation(
+                _project_all_head_writes(z, self.cross_attn, post_scale=None)
+            )
+            state.captured_head_writes = tracked_activation.detach().float().cpu()
+            tracked_activation.register_hook(_capture_grad)
+            cross_output = full_activation.sum(dim=2)
+        else:
+            full_activation, tracked_activation = _build_gradient_subset_activation(z)
+            state.captured_head_writes = tracked_activation.detach().float().cpu()
+            tracked_activation.register_hook(_capture_grad)
+            cross_output = self.cross_attn.o(full_activation.flatten(2))
+        x = x + cross_output
+        y = self.ffn(self.norm2(x).float() * (1 + modulation[4]) + modulation[3])
+        with amp.autocast(dtype=torch.float32):
+            x = x + y * modulation[5]
+        return x
+
+    if bool(use_gradient_checkpointing):
+        for downstream_block_index in range(int(target_layer) + 1, len(target.blocks)):
+            downstream_block = target.blocks[int(downstream_block_index)]
+            original_downstream_block_forwards[int(downstream_block_index)] = downstream_block.forward
+
+            def _make_checkpointed_block_forward(original_block_forward_fn):
+                def checkpointed_block_forward(
+                    self,
+                    x,
+                    e,
+                    seq_lens,
+                    grid_sizes,
+                    freqs,
+                    context,
+                    context_lens,
+                ):
+                    def block_fn(
+                        x_tensor,
+                        e_tensor,
+                        seq_lens_tensor,
+                        grid_sizes_tensor,
+                        freqs_tensor,
+                        context_tensor,
+                    ):
+                        return original_block_forward_fn(
+                            x_tensor,
+                            e_tensor,
+                            seq_lens_tensor,
+                            grid_sizes_tensor,
+                            freqs_tensor,
+                            context_tensor,
+                            context_lens,
+                        )
+                    return checkpoint(
+                        block_fn,
+                        x,
+                        e,
+                        seq_lens,
+                        grid_sizes,
+                        freqs,
+                        context,
+                        use_reentrant=False,
+                    )
+                return checkpointed_block_forward
+
+            downstream_block.forward = MethodType(
+                _make_checkpointed_block_forward(original_downstream_block_forwards[int(downstream_block_index)]),
+                downstream_block,
+            )
+
+    target.forward = MethodType(patched_dit_forward, target)
+    target.blocks[int(target_layer)].forward = MethodType(patched_block_forward, target.blocks[int(target_layer)])
+
+    return Wan21T2VTrajectoryConsensusAttributionHandle(
+        target_model=target,
+        state=state,
+        original_forward=original_forward,
+        original_block_forward=original_block_forward,
+        original_downstream_block_forwards=original_downstream_block_forwards,
+    )
+
+
+def _run_wan21_t2v_trajectory_consensus_contribution_forward(
+    pipeline,
+    prompt: str,
+    size: Tuple[int, int],
+    frame_num: int,
+    shift: float,
+    sample_solver: str,
+    sampling_steps: int,
+    guide_scale: float,
+    seed: int,
+    offload_model: bool,
+    target_step: int,
+    target_layer: int,
+    target_head: int,
+    target_module: str,
+    target_branch: str,
+    ablate_position: str,
+    ablate_head: bool,
+    capture_selected_head_write: bool,
+    capture_all_head_writes: bool = False,
+    capture_suffix_payload: bool = False,
+) -> Wan21T2VTrajectoryConsensusContributionState:
+    """Run one early-stopped contribution forward pass and return captured state."""
+    handle = _install_wan21_t2v_trajectory_consensus_contribution_patch(
+        model=pipeline.model,
+        target_step=int(target_step),
+        target_layer=int(target_layer),
+        target_head=int(target_head),
+        target_module=str(target_module),
+        target_branch=str(target_branch),
+        ablate_position=str(ablate_position),
+        ablate_head=bool(ablate_head),
+        capture_selected_head_write=bool(capture_selected_head_write),
+        capture_all_head_writes=bool(capture_all_head_writes),
+        capture_suffix_payload=bool(capture_suffix_payload),
+    )
+    try:
+        _generate_wan21_t2v_video(
+            pipeline=pipeline,
+            prompt=prompt,
+            size=size,
+            frame_num=frame_num,
+            shift=shift,
+            sample_solver=sample_solver,
+            sampling_steps=sampling_steps,
+            guide_scale=guide_scale,
+            seed=seed,
+            offload_model=offload_model,
+        )
+    except Wan21T2VEarlyStopRequested:
+        pass
+    finally:
+        handle.restore()
+    return handle.state
+
+
+def _run_wan21_t2v_local_clean_vpred(
+    pipeline,
+    latent_input: torch.Tensor,
+    timestep_value: torch.Tensor,
+    seq_len: int,
+    context: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """Run one local denoiser forward from a cached step latent and return clean `v_pred`."""
+    target_model = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    target_model.to(pipeline.device)
+    with amp.autocast(dtype=pipeline.param_dtype), torch.no_grad():
+        latent = latent_input.to(device=pipeline.device, dtype=torch.float32).detach()
+        timestep = torch.stack([timestep_value.to(device=pipeline.device)])
+        context_device = [u.to(device=pipeline.device, dtype=torch.float32) for u in context]
+        result = pipeline.model([latent], t=timestep, context=context_device, seq_len=int(seq_len))
+    if not isinstance(result, list) or not result:
+        raise RuntimeError("Unexpected clean local forward output format.")
+    return result[0].detach().float().cpu()
+
+
+def _run_wan21_t2v_local_contribution_forward(
+    pipeline,
+    latent_input: torch.Tensor,
+    timestep_value: torch.Tensor,
+    seq_len: int,
+    context: Sequence[torch.Tensor],
+    branch: str,
+    target_layer: int,
+    target_head: int,
+    target_module: str,
+    ablate_position: str,
+    ablate_head: bool,
+    capture_selected_head_write: bool,
+    capture_all_head_writes: bool = False,
+    capture_suffix_payload: bool = False,
+) -> Wan21T2VTrajectoryConsensusContributionState:
+    """Run one patched local denoiser forward from a cached step latent.
+
+    The branch-specific behavior is already encoded by the supplied `context`.
+    Therefore this helper always installs the patch with synthetic branch
+    `cond` and synthetic step `1`, then runs exactly one local DiT forward.
+    """
+    branch_name = str(branch).strip().lower()
+    if branch_name not in {"cond", "uncond"}:
+        raise ValueError(f"Unsupported branch for local contribution forward: {branch}")
+
+    target_model = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    target_model.to(pipeline.device)
+    handle = _install_wan21_t2v_trajectory_consensus_contribution_patch(
+        model=pipeline.model,
+        target_step=1,
+        target_layer=int(target_layer),
+        target_head=int(target_head),
+        target_module=str(target_module),
+        target_branch="cond",
+        ablate_position=str(ablate_position),
+        ablate_head=bool(ablate_head),
+        capture_selected_head_write=bool(capture_selected_head_write),
+        capture_all_head_writes=bool(capture_all_head_writes),
+        capture_suffix_payload=bool(capture_suffix_payload),
+    )
+    try:
+        with amp.autocast(dtype=pipeline.param_dtype), torch.no_grad():
+            latent = latent_input.to(device=pipeline.device, dtype=torch.float32).detach()
+            timestep = torch.stack([timestep_value.to(device=pipeline.device)])
+            context_device = [u.to(device=pipeline.device, dtype=torch.float32) for u in context]
+            result = pipeline.model([latent], t=timestep, context=context_device, seq_len=int(seq_len))
+            if handle.state.captured_vpred is None and isinstance(result, list) and result:
+                handle.state.captured_vpred = result[0].detach().float().cpu()
+    except Wan21T2VEarlyStopRequested:
+        pass
+    finally:
+        handle.restore()
+    return handle.state
+
+
+def _project_wan21_t2v_all_head_writes_to_vpred(
+    pipeline,
+    per_head_writes: torch.Tensor,
+    head_e: torch.Tensor,
+    grid_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """Project all per-head residual writes in one layer/module to per-head `v_pred'`.
+
+    Args:
+        per_head_writes: `[B, T, H, D]`
+        head_e: clean run final-head modulation input, shape `[B, D]`
+        grid_sizes: clean run grid sizes used by `unpatchify`
+
+    Returns:
+        Tensor of shape `[H, C, F, H_out, W_out]`.
+    """
+    target = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    device = target.head.head.weight.device
+    writes = per_head_writes.to(device=device, dtype=torch.float32)
+    head_e_device = head_e.to(device=device, dtype=torch.float32)
+    grid_sizes_device = grid_sizes.to(device=device)
+    num_heads = int(writes.shape[2])
+    outputs: List[torch.Tensor] = []
+    with torch.no_grad():
+        for head_index in range(num_heads):
+            projected = target.head(writes[:, :, head_index, :], head_e_device)
+            vpred = target.unpatchify(projected, grid_sizes_device)
+            if not isinstance(vpred, list) or not vpred:
+                raise RuntimeError("Unexpected direct projection output format.")
+            outputs.append(vpred[0].detach().float().cpu())
+    return torch.stack(outputs, dim=0)
+
+
+def _compute_wan21_t2v_global_direct_proxy_metrics(
+    pipeline,
+    clean_vpred: torch.Tensor,
+    post_o_head_writes: Dict[Tuple[int, str], torch.Tensor],
+    head_e: torch.Tensor,
+    grid_sizes: torch.Tensor,
+    object_mask_fhw: Optional[torch.Tensor],
+    chunk_num_heads: int = 8,
+) -> Dict[Tuple[int, str], Dict[str, torch.Tensor]]:
+    """Compute direct-proxy metrics for all selected heads with chunked final readout.
+
+    This function treats all selected heads in one diffusion step as one global
+    head list, then evaluates the final readout in head chunks to control GPU
+    memory. No extra denoiser forward is run here.
+    """
+    target = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    device = target.head.head.weight.device
+    clean_vpred_cpu = clean_vpred.detach().float().cpu()
+    metric_rows: List[Tuple[Tuple[int, str], int]] = []
+    for key, tensor in sorted(post_o_head_writes.items()):
+        num_heads = int(tensor.shape[2])
+        for head_index in range(num_heads):
+            metric_rows.append((key, int(head_index)))
+    if not metric_rows:
+        return {}
+
+    result: Dict[Tuple[int, str], Dict[str, List[float]]] = {}
+    repeated_head_e_base = head_e.detach().float().cpu()
+    repeated_grid_sizes_base = grid_sizes.detach().cpu()
+
+    for chunk_start in range(0, len(metric_rows), max(1, int(chunk_num_heads))):
+        chunk_specs = metric_rows[chunk_start: chunk_start + max(1, int(chunk_num_heads))]
+        chunk_writes = torch.stack(
+            [
+                post_o_head_writes[key][:, :, head_index, :].squeeze(0).detach().float().cpu()
+                for key, head_index in chunk_specs
+            ],
+            dim=0,
+        )
+        if repeated_head_e_base.ndim == 1:
+            chunk_head_e = repeated_head_e_base.unsqueeze(0).repeat(int(chunk_writes.shape[0]), 1)
+        elif repeated_head_e_base.ndim == 2:
+            if int(repeated_head_e_base.shape[0]) == 1:
+                chunk_head_e = repeated_head_e_base.repeat(int(chunk_writes.shape[0]), 1)
+            elif int(repeated_head_e_base.shape[0]) == int(chunk_writes.shape[0]):
+                chunk_head_e = repeated_head_e_base
+            else:
+                raise RuntimeError(
+                    "Unexpected head_e batch shape for direct proxy: "
+                    f"{tuple(repeated_head_e_base.shape)} vs chunk={int(chunk_writes.shape[0])}"
+                )
+        else:
+            raise RuntimeError(
+                f"Unexpected head_e ndim for direct proxy: {int(repeated_head_e_base.ndim)}"
+            )
+        chunk_grid_sizes = repeated_grid_sizes_base.repeat(int(chunk_writes.shape[0]), 1)
+        with torch.no_grad():
+            projected = target.head(
+                chunk_writes.to(device=device, dtype=torch.float32),
+                chunk_head_e.to(device=device, dtype=torch.float32),
+            )
+            vpred_list = target.unpatchify(projected, chunk_grid_sizes.to(device=device))
+        if not isinstance(vpred_list, list) or len(vpred_list) != int(chunk_writes.shape[0]):
+            raise RuntimeError("Unexpected direct projection batch output format.")
+        for (key, head_index), proxy_vpred in zip(chunk_specs, vpred_list):
+            metrics = _compute_wan21_t2v_contribution_metrics(
+                delta_vpred=proxy_vpred.detach().float().cpu(),
+                clean_vpred=clean_vpred_cpu,
+                object_mask_fhw=object_mask_fhw,
+            )
+            bucket = result.setdefault(
+                key,
+                {
+                    "proj_cos_full": [],
+                    "proj_dot_full": [],
+                    "proj_cos_obj": [],
+                    "proj_dot_obj": [],
+                },
+            )
+            bucket["proj_cos_full"].append(float(metrics["cos_full"]))
+            bucket["proj_dot_full"].append(float(metrics["dot_full"]))
+            bucket["proj_cos_obj"].append(float(metrics["cos_obj"]))
+            bucket["proj_dot_obj"].append(float(metrics["dot_obj"]))
+
+    return {
+        key: {metric_name: torch.tensor(values, dtype=torch.float32) for metric_name, values in metric_dict.items()}
+        for key, metric_dict in result.items()
+    }
+
+
+def _run_wan21_t2v_to_target_step_latent(
+    pipeline,
+    prompt: str,
+    size: Tuple[int, int],
+    frame_num: int,
+    shift: float,
+    sample_solver: str,
+    sampling_steps: int,
+    guide_scale: float,
+    seed: int,
+    target_step: int,
+    offload_model: bool,
+) -> Dict[str, Any]:
+    """Backward-compatible wrapper around the multi-step latent cache builder."""
+    cache = _run_wan21_t2v_collect_target_step_latents(
+        pipeline=pipeline,
+        prompt=prompt,
+        size=size,
+        frame_num=frame_num,
+        shift=shift,
+        sample_solver=sample_solver,
+        sampling_steps=sampling_steps,
+        guide_scale=guide_scale,
+        seed=seed,
+        target_steps=[int(target_step)],
+        offload_model=offload_model,
+    )
+    if int(target_step) not in cache:
+        raise RuntimeError(f"Failed to capture target-step latent for step={target_step}")
+    return cache[int(target_step)]
+
+
+def _run_wan21_t2v_collect_target_step_latents(
+    pipeline,
+    prompt: str,
+    size: Tuple[int, int],
+    frame_num: int,
+    shift: float,
+    sample_solver: str,
+    sampling_steps: int,
+    guide_scale: float,
+    seed: int,
+    target_steps: Sequence[int],
+    offload_model: bool,
+) -> Dict[int, Dict[str, Any]]:
+    """Run one monotonic diffusion scan and cache the input latent for target steps."""
+    requested_steps = sorted({int(step) for step in target_steps})
+    if not requested_steps:
+        return {}
+    if int(requested_steps[0]) < 1:
+        raise ValueError(f"target_steps must be >= 1, got {requested_steps}")
+
+    target_shape = (
+        pipeline.vae.model.z_dim,
+        (int(frame_num) - 1) // pipeline.vae_stride[0] + 1,
+        int(size[1]) // pipeline.vae_stride[1],
+        int(size[0]) // pipeline.vae_stride[2],
+    )
+    seq_len = math.ceil(
+        (target_shape[2] * target_shape[3])
+        / (pipeline.patch_size[1] * pipeline.patch_size[2])
+        * target_shape[1]
+        / pipeline.sp_size
+    ) * pipeline.sp_size
+
+    n_prompt = pipeline.sample_neg_prompt
+    seed = int(seed) if int(seed) >= 0 else random.randint(0, sys.maxsize)
+    seed_g = torch.Generator(device=pipeline.device)
+    seed_g.manual_seed(seed)
+
+    context = _encode_wan21_t2v_text_context_once(
+        pipeline=pipeline,
+        text=prompt,
+        offload_model=bool(offload_model),
+    )
+    context_null = _encode_wan21_t2v_text_context_once(
+        pipeline=pipeline,
+        text=n_prompt,
+        offload_model=bool(offload_model),
+    )
+
+    noise = [
+        torch.randn(
+            target_shape[0],
+            target_shape[1],
+            target_shape[2],
+            target_shape[3],
+            dtype=torch.float32,
+            device=pipeline.device,
+            generator=seed_g,
+        )
+    ]
+
+    if sample_solver == "unipc":
+        sample_scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=pipeline.num_train_timesteps,
+            shift=1,
+            use_dynamic_shifting=False,
+        )
+        sample_scheduler.set_timesteps(sampling_steps, device=pipeline.device, shift=shift)
+        timesteps = sample_scheduler.timesteps
+    elif sample_solver == "dpm++":
+        sample_scheduler = FlowDPMSolverMultistepScheduler(
+            num_train_timesteps=pipeline.num_train_timesteps,
+            shift=1,
+            use_dynamic_shifting=False,
+        )
+        sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+        timesteps, _ = retrieve_timesteps(
+            sample_scheduler,
+            device=pipeline.device,
+            sigmas=sampling_sigmas,
+        )
+    else:
+        raise NotImplementedError("Unsupported solver.")
+
+    max_target_step = int(max(requested_steps))
+    if int(max_target_step) > int(len(timesteps)):
+        raise ValueError(
+            f"target_steps={requested_steps} exceed available sampling steps={len(timesteps)}"
+        )
+
+    arg_c = {"context": context, "seq_len": seq_len}
+    arg_null = {"context": context_null, "seq_len": seq_len}
+    latents = noise
+    context_cpu = [u.detach().float().cpu() for u in context]
+    context_null_cpu = [u.detach().float().cpu() for u in context_null]
+    cache: Dict[int, Dict[str, Any]] = {}
+
+    @contextmanager
+    def noop_no_sync():
+        yield
+
+    no_sync = getattr(pipeline.model, "no_sync", noop_no_sync)
+    with amp.autocast(dtype=pipeline.param_dtype), torch.no_grad(), no_sync():
+        for step_index, t in enumerate(timesteps, start=1):
+            if int(step_index) in requested_steps:
+                cache[int(step_index)] = {
+                    "latent_input": latents[0].detach().float().cpu(),
+                    "timestep": t.detach().clone(),
+                    "seq_len": int(seq_len),
+                    "context": context_cpu,
+                    "context_null": context_null_cpu,
+                }
+                if int(step_index) >= int(max_target_step) and len(cache) == len(requested_steps):
+                    return cache
+
+            latent_model_input = latents
+            timestep = torch.stack([t])
+            pipeline.model.to(pipeline.device)
+            noise_pred_cond = pipeline.model(latent_model_input, t=timestep, **arg_c)[0]
+            noise_pred_uncond = pipeline.model(latent_model_input, t=timestep, **arg_null)[0]
+            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+            temp_x0 = sample_scheduler.step(
+                noise_pred.unsqueeze(0),
+                t,
+                latents[0].unsqueeze(0),
+                return_dict=False,
+                generator=seed_g,
+            )[0]
+            latents = [temp_x0.squeeze(0)]
+
+    missing_steps = [step for step in requested_steps if int(step) not in cache]
+    raise RuntimeError(f"Failed to capture target-step latents for steps={missing_steps}")
+
+
+def _run_wan21_t2v_attribution_clean_forward(
+    pipeline,
+    latent_input: torch.Tensor,
+    timestep_value: torch.Tensor,
+    seq_len: int,
+    context: Sequence[torch.Tensor],
+    branch: str,
+    target_step: int,
+    target_layer: int,
+    target_module: str,
+    attribution_position: str,
+    token_indices: Optional[torch.Tensor],
+    use_gradient_checkpointing: bool,
+    offload_model: bool,
+) -> Wan21T2VTrajectoryConsensusAttributionState:
+    """Run one clean local denoiser forward with gradients for attribution patching."""
+    branch_name = str(branch).strip().lower()
+    if branch_name not in {"cond", "uncond"}:
+        raise ValueError(f"Unsupported branch for attribution clean forward: {branch}")
+
+    target_model = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    target_model.to(pipeline.device)
+    original_param_requires_grad: List[bool] = [bool(param.requires_grad) for param in target_model.parameters()]
+    for param in target_model.parameters():
+        param.requires_grad_(False)
+    handle = _install_wan21_t2v_trajectory_consensus_attribution_patch(
+        model=pipeline.model,
+        target_step=1,
+        target_layer=int(target_layer),
+        target_module=str(target_module),
+        target_branch="cond",
+        attribution_position=str(attribution_position),
+        token_indices=token_indices,
+        use_gradient_checkpointing=bool(use_gradient_checkpointing),
+    )
+    try:
+        with amp.autocast(dtype=pipeline.param_dtype):
+            latent = latent_input.to(device=pipeline.device, dtype=torch.float32).detach()
+            timestep = torch.stack([timestep_value.to(device=pipeline.device)])
+            context_device = [u.to(device=pipeline.device, dtype=torch.float32) for u in context]
+            result = pipeline.model([latent], t=timestep, context=context_device, seq_len=int(seq_len))
+            if handle.state.captured_clean_vpred is None and isinstance(result, list) and result:
+                handle.state.captured_clean_vpred = result[0]
+    finally:
+        handle.restore()
+        for param, requires_grad in zip(target_model.parameters(), original_param_requires_grad):
+            param.requires_grad_(requires_grad)
+    return handle.state
+
+
+def _install_wan21_t2v_trajectory_consensus_global_attribution_patch(
+    model,
+    target_step: int,
+    target_branch: str,
+    selected_targets: Dict[int, Tuple[str, ...]],
+    attribution_position: str,
+    token_indices: Optional[torch.Tensor],
+    use_gradient_checkpointing: bool,
+) -> Wan21T2VTrajectoryConsensusGlobalAttributionHandle:
+    """Install a global attribution patch that captures all selected layers/modules in one forward."""
+    from projects.Wan2_1.wan.modules.attention import flash_attention
+    from projects.Wan2_1.wan.modules.model import T5_CONTEXT_TOKEN_NUMBER, rope_apply
+    from torch.utils.checkpoint import checkpoint
+
+    target = _unwrap_wan21_t2v_dit_model_for_runtime_patch(model)
+    if not hasattr(target, "blocks"):
+        raise RuntimeError("Invalid DiT model: missing blocks.")
+
+    normalized_targets: Dict[int, Tuple[str, ...]] = {}
+    for layer, modules in selected_targets.items():
+        layer_index = int(layer)
+        if layer_index < 0 or layer_index >= len(target.blocks):
+            raise ValueError(f"target_layer out of range: {layer_index}, num_layers={len(target.blocks)}")
+        normalized_targets[layer_index] = tuple(
+            sorted({str(module).strip().lower() for module in modules if str(module).strip().lower() in {"self", "cross"}})
+        )
+    normalized_targets = {layer: modules for layer, modules in normalized_targets.items() if modules}
+    if not normalized_targets:
+        raise ValueError("selected_targets must be non-empty for global attribution patch.")
+
+    state = Wan21T2VTrajectoryConsensusGlobalAttributionState(
+        target_step=int(target_step),
+        target_branch=str(target_branch),
+        attribution_position=str(attribution_position).strip().lower(),
+        selected_modules=tuple(sorted({module for modules in normalized_targets.values() for module in modules})),
+        token_indices=None if token_indices is None else token_indices.detach().long().cpu(),
+    )
+
+    original_forward = target.forward
+    original_block_forwards: Dict[int, Any] = {}
+    original_downstream_block_forwards: Dict[int, Any] = {}
+
+    def patched_dit_forward(this, *args, **kwargs):
+        t = kwargs.get("t", None)
+        if t is None and len(args) > 1:
+            t = args[1]
+        state.on_forward_start(t)
+        result = original_forward(*args, **kwargs)
+        if state.is_target_forward():
+            if isinstance(result, list) and result:
+                state.captured_clean_vpred = result[0]
+        return result
+
+    def _project_all_head_writes(z_bthd: torch.Tensor, linear_module, post_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+        num_heads = int(linear_module.num_heads)
+        head_dim = int(linear_module.head_dim)
+        weight = linear_module.o.weight.view(
+            linear_module.o.out_features,
+            num_heads,
+            head_dim,
+        ).permute(1, 2, 0).contiguous()
+        head_writes = torch.einsum("bthd,hdo->btho", z_bthd, weight)
+        if post_scale is not None:
+            head_writes = head_writes * post_scale.unsqueeze(2)
+        return head_writes
+
+    def _run_manual_cross_attn(cross_attn_module, x_input, context, context_lens):
+        b, n, d = x_input.size(0), cross_attn_module.num_heads, cross_attn_module.head_dim
+        q = cross_attn_module.norm_q(cross_attn_module.q(x_input)).view(b, -1, n, d)
+        if hasattr(cross_attn_module, "k_img") and hasattr(cross_attn_module, "v_img"):
+            image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
+            context_img = context[:, :image_context_length]
+            context_txt = context[:, image_context_length:]
+            k = cross_attn_module.norm_k(cross_attn_module.k(context_txt)).view(b, -1, n, d)
+            v = cross_attn_module.v(context_txt).view(b, -1, n, d)
+            k_img = cross_attn_module.norm_k_img(cross_attn_module.k_img(context_img)).view(b, -1, n, d)
+            v_img = cross_attn_module.v_img(context_img).view(b, -1, n, d)
+            head_output = flash_attention(q, k, v, k_lens=context_lens)
+            head_output = head_output + flash_attention(q, k_img, v_img, k_lens=None)
+        else:
+            k = cross_attn_module.norm_k(cross_attn_module.k(context)).view(b, -1, n, d)
+            v = cross_attn_module.v(context).view(b, -1, n, d)
+            head_output = flash_attention(q, k, v, k_lens=context_lens)
+        return head_output
+
+    def _capture_grad(key: Tuple[int, str], grad: torch.Tensor):
+        state.captured_head_writes_grad_obj[key] = grad.detach().float().cpu()
+
+    def _build_gradient_subset_activation(activation: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if state.token_indices is None or int(state.token_indices.numel()) <= 0:
+            activation_leaf = activation.detach().requires_grad_(True)
+            return activation_leaf, activation_leaf
+        token_indices_device = state.token_indices.to(device=activation.device)
+        activation_subset = activation.index_select(dim=1, index=token_indices_device).detach().requires_grad_(True)
+        activation_full = activation.detach().clone()
+        activation_full.index_copy_(1, token_indices_device, activation_subset)
+        return activation_full, activation_subset
+
+    def _make_target_block_forward(layer_index: int, original_block_forward_fn):
+        def target_block_forward(
+            self,
+            x,
+            e,
+            seq_lens,
+            grid_sizes,
+            freqs,
+            context,
+            context_lens,
+        ):
+            if not state.is_target_forward():
+                return original_block_forward_fn(x, e, seq_lens, grid_sizes, freqs, context, context_lens)
+
+            selected_modules = normalized_targets.get(int(layer_index), tuple())
+            if not selected_modules:
+                return original_block_forward_fn(x, e, seq_lens, grid_sizes, freqs, context, context_lens)
+
+            assert e.dtype == torch.float32
+            with amp.autocast(dtype=torch.float32):
+                modulation = (self.modulation + e).chunk(6, dim=1)
+
+            if "self" in selected_modules:
+                sa_input = self.norm1(x).float() * (1 + modulation[1]) + modulation[0]
+                batch_size, seq_len = sa_input.shape[:2]
+                num_heads = self.self_attn.num_heads
+                head_dim = self.self_attn.head_dim
+                q = self.self_attn.norm_q(self.self_attn.q(sa_input)).view(batch_size, seq_len, num_heads, head_dim)
+                k = self.self_attn.norm_k(self.self_attn.k(sa_input)).view(batch_size, seq_len, num_heads, head_dim)
+                v = self.self_attn.v(sa_input).view(batch_size, seq_len, num_heads, head_dim)
+                z_self = flash_attention(
+                    q=rope_apply(q, grid_sizes, freqs),
+                    k=rope_apply(k, grid_sizes, freqs),
+                    v=v,
+                    k_lens=seq_lens,
+                    window_size=self.self_attn.window_size,
+                )
+                if str(state.attribution_position) == "post_o":
+                    full_activation, tracked_activation = _build_gradient_subset_activation(
+                        _project_all_head_writes(z_self, self.self_attn, post_scale=modulation[2])
+                    )
+                    state.captured_head_writes[(int(layer_index), "self")] = tracked_activation.detach().float().cpu()
+                    tracked_activation.register_hook(lambda grad, key=(int(layer_index), "self"): _capture_grad(key, grad))
+                    sa_output = full_activation.sum(dim=2)
+                    with amp.autocast(dtype=torch.float32):
+                        x = x + sa_output
+                else:
+                    full_activation, tracked_activation = _build_gradient_subset_activation(z_self)
+                    state.captured_head_writes[(int(layer_index), "self")] = tracked_activation.detach().float().cpu()
+                    tracked_activation.register_hook(lambda grad, key=(int(layer_index), "self"): _capture_grad(key, grad))
+                    sa_output = self.self_attn.o(full_activation.flatten(2))
+                    with amp.autocast(dtype=torch.float32):
+                        x = x + sa_output * modulation[2]
+            else:
+                sa_output = self.self_attn(
+                    self.norm1(x).float() * (1 + modulation[1]) + modulation[0],
+                    seq_lens,
+                    grid_sizes,
+                    freqs,
+                )
+                with amp.autocast(dtype=torch.float32):
+                    x = x + sa_output * modulation[2]
+
+            if "cross" in selected_modules:
+                cross_input = self.norm3(x)
+                z_cross = _run_manual_cross_attn(self.cross_attn, cross_input, context, context_lens)
+                if str(state.attribution_position) == "post_o":
+                    full_activation, tracked_activation = _build_gradient_subset_activation(
+                        _project_all_head_writes(z_cross, self.cross_attn, post_scale=None)
+                    )
+                    state.captured_head_writes[(int(layer_index), "cross")] = tracked_activation.detach().float().cpu()
+                    tracked_activation.register_hook(lambda grad, key=(int(layer_index), "cross"): _capture_grad(key, grad))
+                    cross_output = full_activation.sum(dim=2)
+                else:
+                    full_activation, tracked_activation = _build_gradient_subset_activation(z_cross)
+                    state.captured_head_writes[(int(layer_index), "cross")] = tracked_activation.detach().float().cpu()
+                    tracked_activation.register_hook(lambda grad, key=(int(layer_index), "cross"): _capture_grad(key, grad))
+                    cross_output = self.cross_attn.o(full_activation.flatten(2))
+                x = x + cross_output
+            else:
+                x = x + self.cross_attn(self.norm3(x), context, context_lens)
+
+            y = self.ffn(self.norm2(x).float() * (1 + modulation[4]) + modulation[3])
+            with amp.autocast(dtype=torch.float32):
+                x = x + y * modulation[5]
+            return x
+
+        return target_block_forward
+
+    base_block_forwards: Dict[int, Any] = {}
+    for layer_index in range(len(target.blocks)):
+        block_module = target.blocks[int(layer_index)]
+        original_block_forwards[int(layer_index)] = block_module.forward
+        if int(layer_index) in normalized_targets:
+            base_block_forwards[int(layer_index)] = MethodType(
+                _make_target_block_forward(int(layer_index), original_block_forwards[int(layer_index)]),
+                block_module,
+            )
+        else:
+            base_block_forwards[int(layer_index)] = original_block_forwards[int(layer_index)]
+
+    first_target_layer = min(normalized_targets.keys())
+    for layer_index in range(first_target_layer, len(target.blocks)):
+        block_module = target.blocks[int(layer_index)]
+        base_forward = base_block_forwards[int(layer_index)]
+        if bool(use_gradient_checkpointing):
+            original_downstream_block_forwards[int(layer_index)] = block_module.forward
+
+            def _make_checkpointed_block_forward(base_forward_fn):
+                def checkpointed_block_forward(
+                    self,
+                    x,
+                    e,
+                    seq_lens,
+                    grid_sizes,
+                    freqs,
+                    context,
+                    context_lens,
+                ):
+                    def block_fn(
+                        x_tensor,
+                        e_tensor,
+                        seq_lens_tensor,
+                        grid_sizes_tensor,
+                        freqs_tensor,
+                        context_tensor,
+                    ):
+                        return base_forward_fn(
+                            x_tensor,
+                            e_tensor,
+                            seq_lens_tensor,
+                            grid_sizes_tensor,
+                            freqs_tensor,
+                            context_tensor,
+                            context_lens,
+                        )
+                    return checkpoint(
+                        block_fn,
+                        x,
+                        e,
+                        seq_lens,
+                        grid_sizes,
+                        freqs,
+                        context,
+                        use_reentrant=False,
+                    )
+                return checkpointed_block_forward
+
+            block_module.forward = MethodType(_make_checkpointed_block_forward(base_forward), block_module)
+        else:
+            block_module.forward = base_forward
+
+    target.forward = MethodType(patched_dit_forward, target)
+
+    return Wan21T2VTrajectoryConsensusGlobalAttributionHandle(
+        target_model=target,
+        state=state,
+        original_forward=original_forward,
+        original_block_forwards=original_block_forwards,
+        original_downstream_block_forwards=original_downstream_block_forwards,
+    )
+
+
+def _run_wan21_t2v_global_attribution_clean_forward(
+    pipeline,
+    latent_input: torch.Tensor,
+    timestep_value: torch.Tensor,
+    seq_len: int,
+    context: Sequence[torch.Tensor],
+    branch: str,
+    target_step: int,
+    selected_targets: Dict[int, Tuple[str, ...]],
+    attribution_position: str,
+    token_indices: Optional[torch.Tensor],
+    use_gradient_checkpointing: bool,
+    offload_model: bool,
+) -> Wan21T2VTrajectoryConsensusGlobalAttributionState:
+    """Run one clean local denoiser forward with gradients and collect all selected layers/modules at once."""
+    branch_name = str(branch).strip().lower()
+    if branch_name not in {"cond", "uncond"}:
+        raise ValueError(f"Unsupported branch for attribution clean forward: {branch}")
+
+    target_model = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    target_model.to(pipeline.device)
+    original_param_requires_grad: List[bool] = [bool(param.requires_grad) for param in target_model.parameters()]
+    for param in target_model.parameters():
+        param.requires_grad_(False)
+    handle = _install_wan21_t2v_trajectory_consensus_global_attribution_patch(
+        model=pipeline.model,
+        target_step=1,
+        target_branch="cond",
+        selected_targets=selected_targets,
+        attribution_position=str(attribution_position),
+        token_indices=token_indices,
+        use_gradient_checkpointing=bool(use_gradient_checkpointing),
+    )
+    try:
+        with amp.autocast(dtype=pipeline.param_dtype):
+            latent = latent_input.to(device=pipeline.device, dtype=torch.float32).detach()
+            timestep = torch.stack([timestep_value.to(device=pipeline.device)])
+            context_device = [u.to(device=pipeline.device, dtype=torch.float32) for u in context]
+            result = pipeline.model([latent], t=timestep, context=context_device, seq_len=int(seq_len))
+            if handle.state.captured_clean_vpred is None and isinstance(result, list) and result:
+                handle.state.captured_clean_vpred = result[0]
+    finally:
+        handle.restore()
+        for param, requires_grad in zip(target_model.parameters(), original_param_requires_grad):
+            param.requires_grad_(requires_grad)
+    return handle.state
+
+
+def _run_wan21_t2v_global_direct_proxy_clean_forward(
+    pipeline,
+    latent_input: torch.Tensor,
+    timestep_value: torch.Tensor,
+    seq_len: int,
+    context: Sequence[torch.Tensor],
+    branch: str,
+    target_step: int,
+    selected_targets: Dict[int, Tuple[str, ...]],
+    offload_model: bool,
+) -> Wan21T2VTrajectoryConsensusGlobalDirectProxyState:
+    """Run one clean local denoiser forward and capture post-o writes for all selected heads."""
+    branch_name = str(branch).strip().lower()
+    if branch_name not in {"cond", "uncond"}:
+        raise ValueError(f"Unsupported branch for direct-proxy clean forward: {branch}")
+
+    from projects.Wan2_1.wan.modules.attention import flash_attention
+    from projects.Wan2_1.wan.modules.model import T5_CONTEXT_TOKEN_NUMBER, rope_apply
+
+    target = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    if not hasattr(target, "blocks"):
+        raise RuntimeError("Invalid DiT model: missing blocks.")
+
+    normalized_targets: Dict[int, Tuple[str, ...]] = {}
+    for layer, modules in selected_targets.items():
+        layer_index = int(layer)
+        if layer_index < 0 or layer_index >= len(target.blocks):
+            raise ValueError(f"target_layer out of range: {layer_index}, num_layers={len(target.blocks)}")
+        normalized_targets[layer_index] = tuple(
+            sorted({str(module).strip().lower() for module in modules if str(module).strip().lower() in {"self", "cross"}})
+        )
+    normalized_targets = {layer: modules for layer, modules in normalized_targets.items() if modules}
+    if not normalized_targets:
+        raise ValueError("selected_targets must be non-empty for global direct proxy.")
+
+    state = Wan21T2VTrajectoryConsensusGlobalDirectProxyState(
+        target_step=1,
+        target_branch="cond",
+        selected_modules=tuple(sorted({module for modules in normalized_targets.values() for module in modules})),
+    )
+
+    original_forward = target.forward
+    original_head_forward = target.head.forward
+    original_unpatchify = target.unpatchify
+    original_block_forwards: Dict[int, Any] = {}
+
+    def patched_dit_forward(this, *args, **kwargs):
+        t = kwargs.get("t", None)
+        if t is None and len(args) > 1:
+            t = args[1]
+        state.on_forward_start(t)
+        result = original_forward(*args, **kwargs)
+        if state.is_target_forward():
+            if isinstance(result, list) and result:
+                state.captured_clean_vpred = result[0].detach().float().cpu()
+        return result
+
+    def patched_head_forward(self, x, e):
+        if state.is_target_forward():
+            state.captured_head_e = e.detach().float().cpu()
+        return original_head_forward(x, e)
+
+    def patched_unpatchify(self, x, grid_sizes):
+        if state.is_target_forward():
+            state.captured_grid_sizes = grid_sizes.detach().cpu()
+        return original_unpatchify(x, grid_sizes)
+
+    def _project_all_head_writes(z_bthd: torch.Tensor, linear_module, post_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+        num_heads = int(linear_module.num_heads)
+        head_dim = int(linear_module.head_dim)
+        weight = linear_module.o.weight.view(
+            linear_module.o.out_features,
+            num_heads,
+            head_dim,
+        ).permute(1, 2, 0).contiguous()
+        head_writes = torch.einsum("bthd,hdo->btho", z_bthd, weight)
+        if post_scale is not None:
+            head_writes = head_writes * post_scale.unsqueeze(2)
+        return head_writes
+
+    def _run_manual_cross_attn(cross_attn_module, x_input, context, context_lens):
+        b, n, d = x_input.size(0), cross_attn_module.num_heads, cross_attn_module.head_dim
+        q = cross_attn_module.norm_q(cross_attn_module.q(x_input)).view(b, -1, n, d)
+        if hasattr(cross_attn_module, "k_img") and hasattr(cross_attn_module, "v_img"):
+            image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
+            context_img = context[:, :image_context_length]
+            context_txt = context[:, image_context_length:]
+            k = cross_attn_module.norm_k(cross_attn_module.k(context_txt)).view(b, -1, n, d)
+            v = cross_attn_module.v(context_txt).view(b, -1, n, d)
+            k_img = cross_attn_module.norm_k_img(cross_attn_module.k_img(context_img)).view(b, -1, n, d)
+            v_img = cross_attn_module.v_img(context_img).view(b, -1, n, d)
+            head_output = flash_attention(q, k, v, k_lens=context_lens)
+            head_output = head_output + flash_attention(q, k_img, v_img, k_lens=None)
+        else:
+            k = cross_attn_module.norm_k(cross_attn_module.k(context)).view(b, -1, n, d)
+            v = cross_attn_module.v(context).view(b, -1, n, d)
+            head_output = flash_attention(q, k, v, k_lens=context_lens)
+        return head_output
+
+    def _make_target_block_forward(layer_index: int, original_block_forward_fn):
+        def target_block_forward(
+            self,
+            x,
+            e,
+            seq_lens,
+            grid_sizes,
+            freqs,
+            context,
+            context_lens,
+        ):
+            if not state.is_target_forward():
+                return original_block_forward_fn(x, e, seq_lens, grid_sizes, freqs, context, context_lens)
+
+            selected_modules = normalized_targets.get(int(layer_index), tuple())
+            if not selected_modules:
+                return original_block_forward_fn(x, e, seq_lens, grid_sizes, freqs, context, context_lens)
+
+            assert e.dtype == torch.float32
+            with amp.autocast(dtype=torch.float32):
+                modulation = (self.modulation + e).chunk(6, dim=1)
+
+            if "self" in selected_modules:
+                sa_input = self.norm1(x).float() * (1 + modulation[1]) + modulation[0]
+                batch_size, seq_len = sa_input.shape[:2]
+                num_heads = self.self_attn.num_heads
+                head_dim = self.self_attn.head_dim
+                q = self.self_attn.norm_q(self.self_attn.q(sa_input)).view(batch_size, seq_len, num_heads, head_dim)
+                k = self.self_attn.norm_k(self.self_attn.k(sa_input)).view(batch_size, seq_len, num_heads, head_dim)
+                v = self.self_attn.v(sa_input).view(batch_size, seq_len, num_heads, head_dim)
+                z_self = flash_attention(
+                    q=rope_apply(q, grid_sizes, freqs),
+                    k=rope_apply(k, grid_sizes, freqs),
+                    v=v,
+                    k_lens=seq_lens,
+                    window_size=self.self_attn.window_size,
+                )
+                post_o_self = _project_all_head_writes(z_self, self.self_attn, post_scale=modulation[2])
+                state.captured_post_o_head_writes[(int(layer_index), "self")] = post_o_self.detach().float().cpu()
+                sa_output = post_o_self.sum(dim=2)
+                with amp.autocast(dtype=torch.float32):
+                    x = x + sa_output
+            else:
+                sa_output = self.self_attn(
+                    self.norm1(x).float() * (1 + modulation[1]) + modulation[0],
+                    seq_lens,
+                    grid_sizes,
+                    freqs,
+                )
+                with amp.autocast(dtype=torch.float32):
+                    x = x + sa_output * modulation[2]
+
+            if "cross" in selected_modules:
+                cross_input = self.norm3(x)
+                z_cross = _run_manual_cross_attn(self.cross_attn, cross_input, context, context_lens)
+                post_o_cross = _project_all_head_writes(z_cross, self.cross_attn, post_scale=None)
+                state.captured_post_o_head_writes[(int(layer_index), "cross")] = post_o_cross.detach().float().cpu()
+                x = x + post_o_cross.sum(dim=2)
+            else:
+                x = x + self.cross_attn(self.norm3(x), context, context_lens)
+
+            y = self.ffn(self.norm2(x).float() * (1 + modulation[4]) + modulation[3])
+            with amp.autocast(dtype=torch.float32):
+                x = x + y * modulation[5]
+            return x
+
+        return target_block_forward
+
+    for layer_index in sorted(normalized_targets.keys()):
+        block_module = target.blocks[int(layer_index)]
+        original_block_forwards[int(layer_index)] = block_module.forward
+        block_module.forward = MethodType(
+            _make_target_block_forward(int(layer_index), original_block_forwards[int(layer_index)]),
+            block_module,
+        )
+
+    target.forward = MethodType(patched_dit_forward, target)
+    target.head.forward = MethodType(patched_head_forward, target.head)
+    target.unpatchify = MethodType(patched_unpatchify, target)
+
+    target_model = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    target_model.to(pipeline.device)
+    original_param_requires_grad: List[bool] = [bool(param.requires_grad) for param in target_model.parameters()]
+    for param in target_model.parameters():
+        param.requires_grad_(False)
+    handle = Wan21T2VTrajectoryConsensusGlobalDirectProxyHandle(
+        target_model=target,
+        state=state,
+        original_forward=original_forward,
+        original_head_forward=original_head_forward,
+        original_unpatchify=original_unpatchify,
+        original_block_forwards=original_block_forwards,
+    )
+    try:
+        with amp.autocast(dtype=pipeline.param_dtype):
+            latent = latent_input.to(device=pipeline.device, dtype=torch.float32).detach()
+            timestep = torch.stack([timestep_value.to(device=pipeline.device)])
+            context_device = [u.to(device=pipeline.device, dtype=torch.float32) for u in context]
+            result = pipeline.model([latent], t=timestep, context=context_device, seq_len=int(seq_len))
+            if handle.state.captured_clean_vpred is None and isinstance(result, list) and result:
+                handle.state.captured_clean_vpred = result[0].detach().float().cpu()
+    finally:
+        handle.restore()
+        for param, requires_grad in zip(target_model.parameters(), original_param_requires_grad):
+            param.requires_grad_(requires_grad)
+        if offload_model:
+            pipeline.model.cpu()
+            torch.cuda.empty_cache()
+    return handle.state
+
+
+def _move_wan21_t2v_tree_to_device(obj, device: torch.device):
+    """Recursively move a nested payload of tensors to the requested device."""
+    if torch.is_tensor(obj):
+        return obj.to(device=device)
+    if isinstance(obj, dict):
+        return {key: _move_wan21_t2v_tree_to_device(value, device) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_move_wan21_t2v_tree_to_device(value, device) for value in obj]
+    if isinstance(obj, tuple):
+        return tuple(_move_wan21_t2v_tree_to_device(value, device) for value in obj)
+    return obj
+
+
+def _compute_wan21_t2v_attribution_patch_dot_metrics(
+    clean_vpred: torch.Tensor,
+    head_writes: torch.Tensor,
+    head_writes_grad_full: torch.Tensor,
+    head_writes_grad_obj: Optional[torch.Tensor],
+    object_mask_fhw: Optional[torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Compute all-head attribution-patching dot metrics from clean activations and gradients.
+
+    Inputs:
+    - `clean_vpred`: clean final prediction, shape `[C, F, H, W]`
+    - `head_writes`: clean residual writes for all heads, shape `[B, T, H_head, D]`
+    - `head_writes_grad_full`: gradient of clean full-field dot metric w.r.t. `head_writes`
+    - `head_writes_grad_obj`: gradient of clean object-masked dot metric w.r.t. `head_writes`
+
+    Returns:
+    - tensors of shape `[H_head]` for:
+      `dot_full`, `ablate_dot_full`, `dot_obj`, `ablate_dot_obj`
+    """
+    head_writes = head_writes.detach().float()
+    head_writes_grad_full = head_writes_grad_full.detach().float()
+    dot_full_clean = float(torch.dot(clean_vpred.detach().float().reshape(-1), clean_vpred.detach().float().reshape(-1)).item())
+    dot_full = -torch.einsum("bthd,bthd->h", head_writes_grad_full, head_writes)
+    ablate_dot_full = torch.full_like(dot_full, dot_full_clean) - dot_full
+
+    if object_mask_fhw is None or head_writes_grad_obj is None:
+        nan_vec = torch.full_like(dot_full, float("nan"))
+        return {
+            "dot_full": dot_full.cpu(),
+            "ablate_dot_full": ablate_dot_full.cpu(),
+            "dot_obj": nan_vec.cpu(),
+            "ablate_dot_obj": nan_vec.cpu(),
+        }
+
+    mask = object_mask_fhw.detach().float().unsqueeze(0)
+    masked_clean = clean_vpred.detach().float() * mask
+    dot_obj_clean = float(torch.dot(masked_clean.reshape(-1), masked_clean.reshape(-1)).item())
+    head_writes_grad_obj = head_writes_grad_obj.detach().float()
+    dot_obj = -torch.einsum("bthd,bthd->h", head_writes_grad_obj, head_writes)
+    ablate_dot_obj = torch.full_like(dot_obj, dot_obj_clean) - dot_obj
+
+    return {
+        "dot_full": dot_full.cpu(),
+        "ablate_dot_full": ablate_dot_full.cpu(),
+        "dot_obj": dot_obj.cpu(),
+        "ablate_dot_obj": ablate_dot_obj.cpu(),
+    }
+
+
+def _compute_wan21_t2v_taylor_contribution_metrics(
+    head_writes: torch.Tensor,
+    head_writes_grad: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Compute first-order Taylor contributions for all heads.
+
+    The Taylor path now uses a clean-only scalar objective `M` and reports the
+    corresponding first-order change under zero-ablation:
+
+    `contribution_h = - <∇_{U_h} M(clean), U_h(clean)>`.
+
+    The returned tensor is one scalar per head.
+    """
+    head_writes = head_writes.detach().float()
+    head_writes_grad = head_writes_grad.detach().float()
+    contribution = torch.abs(-torch.einsum("bthd,bthd->h", head_writes_grad, head_writes))
+    return {"contribution": contribution.cpu()}
+
+
+def _project_wan21_t2v_pre_o_heads_to_post_o_writes(
+    pipeline,
+    module_name: str,
+    layer_index: int,
+    per_head_pre_o: torch.Tensor,
+    self_post_scale: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Convert stored pre-`o` head outputs into post-`o` per-head residual writes."""
+    target = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    block = target.blocks[int(layer_index)]
+    module_name = str(module_name).strip().lower()
+    if module_name == "self":
+        linear_module = block.self_attn
+        post_scale = None if self_post_scale is None else self_post_scale.detach().float().cpu()
+    elif module_name == "cross":
+        linear_module = block.cross_attn
+        post_scale = None
+    else:
+        raise ValueError(f"Unsupported module for direct projection: {module_name}")
+
+    num_heads = int(linear_module.num_heads)
+    head_dim = int(linear_module.head_dim)
+    weight = linear_module.o.weight.detach().float().cpu().view(
+        linear_module.o.out_features,
+        num_heads,
+        head_dim,
+    ).permute(1, 2, 0).contiguous()
+    head_writes = torch.einsum("bthd,hdo->btho", per_head_pre_o.detach().float().cpu(), weight)
+    if post_scale is not None:
+        head_writes = head_writes * post_scale.unsqueeze(2)
+    return head_writes
+
+
+def _replay_wan21_t2v_suffix_from_head_write(
+    pipeline,
+    suffix_payload: Dict[str, Any],
+    target_module: str,
+    target_head: int,
+    injected_head_write: torch.Tensor,
+) -> torch.Tensor:
+    """Replay the clean downstream suffix from one injected head write.
+
+    The replay starts immediately after the targeted head write has been formed.
+    For a self-attention head this means replacing the selected slice inside the
+    self-attention residual write and then executing:
+    - the residual add of self-attention;
+    - the block's cross-attention and FFN;
+    - all later transformer blocks;
+    - the final output head and unpatchify.
+
+    For a cross-attention head this means replacing the selected slice inside the
+    cross-attention residual write and then executing:
+    - the residual add of cross-attention;
+    - the block FFN;
+    - all later transformer blocks;
+    - the final output head and unpatchify.
+    """
+    target = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    model_device = target.head.head.weight.device
+    payload = _move_wan21_t2v_tree_to_device(suffix_payload, model_device)
+    head_write = injected_head_write.to(device=model_device)
+    module_name = str(target_module).strip().lower()
+    head_index = int(target_head)
+
+    if module_name == "self":
+        x_before = payload["x_before"]
+        all_head_writes = payload["all_head_writes"].clone()
+        all_head_writes[:, :, head_index, :] = head_write
+        sa_write_sum = all_head_writes.sum(dim=2)
+        with amp.autocast(dtype=torch.float32):
+            x = x_before + sa_write_sum
+        x = x + payload["cross_attn_module"](payload["norm3_module"](x), payload["context"], payload["context_lens"])
+        y = payload["ffn_module"](payload["norm2_module"](x).float() * (1 + payload["modulation4"]) + payload["modulation3"])
+        with amp.autocast(dtype=torch.float32):
+            x = x + y * payload["modulation5"]
+    elif module_name == "cross":
+        x_before_cross = payload["x_before_cross"]
+        all_head_writes = payload["all_head_writes"].clone()
+        all_head_writes[:, :, head_index, :] = head_write
+        cross_write_sum = all_head_writes.sum(dim=2)
+        x = x_before_cross + cross_write_sum
+        y = payload["ffn_module"](payload["norm2_module"](x).float() * (1 + payload["modulation4"]) + payload["modulation3"])
+        with amp.autocast(dtype=torch.float32):
+            x = x + y * payload["modulation5"]
+    else:
+        raise ValueError(f"Unsupported target_module for suffix replay: {target_module}")
+
+    kwargs = {
+        "seq_lens": payload["seq_lens"],
+        "grid_sizes": payload["grid_sizes"],
+        "freqs": payload["freqs"],
+        "context": payload["context"],
+        "context_lens": payload["context_lens"],
+    }
+    for block_index in range(int(payload["target_layer"]) + 1, len(target.blocks)):
+        x = target.blocks[block_index](x, payload["e"], **kwargs)
+
+    head_output = target.head(x, payload["head_e"])
+    vpred_list = target.unpatchify(head_output, payload["grid_sizes"])
+    if not isinstance(vpred_list, list) or not vpred_list:
+        raise RuntimeError("Unexpected suffix replay output format.")
+    return vpred_list[0]
+
+
+def _compute_wan21_t2v_taylor_approx_scalar_metrics(
+    pipeline,
+    suffix_payload: Dict[str, Any],
+    selected_head_write: torch.Tensor,
+    clean_vpred: torch.Tensor,
+    object_mask_fhw: Optional[torch.Tensor],
+    target_module: str,
+    target_head: int,
+) -> Dict[str, float]:
+    r"""Compute low-memory first-order Taylor metrics for head contribution.
+
+    Instead of approximating the whole vector-valued `Delta v_pred`, this path
+    follows the attribution-patching style scalar approximation:
+
+    \[
+    \Delta m_{s,\ell,h}^{\mathrm{ablate}}
+    \approx
+    \left\langle
+    \nabla_U m\!\big(F_{s,\ell,h}(U_{s,\ell,h})\big),
+    U_{s,\ell,h}
+    \right\rangle .
+    \]
+
+    This avoids constructing the full JVP of the video-sized output and is far
+    more memory efficient than the vector-valued implementation.
+    """
+    target = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+    model_device = target.head.head.weight.device
+    clean_write = selected_head_write.detach().to(device=model_device, dtype=torch.float32).requires_grad_(True)
+    clean_vpred_device = clean_vpred.detach().to(device=model_device, dtype=torch.float32)
+    object_mask_device = None
+    if object_mask_fhw is not None:
+        object_mask_device = object_mask_fhw.detach().to(device=model_device, dtype=torch.float32).unsqueeze(0)
+
+    def suffix_fn(write_tensor: torch.Tensor) -> torch.Tensor:
+        return _replay_wan21_t2v_suffix_from_head_write(
+            pipeline=pipeline,
+            suffix_payload=suffix_payload,
+            target_module=str(target_module),
+            target_head=int(target_head),
+            injected_head_write=write_tensor,
+        )
+
+    vpred_clean_from_suffix = suffix_fn(clean_write)
+    dot_full_clean = torch.dot(vpred_clean_from_suffix.reshape(-1), clean_vpred_device.reshape(-1))
+    grad_dot_full = torch.autograd.grad(dot_full_clean, clean_write, retain_graph=True, create_graph=False)[0]
+    delta_dot_full = torch.dot(grad_dot_full.reshape(-1), clean_write.reshape(-1))
+
+    metrics = {
+        "dot_full": float(delta_dot_full.detach().cpu().item()),
+        "ablate_dot_full": float((dot_full_clean - delta_dot_full).detach().cpu().item()),
+        "cos_full": float("nan"),
+        "ablate_cos_full": float("nan"),
+    }
+
+    if object_mask_device is None:
+        metrics["dot_obj"] = float("nan")
+        metrics["ablate_dot_obj"] = float("nan")
+        metrics["cos_obj"] = float("nan")
+        metrics["ablate_cos_obj"] = float("nan")
+        return metrics
+
+    masked_vpred = vpred_clean_from_suffix * object_mask_device
+    masked_clean = clean_vpred_device * object_mask_device
+    dot_obj_clean = torch.dot(masked_vpred.reshape(-1), masked_clean.reshape(-1))
+    grad_dot_obj = torch.autograd.grad(dot_obj_clean, clean_write, retain_graph=False, create_graph=False)[0]
+    delta_dot_obj = torch.dot(grad_dot_obj.reshape(-1), clean_write.reshape(-1))
+
+    metrics["dot_obj"] = float(delta_dot_obj.detach().cpu().item())
+    metrics["ablate_dot_obj"] = float((dot_obj_clean - delta_dot_obj).detach().cpu().item())
+    metrics["cos_obj"] = float("nan")
+    metrics["ablate_cos_obj"] = float("nan")
+    return metrics
+
+
+def _resolve_wan21_t2v_steps_and_layers_from_maps(
+    mean_maps: Dict[Tuple[int, int, str], torch.Tensor],
+    requested_steps: Sequence[int],
+    requested_layers: Sequence[int],
+) -> Tuple[List[int], List[int]]:
+    """Resolve step/layer scopes from saved cross-attention maps."""
+    available_steps = sorted({int(key[0]) for key in mean_maps.keys()})
+    available_layers = sorted({int(key[1]) for key in mean_maps.keys()})
+
+    if requested_steps:
+        steps = _dedup_wan21_t2v_int_list(requested_steps)
+        missing_steps = [step for step in steps if int(step) not in available_steps]
+        if missing_steps:
+            raise ValueError(f"Requested steps missing from reused maps: {missing_steps}")
+    else:
+        steps = list(available_steps)
+
+    if requested_layers:
+        layers = _dedup_wan21_t2v_int_list(requested_layers)
+        missing_layers = [layer for layer in layers if int(layer) not in available_layers]
+        if missing_layers:
+            raise ValueError(f"Requested layers missing from reused maps: {missing_layers}")
+    else:
+        layers = list(available_layers)
+    return [int(step) for step in steps], [int(layer) for layer in layers]
+
+
+def _resolve_wan21_t2v_candidate_viz_frame_indices(frame_count: int, num_frames: int) -> List[int]:
+    """Return evenly spaced frame indices for candidate visualization."""
+    if int(frame_count) <= 0:
+        return []
+    requested = min(max(1, int(num_frames)), int(frame_count))
+    return (
+        torch.linspace(0, int(frame_count) - 1, steps=requested)
+        .round()
+        .long()
+        .unique(sorted=True)
+        .tolist()
+    )
+
+
+def _load_wan21_t2v_reference_distance_summary(
+    reuse_head_trajectory_dynamics_dir: Optional[str],
+    distance_metric: str,
+    selected_steps: Sequence[int],
+) -> Dict[Tuple[int, int], Dict[str, float]]:
+    """Load early-alignment summaries from head_trajectory_dynamics reference-distance CSV.
+
+    The returned summary uses the mean reference distance over the first ten available
+    diffusion steps for each `(layer, head)` pair. The legacy key
+    `early_alignment_auc_neg` is retained only for compatibility with downstream
+    plotting code; it now stores the negated first-10-step mean rather than a true AUC.
+    """
+    if not reuse_head_trajectory_dynamics_dir:
+        return {}
+    csv_path = os.path.join(
+        reuse_head_trajectory_dynamics_dir,
+        "head_trajectory_dynamics_reference_distance.csv",
+    )
+    rows = _load_wan21_t2v_csv_rows(csv_path)
+    if not rows:
+        return {}
+
+    metric_key = f"{str(distance_metric).strip().lower()}_reference_distance"
+    grouped_values: Dict[Tuple[int, int], List[Tuple[int, float]]] = defaultdict(list)
+    for row in rows:
+        if metric_key not in row or str(row.get(metric_key, "")).strip() == "":
+            continue
+        step = int(row["step"])
+        layer = int(row["layer"])
+        head = int(row["head"])
+        grouped_values[(layer, head)].append((int(step), float(row[metric_key])))
+
+    summary = {}
+    for key, step_value_pairs in grouped_values.items():
+        if not step_value_pairs:
+            continue
+        sorted_pairs = sorted(step_value_pairs, key=lambda item: int(item[0]))
+        first_ten_values = [float(value) for _, value in sorted_pairs[:25]]  # take first 10 steps
+        if not first_ten_values:
+            continue
+        mean_value = float(sum(first_ten_values) / len(first_ten_values))
+        summary[key] = {
+            "early_alignment_auc_neg": float(-mean_value),
+            "early_alignment_raw": float(mean_value),
+        }
+    return summary
+
+
+def _load_wan21_t2v_reference_distance_summaries(
+    reuse_head_trajectory_dynamics_dir: Optional[str],
+    distance_metrics: Sequence[str],
+    selected_steps: Sequence[int],
+) -> Dict[str, Dict[Tuple[int, int], Dict[str, float]]]:
+    """Load early-alignment summaries for multiple reference-distance metrics."""
+    summaries: Dict[str, Dict[Tuple[int, int], Dict[str, float]]] = {}
+    for metric_name in distance_metrics:
+        metric_key = str(metric_name).strip()
+        if not metric_key:
+            continue
+        summaries[metric_key] = _load_wan21_t2v_reference_distance_summary(
+            reuse_head_trajectory_dynamics_dir=reuse_head_trajectory_dynamics_dir,
+            distance_metric=metric_key,
+            selected_steps=selected_steps,
+        )
+    return summaries
+
+
+def _append_wan21_t2v_alignment_scatter_row(
+    scatter_rows: List[Dict[str, object]],
+    *,
+    alignment_metric_name: str,
+    analysis_method: str,
+    module_name: str,
+    branch_name: str,
+    metric_name: str,
+    head_tag: str,
+    step: int,
+    metric_value: object,
+    alignment_summary: Dict[str, float],
+):
+    """Append one alignment-scatter row when the metric value is finite."""
+    metric_text = str(metric_value).strip()
+    if not metric_text or metric_text.lower() == "nan":
+        return
+    scatter_rows.append({
+        "alignment_metric_name": str(alignment_metric_name),
+        "analysis_method": str(analysis_method),
+        "module": str(module_name),
+        "branch": str(branch_name),
+        "metric": str(metric_name),
+        "head_tag": str(head_tag),
+        "step": int(step),
+        "early_alignment_auc_neg": float(alignment_summary["early_alignment_auc_neg"]),
+        "early_alignment_raw": float(alignment_summary["early_alignment_raw"]),
+        "metric_value": float(metric_value),
+    })
+
+
+def _normalize_wan21_t2v_path_component(text: str) -> str:
+    """Convert a free-form label into a filesystem-friendly path component."""
+    cleaned = str(text).strip().lower()
+    cleaned = cleaned.replace("/", "_")
+    cleaned = re.sub(r"[^a-z0-9_.-]+", "_", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned or "metric"
+
+
+def _apply_wan21_t2v_abs_to_ablation_contribution_row(
+    row: Dict[str, object],
+) -> Dict[str, object]:
+    """Normalize ablation-derived contribution magnitudes to absolute values."""
+    method_name = str(row.get("analysis_method", "")).strip().lower()
+    if method_name == "taylor_approx":
+        metric_names = ("contribution",)
+    else:
+        metric_names = tuple()
+    for metric_name in metric_names:
+        metric_text = str(row.get(metric_name, "")).strip()
+        if not metric_text or metric_text.lower() == "nan":
+            continue
+        row[metric_name] = abs(float(metric_text))
+    return row
+
+
+def _render_wan21_t2v_candidate_consensus_plots(
+    output_dir: str,
+    winner_gap_rows: Sequence[Dict[str, object]],
+    skip_existing_plots: bool = False,
+):
+    """Render candidate-consensus summary heatmaps."""
+    if not winner_gap_rows:
+        return []
+
+    mean_rows = []
+    grouped_gap = defaultdict(list)
+    grouped_entropy = defaultdict(list)
+    for row in winner_gap_rows:
+        grouped_gap[(int(row["step"]), int(row["layer"]))].append(float(row["winner_gap"]))
+        grouped_entropy[(int(row["step"]), int(row["layer"]))].append(float(row["candidate_entropy"]))
+    for (step, layer), values in sorted(grouped_gap.items()):
+        mean_rows.append({
+            "step": int(step),
+            "layer": int(layer),
+            "winner_gap_mean": float(sum(values) / len(values)),
+            "candidate_entropy_mean": float(sum(grouped_entropy[(step, layer)]) / len(grouped_entropy[(step, layer)])),
+        })
+
+    plots_dir = os.path.join(output_dir, "trajectory_consensus_candidate_plots")
+    plot_paths = []
+    winner_gap_save = os.path.join(plots_dir, "winner_gap_step_layer_heatmap.pdf")
+    entropy_save = os.path.join(plots_dir, "candidate_entropy_step_layer_heatmap.pdf")
+    if _maybe_skip_wan21_t2v_existing_plot(winner_gap_save, skip_existing_plots):
+        plot_paths.append(winner_gap_save)
+    else:
+        plot_paths.append(
+            _plot_wan21_t2v_trajectory_consensus_heatmap(
+                matrix_rows=mean_rows,
+                save_file=winner_gap_save,
+                title="Candidate Winner Gap (step-layer mean)",
+                row_key="layer",
+                col_key="step",
+                value_key="winner_gap_mean",
+                row_label="layer",
+                col_label="step",
+            )
+        )
+    if _maybe_skip_wan21_t2v_existing_plot(entropy_save, skip_existing_plots):
+        plot_paths.append(entropy_save)
+    else:
+        plot_paths.append(
+            _plot_wan21_t2v_trajectory_consensus_heatmap(
+                matrix_rows=mean_rows,
+                save_file=entropy_save,
+                title="Candidate Entropy (step-layer mean)",
+                row_key="layer",
+                col_key="step",
+                value_key="candidate_entropy_mean",
+                row_label="layer",
+                col_label="step",
+            )
+        )
+    return [path for path in plot_paths if path]
+
+
+def _render_wan21_t2v_head_contribution_plots(
+    output_dir: str,
+    head_rows: Sequence[Dict[str, object]],
+    scatter_rows: Sequence[Dict[str, object]],
+    scatter_outlier_heads: Sequence[str],
+    skip_existing_plots: bool = False,
+):
+    """Render contribution heatmaps, curves, and scatter plots."""
+    if not head_rows:
+        return []
+
+    plots_root_dir = os.path.join(output_dir, "trajectory_consensus_head_contribution_plots")
+    heatmap_plots_dir = os.path.join(plots_root_dir, "heatmaps")
+    plot_paths: List[str] = []
+    scatter_outlier_head_set = {
+        str(head_tag).strip().upper()
+        for head_tag in scatter_outlier_heads
+        if str(head_tag).strip()
+    }
+
+    method_metric_keys = {
+        "exact_ablation": [
+            "cos_full",
+            "dot_full",
+            "cos_obj",
+            "dot_obj",
+            "ablate_cos_full",
+            "ablate_dot_full",
+            "ablate_cos_obj",
+            "ablate_dot_obj",
+        ],
+        "taylor_approx": ["contribution"],
+        "direct_proxy": [
+            "proj_cos_full",
+            "proj_dot_full",
+            "proj_cos_obj",
+            "proj_dot_obj",
+            "proj_share_full",
+            "proj_share_obj",
+        ],
+    }
+    grouped_by_method_module_branch = defaultdict(list)
+    for row in head_rows:
+        method_name = str(row.get("analysis_method") or row.get("contribution_method") or "").strip().lower()
+        if not method_name:
+            continue
+        grouped_by_method_module_branch[(method_name, str(row["module"]), str(row["branch"]))].append(row)
+
+    for (method_name, module_name, branch_name), rows in sorted(grouped_by_method_module_branch.items()):
+        for metric_key in method_metric_keys.get(method_name, []):
+            metric_rows = [row for row in rows if row.get(metric_key, "") != "" and str(row.get(metric_key, "")).lower() != "nan"]
+            if not metric_rows:
+                continue
+            metric_dir = os.path.join(heatmap_plots_dir, module_name, branch_name, metric_key)
+
+            mean_rows = []
+            grouped = defaultdict(list)
+            for row in metric_rows:
+                grouped[(int(row["step"]), int(row["layer"]))].append(float(row[metric_key]))
+            for (step, layer), values in sorted(grouped.items()):
+                mean_rows.append({
+                    "step": int(step),
+                    "layer": int(layer),
+                    "value": float(sum(values) / len(values)),
+                })
+
+            save_file = os.path.join(metric_dir, f"{metric_key}_step_layer_heatmap.pdf")
+            if _maybe_skip_wan21_t2v_existing_plot(save_file, skip_existing_plots):
+                plot_paths.append(save_file)
+            else:
+                plot_paths.append(
+                    _plot_wan21_t2v_trajectory_consensus_heatmap(
+                        matrix_rows=mean_rows,
+                        save_file=save_file,
+                        title=(
+                            f"{metric_key} ({method_name}, {module_name}, {branch_name})"
+                        ),
+                        row_key="layer",
+                        col_key="step",
+                        value_key="value",
+                        row_label="layer",
+                        col_label="step",
+                    )
+                )
+
+            steps = sorted(set(int(row["step"]) for row in metric_rows))
+            layers = sorted(set(int(row["layer"]) for row in metric_rows))
+            for step in steps:
+                step_rows = [
+                    {
+                        "layer": int(row["layer"]),
+                        "head": int(row["head"]),
+                        "value": float(row[metric_key]),
+                    }
+                    for row in metric_rows
+                    if int(row["step"]) == int(step)
+                ]
+                step_dir = os.path.join(metric_dir, f"step_{int(step):03d}")
+                save_file = os.path.join(step_dir, f"{metric_key}_layer_head_step_{int(step):03d}.pdf")
+                if _maybe_skip_wan21_t2v_existing_plot(save_file, skip_existing_plots):
+                    plot_paths.append(save_file)
+                else:
+                    plot_paths.append(
+                        _plot_wan21_t2v_trajectory_consensus_heatmap(
+                            matrix_rows=step_rows,
+                            save_file=save_file,
+                            title=(
+                                f"{metric_key} at step={int(step)} ({method_name}, {module_name}, "
+                                f"{branch_name})"
+                            ),
+                            row_key="layer",
+                            col_key="head",
+                            value_key="value",
+                            row_label="layer",
+                            col_label="head",
+                        )
+                    )
+            for layer in layers:
+                layer_rows = [
+                    {
+                        "step": int(row["step"]),
+                        "head": int(row["head"]),
+                        "value": float(row[metric_key]),
+                    }
+                    for row in metric_rows
+                    if int(row["layer"]) == int(layer)
+                ]
+                save_file = os.path.join(metric_dir, f"{metric_key}_step_head_layer_{int(layer):02d}.pdf")
+                if _maybe_skip_wan21_t2v_existing_plot(save_file, skip_existing_plots):
+                    plot_paths.append(save_file)
+                else:
+                    plot_paths.append(
+                        _plot_wan21_t2v_trajectory_consensus_heatmap(
+                            matrix_rows=layer_rows,
+                            save_file=save_file,
+                            title=(
+                                f"{metric_key} at layer={int(layer)} ({method_name}, {module_name}, "
+                                f"{branch_name})"
+                            ),
+                            row_key="head",
+                            col_key="step",
+                            value_key="value",
+                            row_label="head",
+                            col_label="step",
+                        )
+                    )
+
+    grouped_scatter = defaultdict(list)
+    for row in scatter_rows:
+        method_name = str(row.get("analysis_method") or row.get("contribution_method") or "").strip().lower()
+        if not method_name:
+            continue
+        grouped_scatter[(
+            str(row.get("alignment_metric_name", "")).strip(),
+            method_name,
+            str(row["module"]),
+            str(row["branch"]),
+            str(row["metric"]),
+        )].append(row)
+    for (alignment_metric_name, method_name, module_name, branch_name, metric_name), rows in sorted(grouped_scatter.items()):
+        alignment_metric_tag = _normalize_wan21_t2v_path_component(alignment_metric_name)
+        scatter_plots_dir = os.path.join(plots_root_dir, f"scatter_{alignment_metric_tag}")
+        metric_dir = os.path.join(scatter_plots_dir, module_name, branch_name, metric_name)
+        scatter_variants = [("", rows)]
+        if scatter_outlier_head_set:
+            filtered_rows = [
+                row for row in rows
+                if str(row.get("head_tag", "")).strip().upper() not in scatter_outlier_head_set
+            ]
+            scatter_variants.append(("_del_outlier", filtered_rows))
+        for suffix, variant_rows in scatter_variants:
+            auc_save = os.path.join(metric_dir, f"{metric_name}_vs_alignment_auc_neg{suffix}.pdf")
+            raw_save = os.path.join(metric_dir, f"{metric_name}_vs_alignment_raw{suffix}.pdf")
+            auc_html_save = os.path.join(metric_dir, f"{metric_name}_vs_alignment_auc_neg{suffix}.html")
+            raw_html_save = os.path.join(metric_dir, f"{metric_name}_vs_alignment_raw{suffix}.html")
+            if _maybe_skip_wan21_t2v_existing_plot(auc_save, skip_existing_plots):
+                plot_paths.append(auc_save)
+            else:
+                plot_paths.append(
+                    _plot_wan21_t2v_trajectory_consensus_scatter(
+                        rows=variant_rows,
+                        save_file=auc_save,
+                        x_key="early_alignment_auc_neg",
+                        y_key="metric_value",
+                        title=(
+                            f"{metric_name} vs negated early alignment ({method_name}, {module_name}, "
+                            f"{branch_name}; alignment_metric={alignment_metric_name})"
+                        ),
+                        x_label="negative mean reference distance over first 10 steps",
+                        y_label=metric_name,
+                    )
+                )
+            if _maybe_skip_wan21_t2v_existing_plot(auc_html_save, skip_existing_plots):
+                plot_paths.append(auc_html_save)
+            else:
+                html_path = _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
+                    rows=variant_rows,
+                    save_file=auc_html_save,
+                    x_key="early_alignment_auc_neg",
+                    y_key="metric_value",
+                    title=(
+                        f"{metric_name} vs negated early alignment ({method_name}, {module_name}, "
+                        f"{branch_name}; alignment_metric={alignment_metric_name})"
+                    ),
+                    x_label="negative mean reference distance over first 10 steps",
+                    y_label=metric_name,
+                )
+                if html_path:
+                    plot_paths.append(html_path)
+            if _maybe_skip_wan21_t2v_existing_plot(raw_save, skip_existing_plots):
+                plot_paths.append(raw_save)
+            else:
+                plot_paths.append(
+                    _plot_wan21_t2v_trajectory_consensus_scatter(
+                        rows=variant_rows,
+                        save_file=raw_save,
+                        x_key="early_alignment_raw",
+                        y_key="metric_value",
+                        title=(
+                            f"{metric_name} vs early alignment ({method_name}, {module_name}, "
+                            f"{branch_name}; alignment_metric={alignment_metric_name})"
+                        ),
+                        x_label="mean reference distance over first 10 steps",
+                        y_label=metric_name,
+                    )
+                )
+            if _maybe_skip_wan21_t2v_existing_plot(raw_html_save, skip_existing_plots):
+                plot_paths.append(raw_html_save)
+            else:
+                html_path = _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
+                    rows=variant_rows,
+                    save_file=raw_html_save,
+                    x_key="early_alignment_raw",
+                    y_key="metric_value",
+                    title=(
+                        f"{metric_name} vs early alignment ({method_name}, {module_name}, "
+                        f"{branch_name}; alignment_metric={alignment_metric_name})"
+                    ),
+                    x_label="mean reference distance over first 10 steps",
+                    y_label=metric_name,
+                )
+                if html_path:
+                    plot_paths.append(html_path)
+        per_step_groups = defaultdict(list)
+        for row in rows:
+            per_step_groups[int(row["step"])].append(row)
+        for step, step_rows in sorted(per_step_groups.items()):
+            step_dir = os.path.join(metric_dir, f"step_{int(step):03d}")
+            step_variants = [("", step_rows)]
+            if scatter_outlier_head_set:
+                filtered_step_rows = [
+                    row for row in step_rows
+                    if str(row.get("head_tag", "")).strip().upper() not in scatter_outlier_head_set
+                ]
+                step_variants.append(("_del_outlier", filtered_step_rows))
+            for suffix, variant_step_rows in step_variants:
+                step_auc_save = os.path.join(step_dir, f"{metric_name}_vs_alignment_auc_neg{suffix}.pdf")
+                step_raw_save = os.path.join(step_dir, f"{metric_name}_vs_alignment_raw{suffix}.pdf")
+                step_auc_html_save = os.path.join(step_dir, f"{metric_name}_vs_alignment_auc_neg{suffix}.html")
+                step_raw_html_save = os.path.join(step_dir, f"{metric_name}_vs_alignment_raw{suffix}.html")
+                if _maybe_skip_wan21_t2v_existing_plot(step_auc_save, skip_existing_plots):
+                    plot_paths.append(step_auc_save)
+                else:
+                    plot_paths.append(
+                        _plot_wan21_t2v_trajectory_consensus_scatter(
+                            rows=variant_step_rows,
+                            save_file=step_auc_save,
+                            x_key="early_alignment_auc_neg",
+                            y_key="metric_value",
+                            title=(
+                                f"{metric_name} vs negated early alignment at step={int(step)} "
+                                f"({method_name}, {module_name}, {branch_name}; "
+                                f"alignment_metric={alignment_metric_name})"
+                            ),
+                            x_label="negative mean reference distance over first 10 steps",
+                            y_label=metric_name,
+                        )
+                    )
+                if _maybe_skip_wan21_t2v_existing_plot(step_auc_html_save, skip_existing_plots):
+                    plot_paths.append(step_auc_html_save)
+                else:
+                    html_path = _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
+                        rows=variant_step_rows,
+                        save_file=step_auc_html_save,
+                        x_key="early_alignment_auc_neg",
+                        y_key="metric_value",
+                        title=(
+                            f"{metric_name} vs negated early alignment at step={int(step)} "
+                            f"({method_name}, {module_name}, {branch_name}; "
+                            f"alignment_metric={alignment_metric_name})"
+                        ),
+                        x_label="negative mean reference distance over first 10 steps",
+                        y_label=metric_name,
+                    )
+                    if html_path:
+                        plot_paths.append(html_path)
+                if _maybe_skip_wan21_t2v_existing_plot(step_raw_save, skip_existing_plots):
+                    plot_paths.append(step_raw_save)
+                else:
+                    plot_paths.append(
+                        _plot_wan21_t2v_trajectory_consensus_scatter(
+                            rows=variant_step_rows,
+                            save_file=step_raw_save,
+                            x_key="early_alignment_raw",
+                            y_key="metric_value",
+                            title=(
+                                f"{metric_name} vs early alignment at step={int(step)} "
+                                f"({method_name}, {module_name}, {branch_name}; "
+                                f"alignment_metric={alignment_metric_name})"
+                            ),
+                            x_label="mean reference distance over first 10 steps",
+                            y_label=metric_name,
+                        )
+                    )
+                if _maybe_skip_wan21_t2v_existing_plot(step_raw_html_save, skip_existing_plots):
+                    plot_paths.append(step_raw_html_save)
+                else:
+                    html_path = _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
+                        rows=variant_step_rows,
+                        save_file=step_raw_html_save,
+                        x_key="early_alignment_raw",
+                        y_key="metric_value",
+                        title=(
+                            f"{metric_name} vs early alignment at step={int(step)} "
+                            f"({method_name}, {module_name}, {branch_name}; "
+                            f"alignment_metric={alignment_metric_name})"
+                        ),
+                        x_label="mean reference distance over first 10 steps",
+                        y_label=metric_name,
+                    )
+                    if html_path:
+                        plot_paths.append(html_path)
+    return [path for path in plot_paths if path]
+
+
+def run_wan21_t2v_trajectory_consensus_dynamics(
+    wan21_root: str,
+    ckpt_dir: str,
+    output_dir: str,
+    prompt: str,
+    size: Tuple[int, int],
+    task: str = "t2v-14B",
+    frame_num: int = 81,
+    shift: float = 8.0,
+    sample_solver: str = "unipc",
+    sampling_steps: int = 50,
+    guide_scale: float = 12.0,
+    seed: int = 0,
+    device_id: Optional[int] = None,
+    offload_model: bool = True,
+    parallel_cfg: Optional[Wan21T2VParallelConfig] = None,
+    target_object_words: Sequence[str] = tuple(),
+    target_verb_words: Sequence[str] = tuple(),
+    reuse_cross_attention_dir: Optional[str] = None,
+    reuse_head_trajectory_dynamics_dir: Optional[str] = None,
+    trajectory_consensus_stages: Sequence[str] = ("candidate_consensus", "head_contribution"),
+    trajectory_consensus_steps: Sequence[int] = tuple(),
+    trajectory_consensus_layers: Sequence[int] = tuple(),
+    trajectory_consensus_cross_heads: Optional[Sequence[str]] = tuple(),
+    trajectory_consensus_self_heads: Optional[Sequence[str]] = tuple(),
+    trajectory_consensus_modules: Sequence[str] = ("cross", "self"),
+    trajectory_consensus_branch: str = "cond",
+    trajectory_consensus_reference_distance_metrics: Sequence[str] = ("center_l2",),
+    trajectory_consensus_scatter_outlier_heads: Sequence[str] = tuple(),
+    trajectory_consensus_candidate_base_quantile: float = 0.85,
+    trajectory_consensus_candidate_split_quantiles: Sequence[float] = (0.92, 0.95, 0.97),
+    trajectory_consensus_candidate_smooth_radius: int = 1,
+    trajectory_consensus_candidate_stable_peak_min_levels: int = 2,
+    trajectory_consensus_candidate_peak_merge_distance: float = 2.0,
+    trajectory_consensus_candidate_preprocess_winsorize_quantile: float = 0.995,
+    trajectory_consensus_candidate_preprocess_despike_quantile: float = 0.98,
+    trajectory_consensus_candidate_min_component_area: int = 4,
+    trajectory_consensus_candidate_viz_num_frames: int = 8,
+    trajectory_consensus_do_ablation: bool = True,
+    trajectory_consensus_contribution_method: str = "exact_ablation",
+    trajectory_consensus_ablate_position: str = "pre_o",
+    trajectory_consensus_do_direct_proxy: bool = True,
+    trajectory_consensus_compute_direct_projection: Optional[bool] = None,
+    trajectory_consensus_object_mask_reference_step: int = 50,
+    trajectory_consensus_object_mask_reference_layer: int = 27,
+    trajectory_consensus_taylor_object_only: bool = True,
+    trajectory_consensus_taylor_num_latent_frames: int = 10,
+    trajectory_consensus_taylor_metric_scope: str = "obj",
+    trajectory_consensus_taylor_use_gradient_checkpointing: bool = True,
+    trajectory_consensus_plot_only_from_csv: bool = False,
+    trajectory_consensus_skip_existing_plots: bool = True,
+    trajectory_consensus_num_workers: int = 0,
+) -> Dict[str, object]:
+    """Run the trajectory-consensus-dynamics experiment."""
+    _ensure_dir(output_dir)
+    stages = [str(stage).strip().lower() for stage in trajectory_consensus_stages if str(stage).strip()]
+    stages = list(dict.fromkeys(stages))
+    allowed_stages = {"candidate_consensus", "head_contribution"}
+    bad_stages = [stage for stage in stages if stage not in allowed_stages]
+    if bad_stages:
+        raise ValueError(f"Unsupported trajectory_consensus stages: {bad_stages}")
+    if not stages:
+        raise ValueError("trajectory_consensus_stages must be non-empty.")
+    do_ablation = bool(trajectory_consensus_do_ablation)
+    contribution_method = str(trajectory_consensus_contribution_method).strip().lower()
+    if contribution_method not in {"exact_ablation", "taylor_approx"}:
+        raise ValueError(
+            "trajectory_consensus_contribution_method must be `exact_ablation` or `taylor_approx`."
+        )
+    ablate_position = str(trajectory_consensus_ablate_position).strip().lower()
+    if ablate_position not in {"pre_o", "post_o"}:
+        raise ValueError(
+            "trajectory_consensus_ablate_position must be `pre_o` or `post_o`."
+        )
+    do_direct_proxy = bool(trajectory_consensus_do_direct_proxy)
+    if trajectory_consensus_compute_direct_projection is not None:
+        do_direct_proxy = bool(trajectory_consensus_compute_direct_projection)
+    reference_distance_metrics = [
+        str(metric_name).strip()
+        for metric_name in trajectory_consensus_reference_distance_metrics
+        if str(metric_name).strip()
+    ]
+    if not reference_distance_metrics:
+        reference_distance_metrics = ["center_l2"]
+    scatter_outlier_heads = [
+        str(head_tag).strip()
+        for head_tag in trajectory_consensus_scatter_outlier_heads
+        if str(head_tag).strip()
+    ]
+    taylor_object_only = bool(trajectory_consensus_taylor_object_only)
+    taylor_num_latent_frames = int(trajectory_consensus_taylor_num_latent_frames)
+    taylor_metric_scope = str(trajectory_consensus_taylor_metric_scope).strip().lower()
+    taylor_use_gradient_checkpointing = bool(trajectory_consensus_taylor_use_gradient_checkpointing)
+    if taylor_num_latent_frames == 0:
+        raise ValueError("trajectory_consensus_taylor_num_latent_frames must be positive or -1.")
+    if taylor_num_latent_frames < -1:
+        raise ValueError("trajectory_consensus_taylor_num_latent_frames must be positive or -1.")
+    if taylor_metric_scope not in {"obj", "global"}:
+        raise ValueError("trajectory_consensus_taylor_metric_scope must be `obj` or `global`.")
+
+    head_contribution_base_dir = os.path.join(output_dir, "trajectory_consensus_head_contribution")
+    head_contribution_output_dirs: Dict[str, str] = {}
+    if do_ablation:
+        ablate_position_tag = str(ablate_position)
+        if contribution_method == "taylor_approx":
+            taylor_region_tag = "obj" if taylor_object_only else "global"
+            taylor_scope_tag = f"ablate_at_{taylor_region_tag}_{int(taylor_num_latent_frames)}frames"
+            patching_metric_tag = f"patching_metric_{str(taylor_metric_scope)}"
+            method_dir_name = (
+                f"taylor_approx-{ablate_position_tag}-"
+                f"{taylor_scope_tag}-{patching_metric_tag}"
+            )
+        else:
+            method_dir_name = f"{str(contribution_method)}-{ablate_position_tag}"
+        head_contribution_output_dirs[str(contribution_method)] = os.path.join(
+            head_contribution_base_dir,
+            method_dir_name,
+        )
+    if do_direct_proxy:
+        head_contribution_output_dirs["direct_proxy"] = os.path.join(
+            head_contribution_base_dir,
+            "direct_proxy",
+        )
+
+    mean_maps: Dict[Tuple[int, int, str], torch.Tensor] = {}
+    loaded_map_path = ""
+    object_words_in_maps: List[str] = []
+
+    need_cross_attention_maps = (
+        (not bool(trajectory_consensus_plot_only_from_csv))
+        or ("candidate_consensus" in stages and trajectory_consensus_cross_heads is not None)
+    )
+    can_load_cross_attention_maps = bool(reuse_cross_attention_dir) and bool(target_object_words)
+    if need_cross_attention_maps and (not can_load_cross_attention_maps):
+        raise ValueError(
+            "reuse_cross_attention_dir and target_object_words are required for this "
+            "trajectory_consensus_dynamics run."
+        )
+
+    if can_load_cross_attention_maps:
+        mean_maps, loaded_map_path = _load_wan21_t2v_cross_attention_mean_maps_from_disk(reuse_cross_attention_dir)
+        words_in_maps = sorted({str(key[2]) for key in mean_maps.keys()})
+        _load_wan21_t2v_cross_attention_token_meta(
+            output_dir=reuse_cross_attention_dir,
+            words_in_maps=words_in_maps,
+            target_object_words=target_object_words,
+            target_verb_words=target_verb_words,
+        )
+        object_words_in_maps = [str(word) for word in target_object_words if str(word) in words_in_maps]
+        if need_cross_attention_maps and (not object_words_in_maps):
+            raise ValueError(
+                "None of target_object_words are present in reused cross-attention maps. "
+                f"requested={list(target_object_words)} available={words_in_maps}"
+            )
+
+    if mean_maps:
+        selected_steps, selected_layers = _resolve_wan21_t2v_steps_and_layers_from_maps(
+            mean_maps=mean_maps,
+            requested_steps=trajectory_consensus_steps,
+            requested_layers=trajectory_consensus_layers,
+        )
+    else:
+        selected_steps = _dedup_wan21_t2v_int_list(trajectory_consensus_steps) if trajectory_consensus_steps else []
+        selected_layers = _dedup_wan21_t2v_int_list(trajectory_consensus_layers) if trajectory_consensus_layers else []
+
+    num_cross_heads_per_layer: Dict[int, int] = {}
+    if mean_maps and selected_steps and selected_layers:
+        exemplar_step = int(selected_steps[0])
+        for layer in selected_layers:
+            exemplar_cross_maps = _mean_wan21_t2v_head_maps_for_words(
+                mean_maps=mean_maps,
+                step=exemplar_step,
+                layer=int(layer),
+                words=object_words_in_maps,
+            )
+            if exemplar_cross_maps is not None:
+                num_cross_heads_per_layer[int(layer)] = int(exemplar_cross_maps.shape[0])
+
+    selected_cross_head_specs = _resolve_wan21_t2v_selected_head_specs_from_layer_counts(
+        explicit_head_specs=trajectory_consensus_cross_heads,
+        num_heads_per_layer=num_cross_heads_per_layer,
+    )
+    selected_self_head_specs: List[Tuple[int, int]] = []
+    summary: Dict[str, object] = {
+        "experiment": "wan21_t2v_trajectory_consensus_dynamics",
+        "loaded_map_path": loaded_map_path,
+        "stages": list(stages),
+        "selected_steps": list(selected_steps),
+        "selected_layers": list(selected_layers),
+        "selected_cross_head_specs": [f"L{layer}H{head}" for layer, head in selected_cross_head_specs],
+        "selected_self_head_specs": [],
+        "trajectory_consensus_do_ablation": bool(do_ablation),
+        "trajectory_consensus_do_direct_proxy": bool(do_direct_proxy),
+        "trajectory_consensus_reference_distance_metrics": list(reference_distance_metrics),
+        "trajectory_consensus_scatter_outlier_heads": list(scatter_outlier_heads),
+        "trajectory_consensus_head_contribution_output_dirs": dict(head_contribution_output_dirs),
+        "object_words_in_maps": list(object_words_in_maps),
+        "trajectory_consensus_contribution_method": str(contribution_method),
+        "trajectory_consensus_ablate_position": str(ablate_position),
+        "trajectory_consensus_taylor_object_only": bool(taylor_object_only),
+        "trajectory_consensus_taylor_num_latent_frames": int(taylor_num_latent_frames),
+        "trajectory_consensus_taylor_metric_scope": str(taylor_metric_scope),
+        "trajectory_consensus_taylor_use_gradient_checkpointing": bool(taylor_use_gradient_checkpointing),
+        "trajectory_consensus_plot_only_from_csv": bool(trajectory_consensus_plot_only_from_csv),
+        "trajectory_consensus_skip_existing_plots": bool(trajectory_consensus_skip_existing_plots),
+        "trajectory_consensus_num_workers": int(trajectory_consensus_num_workers),
+    }
+
+    candidate_region_rows: List[Dict[str, object]] = []
+    candidate_weight_rows: List[Dict[str, object]] = []
+    winner_gap_rows: List[Dict[str, object]] = []
+    candidate_region_cache: Dict[Tuple[int, int], Dict[str, object]] = {}
+    per_head_candidate_region_rows: List[Dict[str, object]] = []
+    per_head_candidate_region_cache: Dict[Tuple[int, int, int], Dict[str, object]] = {}
+    plot_paths: List[str] = []
+
+    if "candidate_consensus" in stages:
+        candidate_regions_pt_path = os.path.join(output_dir, "trajectory_consensus_candidate_regions.pt")
+        candidate_regions_csv_path = os.path.join(output_dir, "trajectory_consensus_candidate_regions.csv")
+        candidate_weights_csv_path = os.path.join(output_dir, "trajectory_consensus_candidate_weights.csv")
+        winner_gap_csv_path = os.path.join(output_dir, "trajectory_consensus_winner_gap.csv")
+        per_head_candidate_regions_pt_path = os.path.join(
+            output_dir,
+            "trajectory_consensus_candidate_regions_per_head.pt",
+        )
+        per_head_candidate_regions_csv_path = os.path.join(
+            output_dir,
+            "trajectory_consensus_candidate_regions_per_head.csv",
+        )
+
+        if bool(trajectory_consensus_plot_only_from_csv):
+            if not os.path.exists(candidate_regions_pt_path):
+                raise FileNotFoundError(
+                    f"trajectory_consensus_plot_only_from_csv=True but missing cached candidate regions: {candidate_regions_pt_path}"
+                )
+            loaded_candidate_cache = _load_wan21_t2v_torch_cache(candidate_regions_pt_path)
+            candidate_region_cache = {
+                (int(step), int(layer)): {
+                    "label_map_fhw": (
+                        torch.from_numpy(np.asarray(candidate_payload["label_map_fhw_np"])).to(torch.int64)
+                        if "label_map_fhw_np" in candidate_payload
+                        else candidate_payload["label_map_fhw"].detach().cpu().to(torch.int64)
+                    )
+                }
+                for (step, layer), candidate_payload in loaded_candidate_cache.items()
+            }
+            candidate_region_rows = _load_wan21_t2v_csv_rows(candidate_regions_csv_path)
+            candidate_weight_rows = _load_wan21_t2v_csv_rows(candidate_weights_csv_path)
+            winner_gap_rows = _load_wan21_t2v_csv_rows(winner_gap_csv_path)
+            if os.path.exists(per_head_candidate_regions_pt_path):
+                loaded_per_head_cache = _load_wan21_t2v_torch_cache(per_head_candidate_regions_pt_path)
+                per_head_candidate_region_cache = {
+                    (int(step), int(layer), int(head)): {
+                        "label_map_fhw": (
+                            torch.from_numpy(np.asarray(candidate_payload["label_map_fhw_np"])).to(torch.int64)
+                            if "label_map_fhw_np" in candidate_payload
+                            else candidate_payload["label_map_fhw"].detach().cpu().to(torch.int64)
+                        )
+                    }
+                    for (step, layer, head), candidate_payload in loaded_per_head_cache.items()
+                }
+            if os.path.exists(per_head_candidate_regions_csv_path):
+                per_head_candidate_region_rows = _load_wan21_t2v_csv_rows(per_head_candidate_regions_csv_path)
+        else:
+            extraction_tasks = []
+            for step in selected_steps:
+                for layer in selected_layers:
+                    headmean_map = _mean_wan21_t2v_headmean_map_for_words(
+                        mean_maps=mean_maps,
+                        step=int(step),
+                        layer=int(layer),
+                        words=object_words_in_maps,
+                    )
+                    if headmean_map is None:
+                        continue
+                    # IMPORTANT:
+                    # `avg_pool2d` inside `_smooth_wan21_t2v_map_fhw` can hang when executed
+                    # inside forked process-pool workers in this environment. We therefore
+                    # apply the optional smoothing on the parent process and pass
+                    # `smooth_radius=0` to the child worker.
+                    if int(trajectory_consensus_candidate_smooth_radius) > 0:
+                        worker_map_fhw = _smooth_wan21_t2v_map_fhw(
+                            headmean_map,
+                            smooth_radius=int(trajectory_consensus_candidate_smooth_radius),
+                        )
+                        worker_smooth_radius = 0
+                    else:
+                        worker_map_fhw = headmean_map
+                        worker_smooth_radius = 0
+                    extraction_tasks.append(
+                        (
+                            int(step),
+                            int(layer),
+                            worker_map_fhw,
+                            float(trajectory_consensus_candidate_base_quantile),
+                            tuple(float(x) for x in trajectory_consensus_candidate_split_quantiles),
+                            int(trajectory_consensus_candidate_min_component_area),
+                            int(worker_smooth_radius),
+                            int(trajectory_consensus_candidate_stable_peak_min_levels),
+                            float(trajectory_consensus_candidate_peak_merge_distance),
+                            float(trajectory_consensus_candidate_preprocess_winsorize_quantile),
+                            float(trajectory_consensus_candidate_preprocess_despike_quantile),
+                            int(trajectory_consensus_candidate_min_component_area),
+                        )
+                    )
+
+            effective_num_workers = _resolve_wan21_t2v_num_workers(
+                requested_num_workers=int(trajectory_consensus_num_workers),
+                task_count=int(len(extraction_tasks)),
+            )
+            extraction_progress_bar = None
+            if extraction_tasks:
+                try:
+                    from tqdm import tqdm
+                    extraction_progress_bar = tqdm(
+                        total=int(len(extraction_tasks)),
+                        desc="trajectory consensus candidate extraction",
+                        unit="item",
+                        leave=True,
+                    )
+                except Exception:
+                    extraction_progress_bar = None
+
+            try:
+                for step, layer, candidate_data in _iter_wan21_t2v_parallel_results(
+                    tasks=extraction_tasks,
+                    worker_fn=_trajectory_consensus_extract_candidate_task,
+                    num_workers=int(effective_num_workers),
+                ):
+                    head_maps = _mean_wan21_t2v_head_maps_for_words(
+                        mean_maps=mean_maps,
+                        step=int(step),
+                        layer=int(layer),
+                        words=object_words_in_maps,
+                    )
+                    if head_maps is None:
+                        if extraction_progress_bar is not None:
+                            extraction_progress_bar.update(1)
+                        continue
+                    candidate_data = dict(candidate_data)
+                    candidate_data["label_map_fhw"] = torch.from_numpy(
+                        np.asarray(candidate_data.pop("label_map_fhw_np"))
+                    ).to(torch.int64)
+                    candidate_region_cache[(int(step), int(layer))] = candidate_data
+                    label_map_fhw = candidate_data["label_map_fhw"]
+                    frame_metadata = candidate_data["frame_metadata"]
+                    frame_count = int(label_map_fhw.shape[0])
+                    for frame_index in range(frame_count):
+                        frame_candidates = frame_metadata[frame_index]
+                        for candidate_row in frame_candidates:
+                            candidate_region_rows.append({
+                                "step": int(step),
+                                "layer": int(layer),
+                                "frame": int(frame_index),
+                                "candidate_index": int(candidate_row["candidate_index"]),
+                                "area": int(candidate_row["area"]),
+                                "mass": float(candidate_row.get("mass", float("nan"))),
+                                "density": float(candidate_row.get("density", float("nan"))),
+                                "bbox_height": float(candidate_row.get("bbox_height", float("nan"))),
+                                "bbox_width": float(candidate_row.get("bbox_width", float("nan"))),
+                                "bbox_y_min": float(candidate_row.get("bbox_y_min", float("nan"))),
+                                "bbox_y_max": float(candidate_row.get("bbox_y_max", float("nan"))),
+                                "bbox_x_min": float(candidate_row.get("bbox_x_min", float("nan"))),
+                                "bbox_x_max": float(candidate_row.get("bbox_x_max", float("nan"))),
+                                "peak_y": float(candidate_row["peak_y"]),
+                                "peak_x": float(candidate_row["peak_x"]),
+                                "centroid_y": float(candidate_row["centroid_y"]),
+                                "centroid_x": float(candidate_row["centroid_x"]),
+                                "seed_y": float(candidate_row.get("seed_y", float("nan"))),
+                                "seed_x": float(candidate_row.get("seed_x", float("nan"))),
+                                "seed_score": float(candidate_row.get("seed_score", float("nan"))),
+                                "support_count": int(candidate_row.get("support_count", 0)),
+                                "support_level": float(candidate_row.get("support_level", float("nan"))),
+                                "candidate_count_in_frame": int(len(frame_candidates)),
+                            })
+
+                    per_head_weights: Dict[int, List[List[float]]] = {}
+                    for head_index in range(int(head_maps.shape[0])):
+                        probability_map = _normalize_wan21_t2v_attention_map_per_frame(head_maps[head_index])
+                        per_head_weights[int(head_index)] = _compute_wan21_t2v_candidate_weights_for_head_map(
+                            probability_map_fhw=probability_map,
+                            label_map_fhw=label_map_fhw,
+                        )
+                        for frame_index, frame_weights in enumerate(per_head_weights[int(head_index)]):
+                            for candidate_offset, weight_value in enumerate(frame_weights):
+                                candidate_weight_rows.append({
+                                    "step": int(step),
+                                    "layer": int(layer),
+                                    "head": int(head_index),
+                                    "head_tag": f"L{int(layer)}H{int(head_index)}",
+                                    "frame": int(frame_index),
+                                    "candidate_index": int(candidate_offset + 1),
+                                    "candidate_weight": float(weight_value),
+                                })
+
+                    num_heads = int(head_maps.shape[0])
+                    for frame_index in range(frame_count):
+                        candidate_count = int(label_map_fhw[frame_index].max().item())
+                        layer_mean_weights = []
+                        for candidate_index in range(candidate_count):
+                            head_values = [
+                                per_head_weights[head_index][frame_index][candidate_index]
+                                for head_index in range(num_heads)
+                                if candidate_index < len(per_head_weights[head_index][frame_index])
+                            ]
+                            layer_mean_weights.append(float(sum(head_values) / max(1, len(head_values))))
+                        if not layer_mean_weights:
+                            continue
+                        sorted_weights = sorted(layer_mean_weights, reverse=True)
+                        top1 = float(sorted_weights[0])
+                        top2 = float(sorted_weights[1]) if len(sorted_weights) >= 2 else 0.0
+                        probability = torch.tensor(layer_mean_weights, dtype=torch.float32)
+                        probability = probability / probability.sum().clamp_min(1e-12)
+                        candidate_entropy = float(
+                            -(probability * probability.clamp_min(1e-12).log()).sum().item()
+                        )
+                        winner_gap_rows.append({
+                            "step": int(step),
+                            "layer": int(layer),
+                            "frame": int(frame_index),
+                            "candidate_count": int(candidate_count),
+                            "winner_gap": float(top1 - top2),
+                            "winner_weight": float(top1),
+                            "runner_up_weight": float(top2),
+                            "candidate_entropy": float(candidate_entropy),
+                        })
+
+                    if extraction_progress_bar is not None:
+                        extraction_progress_bar.update(1)
+            finally:
+                if extraction_progress_bar is not None:
+                    extraction_progress_bar.close()
+
+            candidate_region_cache_to_save = {
+                (int(step), int(layer)): {
+                    "label_map_fhw": candidate_data["label_map_fhw"].detach().cpu().to(torch.int16),
+                }
+                for (step, layer), candidate_data in candidate_region_cache.items()
+            }
+            torch.save(candidate_region_cache_to_save, candidate_regions_pt_path)
+            _save_csv(candidate_regions_csv_path, candidate_region_rows)
+            _save_csv(candidate_weights_csv_path, candidate_weight_rows)
+            _save_csv(winner_gap_csv_path, winner_gap_rows)
+
+        per_head_specs_by_layer: Dict[int, List[int]] = defaultdict(list)
+        for layer_index, head_index in selected_cross_head_specs:
+            if int(layer_index) not in selected_layers:
+                continue
+            per_head_specs_by_layer[int(layer_index)].append(int(head_index))
+
+        per_head_extraction_tasks = []
+        per_head_extraction_result_count = 0
+        for step in selected_steps:
+            for layer_index in selected_layers:
+                selected_head_indices = sorted(
+                    {
+                        int(head_index)
+                        for head_index in per_head_specs_by_layer.get(int(layer_index), [])
+                        if (int(step), int(layer_index), int(head_index)) not in per_head_candidate_region_cache
+                    }
+                )
+                if not selected_head_indices:
+                    continue
+                head_maps = _mean_wan21_t2v_head_maps_for_words(
+                    mean_maps=mean_maps,
+                    step=int(step),
+                    layer=int(layer_index),
+                    words=object_words_in_maps,
+                )
+                if head_maps is None:
+                    continue
+                head_payloads = []
+                for head_index in selected_head_indices:
+                    if int(head_index) >= int(head_maps.shape[0]):
+                        continue
+                    # IMPORTANT:
+                    # Keep the per-head path consistent with head-mean extraction.
+                    # `avg_pool2d` inside `_smooth_wan21_t2v_map_fhw` can hang in
+                    # forked workers in this environment, so optional smoothing must
+                    # happen on the parent process before we dispatch worker tasks.
+                    if int(trajectory_consensus_candidate_smooth_radius) > 0:
+                        worker_map_fhw = _smooth_wan21_t2v_map_fhw(
+                            head_maps[int(head_index)],
+                            smooth_radius=int(trajectory_consensus_candidate_smooth_radius),
+                        )
+                        worker_smooth_radius = 0
+                    else:
+                        worker_map_fhw = head_maps[int(head_index)]
+                        worker_smooth_radius = 0
+                    head_payloads.append((int(head_index), worker_map_fhw))
+                if not head_payloads:
+                    continue
+                per_head_extraction_result_count += int(len(head_payloads))
+                per_head_extraction_tasks.append(
+                    (
+                        int(step),
+                        int(layer_index),
+                        tuple(head_payloads),
+                        float(trajectory_consensus_candidate_base_quantile),
+                        tuple(float(x) for x in trajectory_consensus_candidate_split_quantiles),
+                        int(trajectory_consensus_candidate_min_component_area),
+                        int(worker_smooth_radius),
+                        int(trajectory_consensus_candidate_stable_peak_min_levels),
+                        float(trajectory_consensus_candidate_peak_merge_distance),
+                        float(trajectory_consensus_candidate_preprocess_winsorize_quantile),
+                        float(trajectory_consensus_candidate_preprocess_despike_quantile),
+                        int(trajectory_consensus_candidate_min_component_area),
+                    )
+                )
+
+        per_head_extraction_progress_bar = None
+        if per_head_extraction_tasks:
+            try:
+                from tqdm import tqdm
+                per_head_extraction_progress_bar = tqdm(
+                    total=int(per_head_extraction_result_count),
+                    desc="trajectory consensus per-head candidate extraction",
+                    unit="head",
+                    leave=True,
+                )
+            except Exception:
+                per_head_extraction_progress_bar = None
+        try:
+            effective_num_workers = _resolve_wan21_t2v_num_workers(
+                requested_num_workers=int(trajectory_consensus_num_workers),
+                task_count=int(len(per_head_extraction_tasks)),
+            )
+            for step, layer, head_results in _iter_wan21_t2v_parallel_results(
+                tasks=per_head_extraction_tasks,
+                worker_fn=_trajectory_consensus_extract_layer_head_candidates_task,
+                num_workers=int(effective_num_workers),
+            ):
+                for head, candidate_data in head_results:
+                    candidate_data = dict(candidate_data)
+                    label_map_fhw = torch.from_numpy(
+                        np.asarray(candidate_data.pop("label_map_fhw_np"))
+                    ).to(torch.int64)
+                    per_head_candidate_region_cache[(int(step), int(layer), int(head))] = {
+                        "label_map_fhw": label_map_fhw,
+                    }
+                    frame_metadata = candidate_data["frame_metadata"]
+                    for frame_index, frame_candidates in enumerate(frame_metadata):
+                        for candidate_row in frame_candidates:
+                            per_head_candidate_region_rows.append({
+                                "step": int(step),
+                                "layer": int(layer),
+                                "head": int(head),
+                                "head_tag": f"L{int(layer)}H{int(head)}",
+                                "frame": int(frame_index),
+                                "candidate_index": int(candidate_row["candidate_index"]),
+                                "area": int(candidate_row["area"]),
+                                "mass": float(candidate_row.get("mass", float("nan"))),
+                                "density": float(candidate_row.get("density", float("nan"))),
+                                "bbox_height": float(candidate_row.get("bbox_height", float("nan"))),
+                                "bbox_width": float(candidate_row.get("bbox_width", float("nan"))),
+                                "peak_y": float(candidate_row["peak_y"]),
+                                "peak_x": float(candidate_row["peak_x"]),
+                                "centroid_y": float(candidate_row["centroid_y"]),
+                                "centroid_x": float(candidate_row["centroid_x"]),
+                                "seed_y": float(candidate_row.get("seed_y", float("nan"))),
+                                "seed_x": float(candidate_row.get("seed_x", float("nan"))),
+                                "seed_score": float(candidate_row.get("seed_score", float("nan"))),
+                                "support_count": int(candidate_row.get("support_count", 0)),
+                                "support_level": float(candidate_row.get("support_level", float("nan"))),
+                                "candidate_count_in_frame": int(len(frame_candidates)),
+                            })
+                    if per_head_extraction_progress_bar is not None:
+                        per_head_extraction_progress_bar.update(1)
+        finally:
+            if per_head_extraction_progress_bar is not None:
+                per_head_extraction_progress_bar.close()
+
+        if per_head_candidate_region_rows:
+            per_head_candidate_region_rows = sorted(
+                per_head_candidate_region_rows,
+                key=lambda row: (
+                    int(row["step"]),
+                    int(row["layer"]),
+                    int(row["head"]),
+                    int(row["frame"]),
+                    int(row["candidate_index"]),
+                ),
+            )
+            _save_csv(per_head_candidate_regions_csv_path, per_head_candidate_region_rows)
+        if per_head_candidate_region_cache:
+            per_head_candidate_region_cache_to_save = {
+                (int(step), int(layer), int(head)): {
+                    "label_map_fhw": candidate_data["label_map_fhw"].detach().cpu().to(torch.int16),
+                }
+                for (step, layer, head), candidate_data in per_head_candidate_region_cache.items()
+            }
+            torch.save(per_head_candidate_region_cache_to_save, per_head_candidate_regions_pt_path)
+
+        plot_paths.extend(
+            _render_wan21_t2v_candidate_consensus_plots(
+                output_dir,
+                winner_gap_rows,
+                skip_existing_plots=bool(trajectory_consensus_skip_existing_plots),
+            )
+        )
+
+        candidate_viz_tasks = []
+        head_specific_candidate_viz_tasks = []
+        for step in selected_steps:
+            for layer_index in selected_layers:
+                candidate_data = candidate_region_cache.get((int(step), int(layer_index)))
+                if candidate_data is None:
+                    continue
+
+                headmean_map = _mean_wan21_t2v_headmean_map_for_words(
+                    mean_maps=mean_maps,
+                    step=int(step),
+                    layer=int(layer_index),
+                    words=object_words_in_maps,
+                )
+                if headmean_map is not None:
+                    frame_indices = _resolve_wan21_t2v_candidate_viz_frame_indices(
+                        frame_count=int(headmean_map.shape[0]),
+                        num_frames=int(trajectory_consensus_candidate_viz_num_frames),
+                    )
+                    save_file = os.path.join(
+                        output_dir,
+                        "trajectory_consensus_candidate_region_viz",
+                        f"step_{int(step):03d}",
+                        f"layer_{int(layer_index):02d}_head_mean.pdf",
+                    )
+                    contour_save_file = os.path.join(
+                        output_dir,
+                        "trajectory_consensus_candidate_region_viz",
+                        f"step_{int(step):03d}",
+                        f"layer_{int(layer_index):02d}_head_mean_contour.pdf",
+                    )
+                    skip_standard = _maybe_skip_wan21_t2v_existing_plot(
+                        save_file,
+                        bool(trajectory_consensus_skip_existing_plots),
+                    )
+                    skip_contour = _maybe_skip_wan21_t2v_existing_plot(
+                        contour_save_file,
+                        bool(trajectory_consensus_skip_existing_plots),
+                    )
+                    if skip_standard:
+                        plot_paths.append(save_file)
+                    if skip_contour:
+                        plot_paths.append(contour_save_file)
+                    if (not skip_standard) or (not skip_contour):
+                        raw_map_np, label_map_np = _pack_wan21_t2v_candidate_viz_arrays(
+                            raw_map_fhw=headmean_map,
+                            label_map_fhw=candidate_data["label_map_fhw"],
+                        )
+                    if not skip_standard:
+                        candidate_viz_tasks.append(
+                            (
+                                raw_map_np,
+                                label_map_np,
+                                save_file,
+                                f"Candidate regions | step={int(step)} layer={int(layer_index)} head=mean",
+                                frame_indices,
+                                False,
+                                "magma",
+                            )
+                        )
+                    if not skip_contour:
+                        candidate_viz_tasks.append(
+                            (
+                                raw_map_np,
+                                label_map_np,
+                                contour_save_file,
+                                (
+                                    f"Candidate regions with contours | step={int(step)} "
+                                    f"layer={int(layer_index)} head=mean"
+                                ),
+                                frame_indices,
+                                True,
+                                "magma",
+                            )
+                        )
+
+            if selected_cross_head_specs:
+                for layer_index, head_index in selected_cross_head_specs:
+                    if int(layer_index) not in selected_layers:
+                        continue
+                    head_maps = _mean_wan21_t2v_head_maps_for_words(
+                        mean_maps=mean_maps,
+                        step=int(step),
+                        layer=int(layer_index),
+                        words=object_words_in_maps,
+                    )
+                    if head_maps is None or int(head_index) >= int(head_maps.shape[0]):
+                        continue
+                    frame_indices = _resolve_wan21_t2v_candidate_viz_frame_indices(
+                        frame_count=int(head_maps.shape[1]),
+                        num_frames=int(trajectory_consensus_candidate_viz_num_frames),
+                    )
+                    save_file = os.path.join(
+                        output_dir,
+                        "trajectory_consensus_candidate_region_viz",
+                        f"step_{int(step):03d}",
+                        f"layer_{int(layer_index):02d}_head_{int(head_index):02d}.pdf",
+                    )
+                    contour_save_file = os.path.join(
+                        output_dir,
+                        "trajectory_consensus_candidate_region_viz",
+                        f"step_{int(step):03d}",
+                        f"layer_{int(layer_index):02d}_head_{int(head_index):02d}_contour.pdf",
+                    )
+                    skip_standard = _maybe_skip_wan21_t2v_existing_plot(
+                        save_file,
+                        bool(trajectory_consensus_skip_existing_plots),
+                    )
+                    skip_contour = _maybe_skip_wan21_t2v_existing_plot(
+                        contour_save_file,
+                        bool(trajectory_consensus_skip_existing_plots),
+                    )
+                    if skip_standard:
+                        plot_paths.append(save_file)
+                    if skip_contour:
+                        plot_paths.append(contour_save_file)
+                    if skip_standard and skip_contour:
+                        continue
+                    head_candidate_data = per_head_candidate_region_cache.get(
+                        (int(step), int(layer_index), int(head_index))
+                    )
+                    if head_candidate_data is None:
+                        continue
+                    raw_map_np, label_map_np = _pack_wan21_t2v_candidate_viz_arrays(
+                        raw_map_fhw=head_maps[int(head_index)],
+                        label_map_fhw=head_candidate_data["label_map_fhw"],
+                    )
+                    if not skip_standard:
+                        head_specific_candidate_viz_tasks.append(
+                            (
+                                raw_map_np,
+                                label_map_np,
+                                save_file,
+                                (
+                                    f"Candidate regions | step={int(step)} "
+                                    f"layer={int(layer_index)} head={int(head_index)}"
+                                ),
+                                frame_indices,
+                                False,
+                                "magma",
+                            )
+                        )
+                    if not skip_contour:
+                        head_specific_candidate_viz_tasks.append(
+                            (
+                                raw_map_np,
+                                label_map_np,
+                                contour_save_file,
+                                (
+                                    f"Candidate regions with contours | step={int(step)} "
+                                    f"layer={int(layer_index)} head={int(head_index)}"
+                                ),
+                                frame_indices,
+                                True,
+                                "magma",
+                            )
+                        )
+        viz_progress_bar = None
+        if candidate_viz_tasks:
+            try:
+                from tqdm import tqdm
+                viz_progress_bar = tqdm(
+                    total=int(len(candidate_viz_tasks)),
+                    desc="trajectory consensus candidate viz",
+                    unit="plot",
+                    leave=True,
+                )
+            except Exception:
+                viz_progress_bar = None
+        try:
+            effective_num_workers = _resolve_wan21_t2v_num_workers(
+                requested_num_workers=int(trajectory_consensus_num_workers),
+                task_count=int(len(candidate_viz_tasks)),
+            )
+            for plot_path in _iter_wan21_t2v_parallel_results(
+                tasks=candidate_viz_tasks,
+                worker_fn=_trajectory_consensus_render_candidate_viz_task,
+                num_workers=int(effective_num_workers),
+            ):
+                if plot_path:
+                    plot_paths.append(plot_path)
+                if viz_progress_bar is not None:
+                    viz_progress_bar.update(1)
+        finally:
+            if viz_progress_bar is not None:
+                viz_progress_bar.close()
+
+        head_viz_progress_bar = None
+        if head_specific_candidate_viz_tasks:
+            try:
+                from tqdm import tqdm
+                head_viz_progress_bar = tqdm(
+                    total=int(len(head_specific_candidate_viz_tasks)),
+                    desc="trajectory consensus per-head candidate viz",
+                    unit="plot",
+                    leave=True,
+                )
+            except Exception:
+                head_viz_progress_bar = None
+        try:
+            effective_num_workers = _resolve_wan21_t2v_num_workers(
+                requested_num_workers=int(trajectory_consensus_num_workers),
+                task_count=int(len(head_specific_candidate_viz_tasks)),
+            )
+            for plot_path in _iter_wan21_t2v_parallel_results(
+                tasks=head_specific_candidate_viz_tasks,
+                worker_fn=_trajectory_consensus_render_head_specific_candidate_viz_task,
+                num_workers=int(effective_num_workers),
+            ):
+                if plot_path:
+                    plot_paths.append(plot_path)
+                if head_viz_progress_bar is not None:
+                    head_viz_progress_bar.update(1)
+        finally:
+            if head_viz_progress_bar is not None:
+                head_viz_progress_bar.close()
+
+    head_contribution_rows_by_method: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    scatter_rows_by_method: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+
+    if "head_contribution" in stages:
+        contribution_branch = str(trajectory_consensus_branch).strip().lower()
+        if contribution_branch not in {"cond", "uncond"}:
+            raise ValueError(
+                "trajectory_consensus_branch must be `cond` or `uncond` for head_contribution."
+            )
+
+        early_alignment_summaries = _load_wan21_t2v_reference_distance_summaries(
+            reuse_head_trajectory_dynamics_dir=reuse_head_trajectory_dynamics_dir,
+            distance_metrics=reference_distance_metrics,
+            selected_steps=selected_steps,
+        )
+        legacy_head_contribution_csv_path = os.path.join(output_dir, "trajectory_consensus_head_contribution.csv")
+
+        if bool(trajectory_consensus_plot_only_from_csv):
+            for analysis_method, method_output_dir in sorted(head_contribution_output_dirs.items()):
+                method_csv_path = os.path.join(method_output_dir, "trajectory_consensus_head_contribution.csv")
+                head_contribution_csv_read_path = method_csv_path
+                use_legacy_head_contribution_csv = False
+                if (not os.path.exists(head_contribution_csv_read_path)) and os.path.exists(legacy_head_contribution_csv_path):
+                    head_contribution_csv_read_path = legacy_head_contribution_csv_path
+                    use_legacy_head_contribution_csv = True
+                if not os.path.exists(head_contribution_csv_read_path):
+                    raise FileNotFoundError(
+                        "trajectory_consensus_plot_only_from_csv=True but missing cached "
+                        f"head contribution CSV: {method_csv_path}"
+                    )
+                method_rows = _load_wan21_t2v_csv_rows(head_contribution_csv_read_path)
+                if use_legacy_head_contribution_csv:
+                    method_rows = [
+                        row for row in method_rows
+                        if str(row.get("analysis_method", "")).strip().lower() == str(analysis_method)
+                    ]
+                for row in method_rows:
+                    _apply_wan21_t2v_abs_to_ablation_contribution_row(row)
+                    head_contribution_rows_by_method[str(analysis_method)].append(row)
+                    layer = int(row["layer"])
+                    head = int(row["head"])
+                    alignment_key = (int(layer), int(head))
+                    if str(row.get("module", "")).strip().lower() == "cross":
+                        loaded_method = str(row.get("analysis_method", "")).strip().lower()
+                        if loaded_method == "exact_ablation":
+                            metric_names = ("cos_obj", "cos_full", "ablate_cos_obj", "ablate_cos_full")
+                        elif loaded_method == "taylor_approx":
+                            metric_names = ("contribution",)
+                        elif loaded_method == "direct_proxy":
+                            metric_names = ("proj_dot_obj", "proj_dot_full", "proj_cos_obj", "proj_cos_full")
+                        else:
+                            metric_names = tuple()
+                        for alignment_metric_name, early_alignment_summary in early_alignment_summaries.items():
+                            if alignment_key not in early_alignment_summary:
+                                continue
+                            for metric_name in metric_names:
+                                _append_wan21_t2v_alignment_scatter_row(
+                                    scatter_rows_by_method[str(analysis_method)],
+                                    alignment_metric_name=str(alignment_metric_name),
+                                    analysis_method=loaded_method,
+                                    module_name=str(row["module"]),
+                                    branch_name=str(row["branch"]),
+                                    metric_name=str(metric_name),
+                                    head_tag=str(row["head_tag"]),
+                                    step=int(row["step"]),
+                                    metric_value=row.get(metric_name, ""),
+                                    alignment_summary=early_alignment_summary[alignment_key],
+                                )
+                plot_paths.extend(
+                    _render_wan21_t2v_head_contribution_plots(
+                        method_output_dir,
+                        head_contribution_rows_by_method[str(analysis_method)],
+                        scatter_rows_by_method[str(analysis_method)],
+                        scatter_outlier_heads=scatter_outlier_heads,
+                        skip_existing_plots=bool(trajectory_consensus_skip_existing_plots),
+                    )
+                )
+        else:
+            reference_support = _build_wan21_t2v_self_attention_distribution_reference_support(
+                reuse_cross_attention_dir=reuse_cross_attention_dir,
+                target_object_words=target_object_words,
+                target_verb_words=target_verb_words,
+                reference_step=int(trajectory_consensus_object_mask_reference_step),
+                reference_layer=int(trajectory_consensus_object_mask_reference_layer),
+                center_mode="geometric_center",
+                center_power=1.5,
+                center_quantile=0.8,
+                preprocess_winsorize_quantile=0.995,
+                preprocess_despike_quantile=0.98,
+                preprocess_min_component_area=2,
+                support_radius_mode="adaptive_area",
+                support_radius_fixed=2.0,
+                support_radius_alpha=1.5,
+                support_radius_min=1.0,
+                support_radius_max_ratio=0.25,
+            )
+
+            parallel_cfg = parallel_cfg or Wan21T2VParallelConfig()
+            runtime = _init_wan21_t2v_runtime(parallel_cfg, explicit_device_id=device_id)
+            seed = _broadcast_seed_if_needed(seed, runtime)
+            pipeline, _ = _build_wan21_t2v_pipeline(
+                wan21_root=wan21_root,
+                ckpt_dir=ckpt_dir,
+                task=task,
+                runtime=runtime,
+                parallel_cfg=parallel_cfg,
+            )
+            offload_model = _resolve_wan21_t2v_offload_model(runtime, offload_model)
+            target_model = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+            num_self_heads_per_layer = {
+                int(layer): int(target_model.blocks[int(layer)].self_attn.num_heads)
+                for layer in selected_layers
+            }
+            selected_self_head_specs = _resolve_wan21_t2v_selected_head_specs_from_layer_counts(
+                explicit_head_specs=trajectory_consensus_self_heads,
+                num_heads_per_layer=num_self_heads_per_layer,
+            )
+            object_mask_vpred = _upsample_wan21_t2v_token_mask_to_vpred(
+                token_mask_fhw=reference_support["support_mask_fhw"],
+                patch_size=tuple(int(x) for x in target_model.patch_size),
+            )
+            object_mask_vpred = object_mask_vpred.float().cpu()
+            object_token_mask_fhw = reference_support["support_mask_fhw"].detach().float().cpu()
+            latent_frame_count = int(object_token_mask_fhw.shape[0])
+            selected_latent_frame_indices = (
+                list(range(latent_frame_count))
+                if int(taylor_num_latent_frames) < 0
+                else _resolve_wan21_t2v_candidate_viz_frame_indices(
+                    frame_count=latent_frame_count,
+                    num_frames=int(taylor_num_latent_frames),
+                )
+            )
+            taylor_token_mask_fhw = _subset_wan21_t2v_token_mask_by_frames(
+                token_mask_fhw=object_token_mask_fhw,
+                selected_frame_indices=selected_latent_frame_indices,
+            )
+            taylor_object_mask_vpred = _upsample_wan21_t2v_token_mask_to_vpred(
+                token_mask_fhw=taylor_token_mask_fhw,
+                patch_size=tuple(int(x) for x in target_model.patch_size),
+            ).float().cpu()
+            taylor_token_indices = _token_grid_mask_to_wan21_t2v_sequence_indices(taylor_token_mask_fhw)
+
+            clean_cache: Dict[Tuple[int, str], torch.Tensor] = {}
+            selected_modules = [str(module).strip().lower() for module in trajectory_consensus_modules if str(module).strip()]
+            selected_modules = list(dict.fromkeys(selected_modules))
+            for module_name in selected_modules:
+                if module_name not in {"cross", "self"}:
+                    raise ValueError(f"Unsupported trajectory_consensus module: {module_name}")
+            module_to_specs = {
+                "cross": [(layer, head) for layer, head in selected_cross_head_specs if int(layer) in selected_layers],
+                "self": [(layer, head) for layer, head in selected_self_head_specs if int(layer) in selected_layers],
+            }
+            summary["selected_self_head_specs"] = [f"L{layer}H{head}" for layer, head in selected_self_head_specs]
+            selected_targets: Dict[int, Tuple[str, ...]] = {}
+            for module_name in selected_modules:
+                specs_in_scope = module_to_specs.get(module_name, [])
+                if not specs_in_scope:
+                    continue
+                for layer_index in sorted(set(int(layer) for layer, _ in specs_in_scope)):
+                    selected_targets.setdefault(int(layer_index), [])
+                    if str(module_name) not in selected_targets[int(layer_index)]:
+                        selected_targets[int(layer_index)].append(str(module_name))
+            selected_targets = {
+                int(layer): tuple(sorted(modules))
+                for layer, modules in selected_targets.items()
+                if modules
+            }
+            step_latent_cache: Dict[int, Dict[str, Any]] = {}
+            if selected_targets and (do_ablation or do_direct_proxy):
+                step_latent_cache = _run_wan21_t2v_collect_target_step_latents(
+                    pipeline=pipeline,
+                    prompt=prompt,
+                    size=size,
+                    frame_num=frame_num,
+                    shift=shift,
+                    sample_solver=sample_solver,
+                    sampling_steps=sampling_steps,
+                    guide_scale=guide_scale,
+                    seed=seed,
+                    target_steps=selected_steps,
+                    offload_model=offload_model,
+                )
+
+            num_row_methods = int(do_ablation) + int(do_direct_proxy)
+            total_head_tasks = int(
+                sum(len(selected_steps) * len(module_to_specs.get(module_name, [])) for module_name in selected_modules)
+                * max(0, num_row_methods)
+            )
+            contribution_progress_bar = None
+            if total_head_tasks > 0:
+                try:
+                    from tqdm import tqdm
+                    contribution_progress_bar = tqdm(
+                        total=int(total_head_tasks),
+                        desc="trajectory consensus head contribution",
+                        unit="head",
+                        leave=True,
+                    )
+                except Exception:
+                    contribution_progress_bar = None
+            try:
+                for step in selected_steps:
+                    step_latent_state = None
+                    branch_context = None
+                    taylor_metrics_by_layer_module: Dict[Tuple[int, str], Dict[str, torch.Tensor]] = {}
+                    all_proxy_metrics: Dict[Tuple[int, str], Dict[str, torch.Tensor]] = {}
+                    if int(step) in step_latent_cache:
+                        step_latent_state = step_latent_cache[int(step)]
+                        branch_context = (
+                            step_latent_state["context"]
+                            if str(contribution_branch) == "cond"
+                            else step_latent_state["context_null"]
+                        )
+
+                    if do_ablation and contribution_method == "taylor_approx":
+                        if selected_targets:
+                            global_attribution_state = _run_wan21_t2v_global_attribution_clean_forward(
+                                pipeline=pipeline,
+                                latent_input=step_latent_state["latent_input"],
+                                timestep_value=step_latent_state["timestep"],
+                                seq_len=int(step_latent_state["seq_len"]),
+                                context=branch_context,
+                                branch=str(contribution_branch),
+                                target_step=1,
+                                selected_targets=selected_targets,
+                                attribution_position=str(ablate_position),
+                                token_indices=taylor_token_indices if taylor_object_only else None,
+                                use_gradient_checkpointing=bool(taylor_use_gradient_checkpointing),
+                                offload_model=offload_model,
+                            )
+                            if global_attribution_state.captured_clean_vpred is None:
+                                raise RuntimeError(f"Failed to capture global attribution clean v_pred for step={step}.")
+                            clean_vpred_device = global_attribution_state.captured_clean_vpred
+                            metric_mask_vpred = object_mask_vpred if str(taylor_metric_scope) == "obj" else None
+                            target_model.zero_grad(set_to_none=True)
+                            if metric_mask_vpred is not None:
+                                metric_mask_device = metric_mask_vpred.to(
+                                    device=clean_vpred_device.device,
+                                    dtype=clean_vpred_device.dtype,
+                                ).unsqueeze(0)
+                                scalar_metric = (clean_vpred_device * metric_mask_device).sum()
+                            else:
+                                scalar_metric = clean_vpred_device.sum()
+                            scalar_metric.backward(retain_graph=False)
+                            for key, head_writes in global_attribution_state.captured_head_writes.items():
+                                grad_obj = global_attribution_state.captured_head_writes_grad_obj.get(key, None)
+                                if grad_obj is None:
+                                    raise RuntimeError(
+                                        f"Missing global object attribution gradient for step={step}, layer={key[0]}, module={key[1]}."
+                                    )
+                                taylor_metrics_by_layer_module[key] = _compute_wan21_t2v_taylor_contribution_metrics(
+                                    head_writes=head_writes,
+                                    head_writes_grad=grad_obj,
+                                )
+                            if offload_model:
+                                pipeline.model.cpu()
+                                torch.cuda.empty_cache()
+
+                    if do_direct_proxy and selected_targets:
+                        global_proxy_state = _run_wan21_t2v_global_direct_proxy_clean_forward(
+                            pipeline=pipeline,
+                            latent_input=step_latent_state["latent_input"],
+                            timestep_value=step_latent_state["timestep"],
+                            seq_len=int(step_latent_state["seq_len"]),
+                            context=branch_context,
+                            branch=str(contribution_branch),
+                            target_step=1,
+                            selected_targets=selected_targets,
+                            offload_model=offload_model,
+                        )
+                        if (
+                            global_proxy_state.captured_clean_vpred is None
+                            or global_proxy_state.captured_head_e is None
+                            or global_proxy_state.captured_grid_sizes is None
+                        ):
+                            raise RuntimeError(f"Failed to capture global direct proxy state for step={step}.")
+                        all_proxy_metrics = _compute_wan21_t2v_global_direct_proxy_metrics(
+                            pipeline=pipeline,
+                            clean_vpred=global_proxy_state.captured_clean_vpred,
+                            post_o_head_writes=global_proxy_state.captured_post_o_head_writes,
+                            head_e=global_proxy_state.captured_head_e,
+                            grid_sizes=global_proxy_state.captured_grid_sizes,
+                            object_mask_fhw=object_mask_vpred,
+                        )
+
+                    for module_name in selected_modules:
+                        specs_in_scope = module_to_specs.get(module_name, [])
+                        if not specs_in_scope:
+                            continue
+                        layers_in_scope = sorted(set(int(layer) for layer, _ in specs_in_scope))
+                        for layer in layers_in_scope:
+                            layer_head_specs = [(int(l), int(h)) for l, h in specs_in_scope if int(l) == int(layer)]
+                            if not layer_head_specs:
+                                continue
+                            clean_key = (int(step), str(contribution_branch))
+                            if (
+                                do_ablation
+                                and contribution_method == "exact_ablation"
+                                and clean_key not in clean_cache
+                            ):
+                                if step_latent_state is None or branch_context is None:
+                                    raise RuntimeError(f"Missing cached step latent for exact ablation at step={step}.")
+                                clean_cache[clean_key] = _run_wan21_t2v_local_clean_vpred(
+                                    pipeline=pipeline,
+                                    latent_input=step_latent_state["latent_input"],
+                                    timestep_value=step_latent_state["timestep"],
+                                    seq_len=int(step_latent_state["seq_len"]),
+                                    context=branch_context,
+                                )
+
+                            for _, head in layer_head_specs:
+                                head = int(head)
+                                alignment_key = (int(layer), int(head))
+                                if do_ablation and contribution_method == "exact_ablation":
+                                    if step_latent_state is None or branch_context is None:
+                                        raise RuntimeError(f"Missing cached step latent for exact ablation at step={step}.")
+                                    clean_vpred = clean_cache[(int(step), str(contribution_branch))]
+                                    ablate_state = _run_wan21_t2v_local_contribution_forward(
+                                        pipeline=pipeline,
+                                        latent_input=step_latent_state["latent_input"],
+                                        timestep_value=step_latent_state["timestep"],
+                                        seq_len=int(step_latent_state["seq_len"]),
+                                        context=branch_context,
+                                        branch=str(contribution_branch),
+                                        target_layer=int(layer),
+                                        target_head=int(head),
+                                        target_module=str(module_name),
+                                        ablate_position=str(ablate_position),
+                                        ablate_head=True,
+                                        capture_selected_head_write=False,
+                                    )
+                                    if ablate_state.captured_vpred is None:
+                                        raise RuntimeError(
+                                            f"Failed to capture ablated v_pred for step={step}, layer={layer}, head={head}, module={module_name}."
+                                        )
+                                    ablated_vpred = ablate_state.captured_vpred
+                                    delta_vpred = clean_vpred - ablated_vpred
+                                    metric_values = _compute_wan21_t2v_contribution_metrics(
+                                        delta_vpred=delta_vpred,
+                                        clean_vpred=clean_vpred,
+                                        object_mask_fhw=object_mask_vpred,
+                                        ablated_vpred=ablated_vpred,
+                                    )
+                                    row = {
+                                        "step": int(step),
+                                        "layer": int(layer),
+                                        "head": int(head),
+                                        "head_tag": f"L{int(layer)}H{int(head)}",
+                                        "module": str(module_name),
+                                        "branch": str(contribution_branch),
+                                        "analysis_method": "exact_ablation",
+                                        "contribution_method": str(contribution_method),
+                                        "contribution": "",
+                                        "cos_full": float(metric_values["cos_full"]),
+                                        "dot_full": float(metric_values["dot_full"]),
+                                        "cos_obj": float(metric_values["cos_obj"]),
+                                        "dot_obj": float(metric_values["dot_obj"]),
+                                        "ablate_cos_full": float(metric_values["ablate_cos_full"]),
+                                        "ablate_dot_full": float(metric_values["ablate_dot_full"]),
+                                        "ablate_cos_obj": float(metric_values["ablate_cos_obj"]),
+                                        "ablate_dot_obj": float(metric_values["ablate_dot_obj"]),
+                                        "proj_cos_full": "",
+                                        "proj_dot_full": "",
+                                        "proj_cos_obj": "",
+                                        "proj_dot_obj": "",
+                                        "proj_share_full": "",
+                                        "proj_share_obj": "",
+                                    }
+                                    _apply_wan21_t2v_abs_to_ablation_contribution_row(row)
+                                    if alignment_key in early_alignment_summary and str(module_name) == "cross":
+                                        for alignment_metric_name, early_alignment_summary in early_alignment_summaries.items():
+                                            if alignment_key not in early_alignment_summary:
+                                                continue
+                                            for metric_name in ("cos_obj", "cos_full", "ablate_cos_obj", "ablate_cos_full"):
+                                                _append_wan21_t2v_alignment_scatter_row(
+                                                    scatter_rows_by_method["exact_ablation"],
+                                                    alignment_metric_name=str(alignment_metric_name),
+                                                    analysis_method="exact_ablation",
+                                                    module_name=str(module_name),
+                                                    branch_name=str(contribution_branch),
+                                                    metric_name=str(metric_name),
+                                                    head_tag=str(row["head_tag"]),
+                                                    step=int(step),
+                                                    metric_value=row[metric_name],
+                                                    alignment_summary=early_alignment_summary[alignment_key],
+                                                )
+                                    head_contribution_rows_by_method["exact_ablation"].append(row)
+                                    if contribution_progress_bar is not None:
+                                        contribution_progress_bar.update(1)
+
+                                if do_ablation and contribution_method == "taylor_approx":
+                                    attribution_metrics = taylor_metrics_by_layer_module.get((int(layer), str(module_name)), None)
+                                    if attribution_metrics is None:
+                                        raise RuntimeError(
+                                            f"Missing global attribution metrics for step={step}, layer={layer}, module={module_name}."
+                                        )
+                                    contribution_value = float(attribution_metrics["contribution"][int(head)].item())
+                                    row = {
+                                        "step": int(step),
+                                        "layer": int(layer),
+                                        "head": int(head),
+                                        "head_tag": f"L{int(layer)}H{int(head)}",
+                                        "module": str(module_name),
+                                        "branch": str(contribution_branch),
+                                        "analysis_method": "taylor_approx",
+                                        "contribution_method": str(contribution_method),
+                                        "contribution": contribution_value,
+                                        "cos_full": "",
+                                        "dot_full": "",
+                                        "cos_obj": "",
+                                        "dot_obj": "",
+                                        "ablate_cos_full": "",
+                                        "ablate_dot_full": "",
+                                        "ablate_cos_obj": "",
+                                        "ablate_dot_obj": "",
+                                        "proj_cos_full": "",
+                                        "proj_dot_full": "",
+                                        "proj_cos_obj": "",
+                                        "proj_dot_obj": "",
+                                        "proj_share_full": "",
+                                        "proj_share_obj": "",
+                                    }
+                                    _apply_wan21_t2v_abs_to_ablation_contribution_row(row)
+                                    if alignment_key in early_alignment_summary and str(module_name) == "cross":
+                                        for alignment_metric_name, early_alignment_summary in early_alignment_summaries.items():
+                                            if alignment_key not in early_alignment_summary:
+                                                continue
+                                            _append_wan21_t2v_alignment_scatter_row(
+                                                scatter_rows_by_method["taylor_approx"],
+                                                alignment_metric_name=str(alignment_metric_name),
+                                                analysis_method="taylor_approx",
+                                                module_name=str(module_name),
+                                                branch_name=str(contribution_branch),
+                                                metric_name="contribution",
+                                                head_tag=str(row["head_tag"]),
+                                                step=int(step),
+                                                metric_value=contribution_value,
+                                                alignment_summary=early_alignment_summary[alignment_key],
+                                            )
+                                    head_contribution_rows_by_method["taylor_approx"].append(row)
+                                    if contribution_progress_bar is not None:
+                                        contribution_progress_bar.update(1)
+
+                                if do_direct_proxy:
+                                    proxy_metrics = all_proxy_metrics.get((int(layer), str(module_name)), None)
+                                    if proxy_metrics is None:
+                                        raise RuntimeError(
+                                            f"Missing direct projection cache for step={step}, layer={layer}, module={module_name}."
+                                        )
+                                    row = {
+                                        "step": int(step),
+                                        "layer": int(layer),
+                                        "head": int(head),
+                                        "head_tag": f"L{int(layer)}H{int(head)}",
+                                        "module": str(module_name),
+                                        "branch": str(contribution_branch),
+                                        "analysis_method": "direct_proxy",
+                                        "contribution_method": "",
+                                        "contribution": "",
+                                        "cos_full": "",
+                                        "dot_full": "",
+                                        "cos_obj": "",
+                                        "dot_obj": "",
+                                        "ablate_cos_full": "",
+                                        "ablate_dot_full": "",
+                                        "ablate_cos_obj": "",
+                                        "ablate_dot_obj": "",
+                                        "proj_cos_full": float(proxy_metrics["proj_cos_full"][int(head)].item()),
+                                        "proj_dot_full": float(proxy_metrics["proj_dot_full"][int(head)].item()),
+                                        "proj_cos_obj": float(proxy_metrics["proj_cos_obj"][int(head)].item()),
+                                        "proj_dot_obj": float(proxy_metrics["proj_dot_obj"][int(head)].item()),
+                                        "proj_share_full": "",
+                                        "proj_share_obj": "",
+                                    }
+                                    if alignment_key in early_alignment_summary and str(module_name) == "cross":
+                                        for alignment_metric_name, early_alignment_summary in early_alignment_summaries.items():
+                                            if alignment_key not in early_alignment_summary:
+                                                continue
+                                            for metric_name in ("proj_dot_obj", "proj_dot_full", "proj_cos_obj", "proj_cos_full"):
+                                                _append_wan21_t2v_alignment_scatter_row(
+                                                    scatter_rows_by_method["direct_proxy"],
+                                                    alignment_metric_name=str(alignment_metric_name),
+                                                    analysis_method="direct_proxy",
+                                                    module_name=str(module_name),
+                                                    branch_name=str(contribution_branch),
+                                                    metric_name=str(metric_name),
+                                                    head_tag=str(row["head_tag"]),
+                                                    step=int(step),
+                                                    metric_value=row[metric_name],
+                                                    alignment_summary=early_alignment_summary[alignment_key],
+                                                )
+                                    head_contribution_rows_by_method["direct_proxy"].append(row)
+                                    if contribution_progress_bar is not None:
+                                        contribution_progress_bar.update(1)
+            finally:
+                if contribution_progress_bar is not None:
+                    contribution_progress_bar.close()
+
+            share_groups = defaultdict(list)
+            for row in head_contribution_rows_by_method.get("direct_proxy", []):
+                share_groups[(int(row["step"]), int(row["layer"]), str(row["module"]), str(row["branch"]))].append(row)
+            for _, rows in share_groups.items():
+                positive_full_sum = sum(max(0.0, float(row["proj_dot_full"])) for row in rows if row["proj_dot_full"] != "")
+                positive_obj_sum = sum(max(0.0, float(row["proj_dot_obj"])) for row in rows if row["proj_dot_obj"] != "")
+                for row in rows:
+                    if row["proj_dot_full"] != "":
+                        row["proj_share_full"] = float(max(0.0, float(row["proj_dot_full"])) / max(positive_full_sum, 1e-12))
+                    if row["proj_dot_obj"] != "":
+                        row["proj_share_obj"] = float(max(0.0, float(row["proj_dot_obj"])) / max(positive_obj_sum, 1e-12))
+
+            for analysis_method, method_rows in sorted(head_contribution_rows_by_method.items()):
+                method_output_dir = head_contribution_output_dirs.get(str(analysis_method))
+                if not method_output_dir:
+                    continue
+                _ensure_dir(method_output_dir)
+                _save_csv(
+                    os.path.join(method_output_dir, "trajectory_consensus_head_contribution.csv"),
+                    method_rows,
+                )
+
+        for analysis_method, method_rows in sorted(head_contribution_rows_by_method.items()):
+            method_output_dir = head_contribution_output_dirs.get(str(analysis_method))
+            if not method_output_dir:
+                continue
+            plot_paths.extend(
+                _render_wan21_t2v_head_contribution_plots(
+                    method_output_dir,
+                    method_rows,
+                    scatter_rows_by_method.get(str(analysis_method), []),
+                    scatter_outlier_heads=scatter_outlier_heads,
+                    skip_existing_plots=bool(trajectory_consensus_skip_existing_plots),
+                )
+            )
+
+    summary.update({
+        "num_candidate_region_rows": int(len(candidate_region_rows)),
+        "num_candidate_weight_rows": int(len(candidate_weight_rows)),
+        "num_winner_gap_rows": int(len(winner_gap_rows)),
+        "num_head_contribution_rows": int(sum(len(rows) for rows in head_contribution_rows_by_method.values())),
+        "plot_paths": list(plot_paths),
+    })
+
+    method_summaries: Dict[str, str] = {}
+    for analysis_method, method_rows in sorted(head_contribution_rows_by_method.items()):
+        method_output_dir = head_contribution_output_dirs.get(str(analysis_method))
+        if not method_output_dir:
+            continue
+        method_plot_paths = [path for path in plot_paths if str(path).startswith(method_output_dir)]
+        method_summary_path = os.path.join(method_output_dir, "trajectory_consensus_summary.json")
+        previous_method_summary: Dict[str, object] = {}
+        if os.path.exists(method_summary_path):
+            try:
+                with open(method_summary_path, "r", encoding="utf-8") as handle:
+                    loaded_summary = json.load(handle)
+                if isinstance(loaded_summary, dict):
+                    previous_method_summary = loaded_summary
+            except Exception:
+                previous_method_summary = {}
+
+        method_summary = dict(summary)
+        method_summary.update({
+            "analysis_method": str(analysis_method),
+            "trajectory_consensus_do_ablation": bool(analysis_method in {"exact_ablation", "taylor_approx"}),
+            "trajectory_consensus_do_direct_proxy": bool(analysis_method == "direct_proxy"),
+            "trajectory_consensus_contribution_method": str(analysis_method),
+            "head_contribution_output_dir": str(method_output_dir),
+            "head_contribution_plot_paths": list(method_plot_paths),
+            "num_head_contribution_rows": int(len(method_rows)) if method_rows else int(previous_method_summary.get("num_head_contribution_rows", 0)),
+            "num_candidate_region_rows": int(previous_method_summary.get("num_candidate_region_rows", summary.get("num_candidate_region_rows", 0))),
+            "num_candidate_weight_rows": int(previous_method_summary.get("num_candidate_weight_rows", summary.get("num_candidate_weight_rows", 0))),
+            "num_winner_gap_rows": int(previous_method_summary.get("num_winner_gap_rows", summary.get("num_winner_gap_rows", 0))),
+        })
+        if previous_method_summary.get("stages"):
+            method_summary["stages"] = list(dict.fromkeys(
+                [str(stage) for stage in previous_method_summary.get("stages", [])]
+                + [str(stage) for stage in summary.get("stages", [])]
+            ))
+        _ensure_dir(method_output_dir)
+        _save_json(method_summary_path, method_summary)
+        method_summaries[str(analysis_method)] = method_summary_path
+
+    summary["method_summaries"] = method_summaries
+    return summary

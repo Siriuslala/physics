@@ -8,7 +8,7 @@ conda activate video
 # t2v-14B: '720*1280', '1280*720', '480*832', '832*480'
 # t2v-1.3B: '480*832', '832*480'
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0
 
 build_prompt_tag() {
     local prompt="$1"
@@ -53,7 +53,7 @@ SAMPLE_GUIDE_SCALE=5.0
 # SAMPLE_GUIDE_SCALE=5.0
 
 # ==============================
-SEEDS=(8)
+SEEDS=(20)
 # SEEDS=($(seq 1 32))
 
 PROMPTS=(

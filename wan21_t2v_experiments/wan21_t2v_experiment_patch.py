@@ -81,6 +81,14 @@ class Wan21T2VAttentionProbeConfig:
     distribution_global_query_tokens_per_frame: int = 64
     distribution_object_query_token_limit_per_frame: int = 0
     distribution_object_support_mask: Optional[torch.Tensor] = None
+    collect_self_attention_viz: bool = False
+    self_attention_viz_layers: Tuple[int, ...] = tuple()
+    self_attention_viz_query_video_frame_indices: Tuple[int, ...] = (1, 33, 41, 81)
+    self_attention_viz_video_frame_count: int = 81
+    self_attention_viz_object_query_token_limit_per_frame: int = 64
+    self_attention_viz_object_support_mask: Optional[torch.Tensor] = None
+    collect_self_attn_modulation: bool = False
+    modulation_layers: Tuple[int, ...] = tuple()
     stop_after_last_probe_step: bool = False
 
 
@@ -171,10 +179,16 @@ class Wan21T2VProbeState:
         self.distribution_object_sum: Dict[Tuple[int, int, int], torch.Tensor] = {}
         self.distribution_object_count: Dict[Tuple[int, int, int], int] = {}
         self.distribution_object_dt_sum: Dict[Tuple[int, int], torch.Tensor] = {}
-        self.distribution_object_dt_count: Dict[Tuple[int, int], int] = {}
+        self.distribution_object_dt_valid_count: Dict[Tuple[int, int], torch.Tensor] = {}
         self.distribution_global_dt_sum: Dict[Tuple[int, int, str], torch.Tensor] = {}
-        self.distribution_global_dt_count: Dict[Tuple[int, int, str], int] = {}
+        self.distribution_global_dt_valid_count: Dict[Tuple[int, int, str], torch.Tensor] = {}
         self.distribution_grid_size: Optional[Tuple[int, int, int]] = None
+        self.self_attention_viz_sum: Dict[Tuple[int, int, int], torch.Tensor] = {}
+        self.self_attention_viz_count: Dict[Tuple[int, int, int], int] = {}
+        self.self_attention_viz_query_video_frames: Dict[Tuple[int, int, int], int] = {}
+        self.self_attention_viz_grid_size: Optional[Tuple[int, int, int]] = None
+        self.self_attn_modulation_sum: Dict[Tuple[str, int, int], torch.Tensor] = {}
+        self.self_attn_modulation_count: Dict[Tuple[str, int, int], int] = {}
         self.last_requested_probe_step = max(config.probe.probe_steps) if config.probe.probe_steps else 0
         self.early_stop_triggered = False
         self.early_stop_completed_step = 0
@@ -399,6 +413,70 @@ class Wan21T2VProbeState:
             )
         return torch.cat(query_indices, dim=0), torch.cat(query_frames, dim=0)
 
+    def _resolve_self_attention_viz_query_token_frames(self, token_frame_count: int) -> List[Tuple[int, int]]:
+        """Project requested 1-based video-frame labels to token-frame indices."""
+        requested_video_frames = [
+            int(frame_id)
+            for frame_id in self.config.probe.self_attention_viz_query_video_frame_indices
+            if int(frame_id) >= 1
+        ]
+        if not requested_video_frames or int(token_frame_count) <= 0:
+            return []
+
+        video_frame_count = max(1, int(self.config.probe.self_attention_viz_video_frame_count))
+        resolved_pairs: List[Tuple[int, int]] = []
+        seen_token_frames = set()
+        for video_frame_label in requested_video_frames:
+            video_frame_index0 = max(0, min(video_frame_count - 1, int(video_frame_label) - 1))
+            if video_frame_count <= 1 or int(token_frame_count) <= 1:
+                token_frame_index = 0
+            else:
+                token_frame_index = round(
+                    float(video_frame_index0) * float(int(token_frame_count) - 1) / float(video_frame_count - 1)
+                )
+            token_frame_index = max(0, min(int(token_frame_count) - 1, int(token_frame_index)))
+            if token_frame_index in seen_token_frames:
+                continue
+            seen_token_frames.add(token_frame_index)
+            resolved_pairs.append((token_frame_index, int(video_frame_label)))
+        return resolved_pairs
+
+    def _get_self_attention_viz_query_indices(
+        self,
+        f: int,
+        h: int,
+        w: int,
+        device: torch.device,
+    ) -> Dict[int, Dict[str, torch.Tensor]]:
+        """Return object-region query indices for selected query frames used by self_attention_viz."""
+        support_mask = self.config.probe.self_attention_viz_object_support_mask
+        if support_mask is None:
+            return {}
+        if support_mask.dim() != 3:
+            raise ValueError(
+                "self_attention_viz_object_support_mask must have shape [F, H, W], "
+                f"got {tuple(support_mask.shape)}."
+            )
+        if tuple(int(v) for v in support_mask.shape) != (int(f), int(h), int(w)):
+            raise ValueError(
+                "self_attention_viz_object_support_mask shape does not match current token grid: "
+                f"mask={tuple(int(v) for v in support_mask.shape)} vs grid={(int(f), int(h), int(w))}."
+            )
+
+        token_limit = int(self.config.probe.self_attention_viz_object_query_token_limit_per_frame)
+        query_info: Dict[int, Dict[str, torch.Tensor]] = {}
+        for token_frame_index, video_frame_label in self._resolve_self_attention_viz_query_token_frames(f):
+            frame_mask = support_mask[int(token_frame_index)].reshape(-1).to(device=device) > 0.5
+            frame_indices = torch.nonzero(frame_mask, as_tuple=False).flatten()
+            if frame_indices.numel() == 0:
+                continue
+            frame_indices = self._sample_evenly_from_indices(frame_indices, token_limit)
+            query_info[int(token_frame_index)] = {
+                "query_indices": frame_indices + int(token_frame_index) * (h * w),
+                "query_video_frame": torch.tensor(int(video_frame_label), device=device, dtype=torch.long),
+            }
+        return query_info
+
     def _ensure_dt_storage(self, bins: int):
         if self.dt_bins is None:
             self.dt_bins = bins
@@ -410,6 +488,53 @@ class Wan21T2VProbeState:
                 (self.num_layers, self.num_heads, bins), dtype=torch.float64)
             self.dt_hist_count[self.current_step] = torch.zeros((self.num_layers,), dtype=torch.float64)
 
+    def collect_self_attn_modulation(
+        self,
+        layer_idx: int,
+        modulation_name: str,
+        modulation_tensor: torch.Tensor,
+        sa_output: Optional[torch.Tensor] = None,
+        gated_sa_output: Optional[torch.Tensor] = None,
+    ):
+        """Collect step/layer statistics for one self-attention modulation tensor."""
+        if not self.should_collect_layer(layer_idx):
+            return
+        if not bool(self.config.probe.collect_self_attn_modulation):
+            return
+        if self.config.probe.modulation_layers and int(layer_idx) not in self.config.probe.modulation_layers:
+            return
+
+        modulation_flat = modulation_tensor.detach().float().reshape(-1)
+        modulation_sq_mean = modulation_flat.square().mean()
+        modulation_rms = torch.sqrt(modulation_sq_mean)
+
+        stats = torch.zeros((9,), dtype=torch.float64)
+        stats[0] = float(modulation_flat.mean().item())
+        stats[1] = float(modulation_flat.abs().mean().item())
+        stats[2] = float(modulation_rms.item())
+        stats[3] = float((modulation_flat > 0).float().mean().item())
+        stats[4] = float((modulation_flat < 0).float().mean().item())
+        stats[5] = float(modulation_flat.abs().max().item())
+
+        if sa_output is not None:
+            sa_flat = sa_output.detach().float().reshape(-1)
+            sa_rms = torch.sqrt(sa_flat.square().mean())
+            stats[6] = float(sa_rms.item())
+            if gated_sa_output is None:
+                gated_sa_output = sa_output * modulation_tensor
+        if gated_sa_output is not None:
+            gated_flat = gated_sa_output.detach().float().reshape(-1)
+            gated_rms = torch.sqrt(gated_flat.square().mean())
+            stats[7] = float(gated_rms.item())
+            stats[8] = float(gated_rms.item() / max(1e-8, float(stats[6])))
+
+        key = (str(modulation_name), int(self.current_step), int(layer_idx))
+        if key not in self.self_attn_modulation_sum:
+            self.self_attn_modulation_sum[key] = torch.zeros((9,), dtype=torch.float64)
+            self.self_attn_modulation_count[key] = 0
+        self.self_attn_modulation_sum[key] += stats
+        self.self_attn_modulation_count[key] += 1
+
     def collect(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, seq_lens: torch.Tensor, grid_sizes: torch.Tensor):
         """Collect P(|dt|) and optional MAAS maps from q/k tensors."""
         if not self.should_collect_layer(layer_idx):
@@ -420,13 +545,17 @@ class Wan21T2VProbeState:
             (not self.config.probe.distribution_layers)
             or (int(layer_idx) in self.config.probe.distribution_layers)
         )
+        need_self_attention_viz = bool(self.config.probe.collect_self_attention_viz) and (
+            (not self.config.probe.self_attention_viz_layers)
+            or (int(layer_idx) in self.config.probe.self_attention_viz_layers)
+        )
         need_maas = bool(self.config.probe.collect_maas_maps) and (
             self.current_step in self.config.probe.maas_steps
         ) and (
             (not self.config.probe.maas_layers) or (int(layer_idx) in self.config.probe.maas_layers)
         )
 
-        if not (need_dt_histograms or need_distribution or need_maas):
+        if not (need_dt_histograms or need_distribution or need_self_attention_viz or need_maas):
             return
 
         bsz = q.size(0)
@@ -526,7 +655,10 @@ class Wan21T2VProbeState:
                                 (self.num_heads, signed_dt_bins, 3),
                                 dtype=torch.float64,
                             )
-                            self.distribution_object_dt_count[object_dt_key] = 0
+                            self.distribution_object_dt_valid_count[object_dt_key] = torch.zeros(
+                                (signed_dt_bins,),
+                                dtype=torch.float64,
+                            )
                         signed_dt_index = signed_key_frame_indices - int(query_frame)
                         signed_dt_index_cpu = signed_dt_index.detach().cpu()
                         object_dt_sum = self.distribution_object_dt_sum[object_dt_key]
@@ -537,7 +669,7 @@ class Wan21T2VProbeState:
                             object_dt_sum[head_index, signed_dt_index_cpu, 0] += frame_mass_cpu[head_index]
                             object_dt_sum[head_index, signed_dt_index_cpu, 1] += object_mass_cpu[head_index]
                             object_dt_sum[head_index, signed_dt_index_cpu, 2] += nonobject_mass_cpu[head_index]
-                        self.distribution_object_dt_count[object_dt_key] += 1
+                        self.distribution_object_dt_valid_count[object_dt_key][signed_dt_index_cpu] += 1.0
 
                 global_query_indices, global_query_frames = self._get_distribution_global_query_indices(
                     f=f,
@@ -571,13 +703,54 @@ class Wan21T2VProbeState:
                                     (self.num_heads, signed_dt_bins),
                                     dtype=torch.float64,
                                 )
-                                self.distribution_global_dt_count[global_dt_key] = 0
+                                self.distribution_global_dt_valid_count[global_dt_key] = torch.zeros(
+                                    (signed_dt_bins,),
+                                    dtype=torch.float64,
+                                )
                             global_dt_sum = self.distribution_global_dt_sum[global_dt_key]
                             for head_index in range(self.num_heads):
                                 global_dt_sum[head_index, signed_dt_index_cpu] += frame_mass_cpu[head_index]
-                            self.distribution_global_dt_count[global_dt_key] += 1
+                            self.distribution_global_dt_valid_count[global_dt_key][signed_dt_index_cpu] += 1.0
 
                 self.distribution_grid_size = (f, h, w)
+
+            if need_self_attention_viz:
+                query_info_by_frame = self._get_self_attention_viz_query_indices(
+                    f=f,
+                    h=h,
+                    w=w,
+                    device=q.device,
+                )
+                for query_frame, query_info in query_info_by_frame.items():
+                    query_indices = query_info["query_indices"]
+                    query_keep = query_indices < seq_len
+                    query_indices = query_indices[query_keep]
+                    if int(query_indices.numel()) <= 0:
+                        continue
+
+                    query_video_frame = int(query_info["query_video_frame"].item())
+                    query_tokens = q_i[query_indices]
+                    viz_logits = torch.einsum("qhd,khd->hqk", query_tokens.float(), k_i.float()) * scale
+                    viz_probs = torch.softmax(viz_logits, dim=-1)
+                    viz_prob_sum = viz_probs[:, :, :seq_len].reshape(
+                        self.num_heads,
+                        int(query_indices.numel()),
+                        f,
+                        h,
+                        w,
+                    ).sum(dim=1)
+
+                    viz_key = (self.current_step, int(layer_idx), int(query_frame))
+                    if viz_key not in self.self_attention_viz_sum:
+                        self.self_attention_viz_sum[viz_key] = torch.zeros(
+                            tuple(int(dim) for dim in viz_prob_sum.shape),
+                            dtype=torch.float64,
+                        )
+                        self.self_attention_viz_count[viz_key] = 0
+                    self.self_attention_viz_sum[viz_key] += viz_prob_sum.detach().cpu().double()
+                    self.self_attention_viz_count[viz_key] += int(query_indices.numel())
+                    self.self_attention_viz_query_video_frames[viz_key] = int(query_video_frame)
+                    self.self_attention_viz_grid_size = (f, h, w)
 
     def export_dt_histograms(self) -> Dict[str, torch.Tensor]:
         """Export normalized dt histograms as tensors."""
@@ -617,8 +790,8 @@ class Wan21T2VProbeState:
 
         object_dt_rows: List[Dict[str, float]] = []
         for (step, layer), mass_sum in sorted(self.distribution_object_dt_sum.items()):
-            count = max(1, int(self.distribution_object_dt_count[(step, layer)]))
-            mean_mass = (mass_sum / float(count)).float()
+            valid_count = self.distribution_object_dt_valid_count[(step, layer)].clamp_min(1.0)
+            mean_mass = (mass_sum / valid_count.view(1, -1, 1)).float()
             frame_count = int((mean_mass.size(1) + 1) // 2)
             for head_index in range(int(mean_mass.size(0))):
                 for dt_index in range(int(mean_mass.size(1))):
@@ -626,6 +799,7 @@ class Wan21T2VProbeState:
                     frame_mass = float(mean_mass[head_index, dt_index, 0].item())
                     object_mass = float(mean_mass[head_index, dt_index, 1].item())
                     nonobject_mass = float(mean_mass[head_index, dt_index, 2].item())
+                    dt_query_count = int(valid_count[dt_index].item())
                     object_dt_rows.append(
                         {
                             "step": int(step),
@@ -636,14 +810,14 @@ class Wan21T2VProbeState:
                             "object_mass": object_mass,
                             "nonobject_mass": nonobject_mass,
                             "object_fraction": float(object_mass / max(1e-8, frame_mass)),
-                            "num_query_tokens": int(count),
+                            "num_query_tokens": int(dt_query_count),
                         }
                     )
 
         global_dt_rows: List[Dict[str, float]] = []
         for (step, layer, bucket_name), mass_sum in sorted(self.distribution_global_dt_sum.items()):
-            count = max(1, int(self.distribution_global_dt_count[(step, layer, bucket_name)]))
-            mean_mass = (mass_sum / float(count)).float()
+            valid_count = self.distribution_global_dt_valid_count[(step, layer, bucket_name)].clamp_min(1.0)
+            mean_mass = (mass_sum / valid_count.view(1, -1)).float()
             frame_count = int((mean_mass.size(1) + 1) // 2)
             for head_index in range(int(mean_mass.size(0))):
                 for dt_index in range(int(mean_mass.size(1))):
@@ -656,7 +830,7 @@ class Wan21T2VProbeState:
                             "query_bucket": str(bucket_name),
                             "dt": int(dt_value),
                             "attention_mass": float(mean_mass[head_index, dt_index].item()),
-                            "num_query_tokens": int(count),
+                            "num_query_tokens": int(valid_count[dt_index].item()),
                         }
                     )
 
@@ -665,6 +839,56 @@ class Wan21T2VProbeState:
             "object_dt_rows": object_dt_rows,
             "global_dt_rows": global_dt_rows,
         }
+
+    def export_self_attention_viz_maps(self) -> Dict[Tuple[int, int, int], torch.Tensor]:
+        """Export averaged self-attention visualization maps with shape [num_heads, F, H, W]."""
+        out: Dict[Tuple[int, int, int], torch.Tensor] = {}
+        for key, tensor_sum in sorted(self.self_attention_viz_sum.items()):
+            count = max(1, int(self.self_attention_viz_count[key]))
+            out[key] = (tensor_sum / float(count)).float()
+        return out
+
+    def export_self_attention_viz_rows(self) -> List[Dict[str, float]]:
+        """Export metadata rows for saved self-attention visualization maps."""
+        rows: List[Dict[str, float]] = []
+        for (step, layer, query_token_frame), tensor_sum in sorted(self.self_attention_viz_sum.items()):
+            del tensor_sum
+            key = (int(step), int(layer), int(query_token_frame))
+            rows.append(
+                {
+                    "step": int(step),
+                    "layer": int(layer),
+                    "query_token_frame": int(query_token_frame),
+                    "query_video_frame": int(self.self_attention_viz_query_video_frames.get(key, query_token_frame + 1)),
+                    "num_query_tokens": int(self.self_attention_viz_count[key]),
+                }
+            )
+        return rows
+
+    def export_self_attn_modulation_rows(self) -> List[Dict[str, float]]:
+        """Export step/layer summaries for the self-attention modulation gate."""
+        rows: List[Dict[str, float]] = []
+        for (modulation_name, step, layer), stats_sum in sorted(self.self_attn_modulation_sum.items()):
+            count = max(1, int(self.self_attn_modulation_count[(modulation_name, step, layer)]))
+            mean_stats = (stats_sum / float(count)).tolist()
+            rows.append(
+                {
+                    "modulation_name": str(modulation_name),
+                    "step": int(step),
+                    "layer": int(layer),
+                    "gate_mean": float(mean_stats[0]),
+                    "gate_abs_mean": float(mean_stats[1]),
+                    "gate_rms": float(mean_stats[2]),
+                    "gate_positive_fraction": float(mean_stats[3]),
+                    "gate_negative_fraction": float(mean_stats[4]),
+                    "gate_max_abs": float(mean_stats[5]),
+                    "sa_output_rms": float(mean_stats[6]),
+                    "gated_sa_output_rms": float(mean_stats[7]),
+                    "gated_to_raw_rms_ratio": float(mean_stats[8]),
+                    "num_forward_samples": int(count),
+                }
+            )
+        return rows
 
     def compute_maas(self, token_trajectory: Dict[int, Tuple[int, int]], radius: Optional[int] = None):
         """Compute MAAS rows and summary given token-space trajectory targets."""
@@ -736,18 +960,22 @@ class Wan21T2VPatchHandle:
         state: Wan21T2VProbeState,
         original_forward=None,
         original_attn_forwards=None,
+        original_block_forwards=None,
         restore_items=None,
     ):
         self.target_model = target_model
         self.state = state
         self.original_forward = original_forward
         self.original_attn_forwards = [] if original_attn_forwards is None else original_attn_forwards
+        self.original_block_forwards = [] if original_block_forwards is None else original_block_forwards
         self.restore_items = [] if restore_items is None else restore_items
 
     def restore(self):
         if self.original_forward is not None:
             self.target_model.forward = self.original_forward
         for idx, block in enumerate(self.target_model.blocks):
+            if idx < len(self.original_block_forwards):
+                block.forward = self.original_block_forwards[idx]
             if idx < len(self.original_attn_forwards):
                 block.self_attn.forward = self.original_attn_forwards[idx]
         for obj, name, value in self.restore_items:
@@ -1271,6 +1499,8 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
     target.forward = MethodType(patched_dit_forward, target)
 
     original_attn_forwards = []
+    original_block_forwards = []
+    needs_block_forward_patch = bool(patch_cfg.probe.enabled and patch_cfg.probe.collect_self_attn_modulation)
 
     def build_patched_self_attn(layer_idx: int):
         """Create per-layer self-attention patch closure."""
@@ -1307,7 +1537,64 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
 
         return patched_self_attn
 
+    def build_patched_block_forward(layer_idx: int):
+        """Create per-layer block patch closure when modulation probes are enabled."""
+
+        def patched_block_forward(
+            self,
+            x,
+            e,
+            seq_lens,
+            grid_sizes,
+            freqs,
+            context,
+            context_lens,
+        ):
+            assert e.dtype == torch.float32
+            with torch.cuda.amp.autocast(dtype=torch.float32):
+                e = (self.modulation + e).chunk(6, dim=1)
+            assert e[0].dtype == torch.float32
+
+            y = self.self_attn(
+                self.norm1(x).float() * (1 + e[1]) + e[0],
+                seq_lens,
+                grid_sizes,
+                freqs,
+            )
+            with torch.cuda.amp.autocast(dtype=torch.float32):
+                gated_y = y * e[2]
+            state.collect_self_attn_modulation(
+                layer_idx=layer_idx,
+                modulation_name="e0",
+                modulation_tensor=e[0],
+            )
+            state.collect_self_attn_modulation(
+                layer_idx=layer_idx,
+                modulation_name="e1",
+                modulation_tensor=e[1],
+            )
+            state.collect_self_attn_modulation(
+                layer_idx=layer_idx,
+                modulation_name="e2",
+                modulation_tensor=e[2],
+                sa_output=y,
+                gated_sa_output=gated_y,
+            )
+            with torch.cuda.amp.autocast(dtype=torch.float32):
+                x = x + gated_y
+
+            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+            with torch.cuda.amp.autocast(dtype=torch.float32):
+                x = x + y * e[5]
+            return x
+
+        return patched_block_forward
+
     for layer_idx, block in enumerate(target.blocks):
+        if needs_block_forward_patch:
+            original_block_forwards.append(block.forward)
+            block.forward = MethodType(build_patched_block_forward(layer_idx), block)
         original_attn_forwards.append(block.self_attn.forward)
         block.self_attn.forward = MethodType(build_patched_self_attn(layer_idx), block.self_attn)
 
@@ -1316,5 +1603,6 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
         state=state,
         original_forward=original_forward,
         original_attn_forwards=original_attn_forwards,
+        original_block_forwards=original_block_forwards,
         restore_items=restore_items,
     )

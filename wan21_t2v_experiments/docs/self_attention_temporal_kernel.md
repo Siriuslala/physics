@@ -123,10 +123,7 @@ This is the exact token-level temperature intervention.
 
 For selected heads, replace the attention probabilities by
 
-\[
-\alpha_h^{(T)}(i,j) = \operatorname{softmax}_{j}\!\left(\frac{\ell_h(i,j)}{T}\right),
-\qquad T > 0,
-\]
+\[ \alpha_h^{(T)}(i,j) = \operatorname{softmax}_{j}\!\left(\frac{\ell_h(i,j)}{T}\right), \qquad T > 0, \]
 
 where \(T = \texttt{self_attn_token_temperature}\).
 
@@ -144,33 +141,19 @@ Because
 
 we can realize the temperature scaling exactly by scaling both query and key:
 
-\[
-q'_{i,h} = T^{-1/2} q_{i,h},
-\qquad
-k'_{j,h} = T^{-1/2} k_{j,h}.
-\]
+\[ q'_{i,h} = T^{-1/2} q_{i,h}, \qquad k'_{j,h} = T^{-1/2} k_{j,h}. \]
 
 Then
 
-\[
-\frac{\langle q'_{i,h}, k'_{j,h} \rangle}{\sqrt d}
-= \frac{\langle q_{i,h}, k_{j,h} \rangle}{\sqrt d \, T}.
-\]
+\[ \frac{\langle q'_{i,h}, k'_{j,h} \rangle}{\sqrt d} = \frac{\langle q_{i,h}, k_{j,h} \rangle}{\sqrt d \, T}. \]
 
 More generally, if both query and key are scaled by the same scalar \(s\), then
 
-\[
-\frac{\langle s q_{i,h}, s k_{j,h} \rangle}{\sqrt d}
-= s^2 \frac{\langle q_{i,h}, k_{j,h} \rangle}{\sqrt d}.
-\]
+\[ \frac{\langle s q_{i,h}, s k_{j,h} \rangle}{\sqrt d} = s^2 \frac{\langle q_{i,h}, k_{j,h} \rangle}{\sqrt d}. \]
 
 So to obtain an exact division by \(T\), we must set
 
-\[
-s^2 = \frac{1}{T}
-\quad\Longrightarrow\quad
-s = T^{-1/2}.
-\]
+\[ s^2 = \frac{1}{T} \quad\Longrightarrow\quad s = T^{-1/2}. \]
 
 So feeding \(q'\) and \(k'\) into flash attention is mathematically equivalent to applying an exact softmax temperature \(T\) to the selected heads' token-level attention logits.
 

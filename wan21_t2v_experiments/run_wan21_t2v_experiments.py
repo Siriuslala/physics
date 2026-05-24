@@ -4,7 +4,7 @@ import argparse
 import os
 import sys
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PARENT = os.path.dirname(HERE)
@@ -26,6 +26,24 @@ def _parse_csv_strs(s: str) -> List[str]:
     if not s:
         return []
     return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _parse_optional_csv_strs_with_none(s: str) -> Optional[List[str]]:
+    """Parse a CSV string with an explicit `None` sentinel.
+
+    Semantics:
+    - `""` -> `[]`, meaning "use all items by default"
+    - `"None"` / `"none"` -> `None`, meaning "use no items"
+    - otherwise -> parsed CSV list
+    """
+    if s is None:
+        return []
+    text = str(s).strip()
+    if text.lower() == "none":
+        return None
+    if text == "":
+        return []
+    return [x.strip() for x in text.split(",") if x.strip()]
 
 
 def _parse_size(size: str) -> Tuple[int, int]:
@@ -58,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
             "rope_decay_curve",
             "self_attention_temporal_kernel",
             "self_attention_distribution",
+            "self_attention_viz",
+            "self_attention_modulation",
             "seed_to_trajectory_predictability",
             "event_token_value",
             "motion_aligned_attention",
@@ -70,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
             "token_trajectory_seed_stability",
             "joint_attention_suite",
             "rope_modification",
+            "trajectory_consensus_dynamics",
         ],
     )
 
@@ -282,6 +303,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--draw_attention_map_only", type=_str2bool, default=False)
     parser.add_argument("--draw_attention_maps_path", type=str, default="")
     parser.add_argument("--visualization_output_dir", type=str, default="")
+    parser.add_argument(
+        "--cross_attention_token_viz_num_workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of CPU worker processes used by cross_attention_token_viz to render PDFs "
+            "and extract per-head trajectories. A non-positive value means use os.cpu_count()."
+        ),
+    )
 
     # Trajectory-entropy options
     parser.add_argument(
@@ -750,6 +780,101 @@ def build_parser() -> argparse.ArgumentParser:
         help="If true, self_attention_distribution plotting skips plot files that already exist.",
     )
 
+    # Self-attention visualization options
+    parser.add_argument(
+        "--self_attention_viz_steps",
+        type=str,
+        default="1,2,3",
+        help="CSV diffusion steps for self_attention_viz. Empty means all steps [1..sampling_steps].",
+    )
+    parser.add_argument(
+        "--self_attention_viz_layers",
+        type=str,
+        default="",
+        help="CSV layer ids for self_attention_viz. Empty means all layers.",
+    )
+    parser.add_argument(
+        "--self_attention_viz_branch",
+        type=str,
+        default="cond",
+        choices=["cond", "uncond", "both"],
+    )
+    parser.add_argument("--self_attention_viz_reference_step", type=int, default=50)
+    parser.add_argument("--self_attention_viz_reference_layer", type=int, default=27)
+    parser.add_argument(
+        "--self_attention_viz_reference_center_mode",
+        type=str,
+        default="geometric_center",
+        choices=["peak", "centroid", "geometric_center"],
+    )
+    parser.add_argument("--self_attention_viz_reference_center_power", type=float, default=1.5)
+    parser.add_argument("--self_attention_viz_reference_center_quantile", type=float, default=0.8)
+    parser.add_argument("--self_attention_viz_reference_preprocess_winsorize_quantile", type=float, default=0.995)
+    parser.add_argument("--self_attention_viz_reference_preprocess_despike_quantile", type=float, default=0.98)
+    parser.add_argument("--self_attention_viz_reference_preprocess_min_component_area", type=int, default=2)
+    parser.add_argument(
+        "--self_attention_viz_support_radius_mode",
+        type=str,
+        default="adaptive_area",
+        choices=["fixed", "adaptive_area"],
+    )
+    parser.add_argument("--self_attention_viz_support_radius_fixed", type=float, default=2.0)
+    parser.add_argument("--self_attention_viz_support_radius_alpha", type=float, default=1.5)
+    parser.add_argument("--self_attention_viz_support_radius_min", type=float, default=1.0)
+    parser.add_argument("--self_attention_viz_support_radius_max_ratio", type=float, default=0.25)
+    parser.add_argument(
+        "--self_attention_viz_query_video_frame_indices",
+        type=str,
+        default="1,33,41,81",
+        help=(
+            "CSV 1-based video-frame labels used as self_attention_viz query frames. "
+            "They are projected to token-frame indices internally."
+        ),
+    )
+    parser.add_argument("--self_attention_viz_object_query_token_limit_per_frame", type=int, default=64)
+    parser.add_argument("--self_attention_viz_num_viz_frames", type=int, default=10)
+    parser.add_argument("--self_attention_viz_viz_frame_indices", type=str, default="")
+    parser.add_argument("--self_attention_viz_save_attention_pdfs", type=_str2bool, default=True)
+    parser.add_argument("--self_attention_viz_attention_pdf_share_color_scale", type=_str2bool, default=False)
+    parser.add_argument("--self_attention_viz_skip_existing_pdfs", type=_str2bool, default=True)
+    parser.add_argument("--self_attention_viz_stop_after_last_probe_step", type=_str2bool, default=False)
+    parser.add_argument("--draw_self_attention_maps_only", type=_str2bool, default=False)
+    parser.add_argument("--draw_self_attention_maps_path", type=str, default="")
+    parser.add_argument("--self_attention_viz_visualization_output_dir", type=str, default="")
+    parser.add_argument(
+        "--self_attention_viz_num_workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of CPU worker processes used by self_attention_viz to render PDFs. "
+            "A non-positive value means use os.cpu_count()."
+        ),
+    )
+    parser.add_argument(
+        "--self_attention_modulation_steps",
+        type=str,
+        default="1,2,3",
+        help="CSV diffusion steps for self_attention_modulation. Empty means all steps [1..sampling_steps].",
+    )
+    parser.add_argument(
+        "--self_attention_modulation_layers",
+        type=str,
+        default="",
+        help="CSV layer ids for self_attention_modulation. Empty means all layers.",
+    )
+    parser.add_argument(
+        "--self_attention_modulation_branch",
+        type=str,
+        default="cond",
+        choices=["cond", "uncond", "both"],
+    )
+    parser.add_argument(
+        "--self_attention_modulation_stop_after_last_probe_step",
+        type=_str2bool,
+        default=False,
+        help="If true, stop diffusion immediately after the last requested self_attention_modulation probe step.",
+    )
+
     # Seed-to-trajectory predictability options
     parser.add_argument(
         "--seed_to_trajectory_early_steps",
@@ -805,6 +930,171 @@ def build_parser() -> argparse.ArgumentParser:
             "Used by joint_attention_suite (skip stage-1) and trajectory_entropy (reuse cross-attention maps)."
         ),
     )
+    parser.add_argument(
+        "--reuse_head_trajectory_dynamics_dir",
+        type=str,
+        default="",
+        help="Optional existing head_trajectory_dynamics directory used for early-alignment scatter plots.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_stages",
+        type=str,
+        default="candidate_consensus,head_contribution",
+        help="CSV stages for trajectory_consensus_dynamics. Supported: candidate_consensus,head_contribution.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_steps",
+        type=str,
+        default="1,2,3",
+        help="CSV diffusion steps for trajectory_consensus_dynamics. Empty means all reused-map steps.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_layers",
+        type=str,
+        default="",
+        help="CSV layer ids for trajectory_consensus_dynamics. Empty means all reused-map layers.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_cross_heads",
+        type=str,
+        default="",
+        help=(
+            "CSV cross-attention head specs `LxHy` for trajectory_consensus_dynamics. "
+            "Used by candidate visualization and by head_contribution when module `cross` is enabled. "
+            "Use empty string to analyze all heads in the selected layers, or `None` to analyze no cross-attention head."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_consensus_self_heads",
+        type=str,
+        default="",
+        help=(
+            "CSV self-attention head specs `LxHy` for trajectory_consensus_dynamics "
+            "head_contribution when module `self` is enabled. "
+            "Use empty string to analyze all heads in the selected layers, or `None` to analyze no self-attention head."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_consensus_modules",
+        type=str,
+        default="cross,self",
+        help="CSV module names for trajectory_consensus_dynamics head_contribution. Supported: cross,self.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_branch",
+        type=str,
+        default="cond",
+        choices=["cond", "uncond"],
+        help="CFG branch analyzed by trajectory_consensus_dynamics head_contribution.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_reference_distance_metric",
+        type=str,
+        default="center_l2",
+        help="CSV reference-distance metric names reused from head_trajectory_dynamics for early-alignment scatter plots.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_scatter_outlier_heads",
+        type=str,
+        default="",
+        help="CSV head tags like `L0H4` removed only from the filtered scatter plots.",
+    )
+    parser.add_argument("--trajectory_consensus_candidate_base_quantile", type=float, default=0.85)
+    parser.add_argument(
+        "--trajectory_consensus_candidate_split_quantiles",
+        type=str,
+        default="0.92,0.95,0.97",
+        help="CSV seed-support quantiles used to propose local maxima in trajectory_consensus_dynamics.",
+    )
+    parser.add_argument("--trajectory_consensus_candidate_smooth_radius", type=int, default=1)
+    parser.add_argument("--trajectory_consensus_candidate_stable_peak_min_levels", type=int, default=2)
+    parser.add_argument("--trajectory_consensus_candidate_peak_merge_distance", type=float, default=2.0)
+    parser.add_argument("--trajectory_consensus_candidate_preprocess_winsorize_quantile", type=float, default=0.995)
+    parser.add_argument("--trajectory_consensus_candidate_preprocess_despike_quantile", type=float, default=0.98)
+    parser.add_argument("--trajectory_consensus_candidate_min_component_area", type=int, default=4)
+    parser.add_argument("--trajectory_consensus_candidate_viz_num_frames", type=int, default=8)
+    parser.add_argument(
+        "--trajectory_consensus_contribution_method",
+        type=str,
+        default="exact_ablation",
+        choices=["exact_ablation", "taylor_approx"],
+        help=(
+            "Head-contribution method for trajectory_consensus_dynamics. "
+            "`exact_ablation` reruns one ablated forward per head. "
+            "`taylor_approx` uses attribution patching with a first-order Taylor approximation."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_consensus_ablate_position",
+        type=str,
+        default="pre_o",
+        choices=["pre_o", "post_o"],
+        help=(
+            "Activation position used by trajectory_consensus_dynamics head contribution. "
+            "`pre_o` patches the per-head attention output z before the output projection. "
+            "`post_o` patches the per-head residual write after the output projection."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_consensus_do_ablation",
+        type=_str2bool,
+        default=True,
+        help="When True, trajectory_consensus_dynamics runs the ablation branch (exact_ablation or taylor_approx).",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_do_direct_proxy",
+        type=_str2bool,
+        default=True,
+        help="When True, trajectory_consensus_dynamics runs the direct-proxy branch.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_compute_direct_projection",
+        type=_str2bool,
+        default=None,
+        help=(
+            "Deprecated alias for --trajectory_consensus_do_direct_proxy. "
+            "Kept for backward compatibility."
+        ),
+    )
+    parser.add_argument("--trajectory_consensus_object_mask_reference_step", type=int, default=50)
+    parser.add_argument("--trajectory_consensus_object_mask_reference_layer", type=int, default=27)
+    parser.add_argument(
+        "--trajectory_consensus_taylor_object_only",
+        type=_str2bool,
+        default=True,
+        help="When True, trajectory_consensus_dynamics Taylor attribution uses only object-region outputs and object-token activations.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_taylor_num_latent_frames",
+        type=int,
+        default=10,
+        help="Number of evenly sampled latent frames used by trajectory_consensus_dynamics Taylor attribution. Use -1 to keep all latent frames.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_taylor_metric_scope",
+        type=str,
+        default="obj",
+        choices=["obj", "global"],
+        help="Scalar target used by trajectory_consensus_dynamics Taylor attribution: object-region velocity sum or global velocity sum.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_taylor_use_gradient_checkpointing",
+        type=_str2bool,
+        default=True,
+        help="When True, trajectory_consensus_dynamics Taylor attribution uses gradient checkpointing for downstream Wan blocks.",
+    )
+    parser.add_argument("--trajectory_consensus_plot_only_from_csv", type=_str2bool, default=False)
+    parser.add_argument("--trajectory_consensus_skip_existing_plots", type=_str2bool, default=True)
+    parser.add_argument(
+        "--trajectory_consensus_num_workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of CPU worker processes used by trajectory_consensus_dynamics for "
+            "candidate-region extraction and candidate visualization rendering. "
+            "A non-positive value means use os.cpu_count()."
+        ),
+    )
 
     return parser
 
@@ -829,10 +1119,13 @@ def main():
         run_wan21_t2v_cross_attn_head_ablation,
         run_wan21_t2v_seed_to_trajectory_predictability,
         run_wan21_t2v_self_attention_distribution,
+        run_wan21_t2v_self_attention_viz,
+        run_wan21_t2v_self_attention_modulation,
         run_wan21_t2v_self_attention_temporal_kernel,
         run_wan21_t2v_step_window_cross_attn_off,
         run_wan21_t2v_step_window_ffn_off,
         run_wan21_t2v_step_window_prompt_replace,
+        run_wan21_t2v_trajectory_consensus_dynamics,
         run_wan21_t2v_trajectory_entropy,
         run_wan21_t2v_token_trajectory_seed_stability,
     )
@@ -858,6 +1151,11 @@ def main():
     self_attn_kernel_heads = _parse_csv_strs(args.self_attn_kernel_heads)
     self_attention_distribution_steps = _parse_csv_ints(args.self_attention_distribution_steps)
     self_attention_distribution_layers = _parse_csv_ints(args.self_attention_distribution_layers)
+    self_attention_viz_steps = _parse_csv_ints(args.self_attention_viz_steps)
+    self_attention_viz_layers = _parse_csv_ints(args.self_attention_viz_layers)
+    self_attention_viz_query_video_frame_indices = _parse_csv_ints(args.self_attention_viz_query_video_frame_indices)
+    self_attention_modulation_steps = _parse_csv_ints(args.self_attention_modulation_steps)
+    self_attention_modulation_layers = _parse_csv_ints(args.self_attention_modulation_layers)
     seed_to_trajectory_early_steps = _parse_csv_ints(args.seed_to_trajectory_early_steps)
     event_token_value_words = _parse_csv_strs(args.event_token_value_words)
     event_token_value_steps = _parse_csv_ints(args.event_token_value_steps)
@@ -866,8 +1164,17 @@ def main():
     target_object_words = _parse_csv_strs(args.target_object_words)
     target_verb_words = _parse_csv_strs(args.target_verb_words)
     seed_list = _parse_csv_ints(args.seed_list)
+    trajectory_consensus_stages = _parse_csv_strs(args.trajectory_consensus_stages)
+    trajectory_consensus_steps = _parse_csv_ints(args.trajectory_consensus_steps)
+    trajectory_consensus_layers = _parse_csv_ints(args.trajectory_consensus_layers)
+    trajectory_consensus_cross_heads = _parse_optional_csv_strs_with_none(args.trajectory_consensus_cross_heads)
+    trajectory_consensus_self_heads = _parse_optional_csv_strs_with_none(args.trajectory_consensus_self_heads)
+    trajectory_consensus_modules = _parse_csv_strs(args.trajectory_consensus_modules)
+    trajectory_consensus_reference_distance_metrics = _parse_csv_strs(args.trajectory_consensus_reference_distance_metric)
+    trajectory_consensus_scatter_outlier_heads = _parse_csv_strs(args.trajectory_consensus_scatter_outlier_heads)
     viz_layers = _parse_csv_ints(args.viz_layers)
     viz_frame_indices = _parse_csv_ints(args.viz_frame_indices)
+    self_attention_viz_viz_frame_indices = _parse_csv_ints(args.self_attention_viz_viz_frame_indices)
 
     parallel_cfg = Wan21T2VParallelConfig(
         t5_fsdp=args.t5_fsdp,
@@ -1097,6 +1404,69 @@ def main():
             self_attention_distribution_skip_existing_plots=args.self_attention_distribution_skip_existing_plots,
             save_video=args.save_video,
         )
+    elif experiment_name == "self_attention_viz":
+        if not target_object_words:
+            raise ValueError("--target_object_words is required for self_attention_viz.")
+        if not args.reuse_cross_attention_dir.strip():
+            raise ValueError("--reuse_cross_attention_dir is required for self_attention_viz.")
+        run_wan21_t2v_self_attention_viz(
+            **common_kwargs,
+            target_object_words=target_object_words,
+            target_verb_words=target_verb_words,
+            reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip(),
+            self_attention_viz_steps=self_attention_viz_steps,
+            self_attention_viz_layers=self_attention_viz_layers,
+            self_attention_viz_branch=args.self_attention_viz_branch,
+            self_attention_viz_reference_step=args.self_attention_viz_reference_step,
+            self_attention_viz_reference_layer=args.self_attention_viz_reference_layer,
+            self_attention_viz_reference_center_mode=args.self_attention_viz_reference_center_mode,
+            self_attention_viz_reference_center_power=args.self_attention_viz_reference_center_power,
+            self_attention_viz_reference_center_quantile=args.self_attention_viz_reference_center_quantile,
+            self_attention_viz_reference_preprocess_winsorize_quantile=(
+                args.self_attention_viz_reference_preprocess_winsorize_quantile
+            ),
+            self_attention_viz_reference_preprocess_despike_quantile=(
+                args.self_attention_viz_reference_preprocess_despike_quantile
+            ),
+            self_attention_viz_reference_preprocess_min_component_area=(
+                args.self_attention_viz_reference_preprocess_min_component_area
+            ),
+            self_attention_viz_support_radius_mode=args.self_attention_viz_support_radius_mode,
+            self_attention_viz_support_radius_fixed=args.self_attention_viz_support_radius_fixed,
+            self_attention_viz_support_radius_alpha=args.self_attention_viz_support_radius_alpha,
+            self_attention_viz_support_radius_min=args.self_attention_viz_support_radius_min,
+            self_attention_viz_support_radius_max_ratio=args.self_attention_viz_support_radius_max_ratio,
+            self_attention_viz_query_video_frame_indices=(
+                self_attention_viz_query_video_frame_indices if self_attention_viz_query_video_frame_indices else [1, 33, 41, 81]
+            ),
+            self_attention_viz_object_query_token_limit_per_frame=(
+                args.self_attention_viz_object_query_token_limit_per_frame
+            ),
+            self_attention_viz_num_viz_frames=args.self_attention_viz_num_viz_frames,
+            self_attention_viz_viz_frame_indices=(
+                self_attention_viz_viz_frame_indices if self_attention_viz_viz_frame_indices else None
+            ),
+            self_attention_viz_save_attention_pdfs=args.self_attention_viz_save_attention_pdfs,
+            self_attention_viz_attention_pdf_share_color_scale=(
+                args.self_attention_viz_attention_pdf_share_color_scale
+            ),
+            self_attention_viz_skip_existing_pdfs=args.self_attention_viz_skip_existing_pdfs,
+            self_attention_viz_stop_after_last_probe_step=args.self_attention_viz_stop_after_last_probe_step,
+            draw_self_attention_maps_only=args.draw_self_attention_maps_only,
+            draw_self_attention_maps_path=args.draw_self_attention_maps_path,
+            self_attention_viz_visualization_output_dir=args.self_attention_viz_visualization_output_dir,
+            self_attention_viz_num_workers=args.self_attention_viz_num_workers,
+            save_video=args.save_video,
+        )
+    elif experiment_name == "self_attention_modulation":
+        run_wan21_t2v_self_attention_modulation(
+            **common_kwargs,
+            self_attention_modulation_steps=self_attention_modulation_steps,
+            self_attention_modulation_layers=self_attention_modulation_layers,
+            self_attention_modulation_branch=args.self_attention_modulation_branch,
+            self_attention_modulation_stop_after_last_probe_step=args.self_attention_modulation_stop_after_last_probe_step,
+            save_video=args.save_video,
+        )
     elif experiment_name == "seed_to_trajectory_predictability":
         if not target_object_words:
             raise ValueError("--target_object_words is required for seed_to_trajectory_predictability.")
@@ -1225,6 +1595,7 @@ def main():
             draw_attention_map_only=args.draw_attention_map_only,
             draw_attention_maps_path=args.draw_attention_maps_path,
             visualization_output_dir=args.visualization_output_dir,
+            cross_attention_token_viz_num_workers=args.cross_attention_token_viz_num_workers,
         )
     elif experiment_name == "token_trajectory_seed_stability":
         if not target_object_words:
@@ -1264,6 +1635,52 @@ def main():
             object_trajectory_layer=args.object_traj_layer,
             object_trajectory_head=args.object_traj_head,
             reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
+        )
+    elif experiment_name == "trajectory_consensus_dynamics":
+        if (not args.trajectory_consensus_plot_only_from_csv) and (not target_object_words):
+            raise ValueError("--target_object_words is required for trajectory_consensus_dynamics.")
+        if (not args.trajectory_consensus_plot_only_from_csv) and (not args.reuse_cross_attention_dir.strip()):
+            raise ValueError("--reuse_cross_attention_dir is required for trajectory_consensus_dynamics.")
+        run_wan21_t2v_trajectory_consensus_dynamics(
+            **common_kwargs,
+            target_object_words=target_object_words,
+            target_verb_words=target_verb_words,
+            reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
+            reuse_head_trajectory_dynamics_dir=args.reuse_head_trajectory_dynamics_dir.strip() or None,
+            trajectory_consensus_stages=trajectory_consensus_stages,
+            trajectory_consensus_steps=trajectory_consensus_steps,
+            trajectory_consensus_layers=trajectory_consensus_layers,
+            trajectory_consensus_cross_heads=trajectory_consensus_cross_heads,
+            trajectory_consensus_self_heads=trajectory_consensus_self_heads,
+            trajectory_consensus_modules=trajectory_consensus_modules,
+            trajectory_consensus_branch=args.trajectory_consensus_branch,
+            trajectory_consensus_reference_distance_metrics=trajectory_consensus_reference_distance_metrics,
+            trajectory_consensus_scatter_outlier_heads=trajectory_consensus_scatter_outlier_heads,
+            trajectory_consensus_candidate_base_quantile=args.trajectory_consensus_candidate_base_quantile,
+            trajectory_consensus_candidate_split_quantiles=tuple(
+                float(x) for x in _parse_csv_strs(args.trajectory_consensus_candidate_split_quantiles)
+            ),
+            trajectory_consensus_candidate_smooth_radius=args.trajectory_consensus_candidate_smooth_radius,
+            trajectory_consensus_candidate_stable_peak_min_levels=args.trajectory_consensus_candidate_stable_peak_min_levels,
+            trajectory_consensus_candidate_peak_merge_distance=args.trajectory_consensus_candidate_peak_merge_distance,
+            trajectory_consensus_candidate_preprocess_winsorize_quantile=args.trajectory_consensus_candidate_preprocess_winsorize_quantile,
+            trajectory_consensus_candidate_preprocess_despike_quantile=args.trajectory_consensus_candidate_preprocess_despike_quantile,
+            trajectory_consensus_candidate_min_component_area=args.trajectory_consensus_candidate_min_component_area,
+            trajectory_consensus_candidate_viz_num_frames=args.trajectory_consensus_candidate_viz_num_frames,
+            trajectory_consensus_do_ablation=args.trajectory_consensus_do_ablation,
+            trajectory_consensus_contribution_method=args.trajectory_consensus_contribution_method,
+            trajectory_consensus_ablate_position=args.trajectory_consensus_ablate_position,
+            trajectory_consensus_do_direct_proxy=args.trajectory_consensus_do_direct_proxy,
+            trajectory_consensus_compute_direct_projection=args.trajectory_consensus_compute_direct_projection,
+            trajectory_consensus_object_mask_reference_step=args.trajectory_consensus_object_mask_reference_step,
+            trajectory_consensus_object_mask_reference_layer=args.trajectory_consensus_object_mask_reference_layer,
+            trajectory_consensus_taylor_object_only=args.trajectory_consensus_taylor_object_only,
+            trajectory_consensus_taylor_num_latent_frames=args.trajectory_consensus_taylor_num_latent_frames,
+            trajectory_consensus_taylor_metric_scope=args.trajectory_consensus_taylor_metric_scope,
+            trajectory_consensus_taylor_use_gradient_checkpointing=args.trajectory_consensus_taylor_use_gradient_checkpointing,
+            trajectory_consensus_plot_only_from_csv=args.trajectory_consensus_plot_only_from_csv,
+            trajectory_consensus_skip_existing_plots=args.trajectory_consensus_skip_existing_plots,
+            trajectory_consensus_num_workers=args.trajectory_consensus_num_workers,
         )
 
     print(f"[wan21_t2v_experiments] done. outputs: {output_dir}")

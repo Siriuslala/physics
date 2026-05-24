@@ -98,6 +98,7 @@ VISUALIZATION_OUTPUT_DIR=""
 
 STREAM_FLUSH_PER_STEP=False
 PLOT_DURING_SAMPLING=False
+CROSS_ATTENTION_TOKEN_VIZ_NUM_WORKERS=16
 
 # ==============================
 for PROMPT in "${PROMPTS[@]}"; do
@@ -166,7 +167,8 @@ for SEED in "${SEEDS[@]}"; do
         --plot_during_sampling $PLOT_DURING_SAMPLING \
         --draw_attention_map_only $DRAW_ATTENTION_MAP_ONLY \
         --draw_attention_maps_path "$DRAW_ATTENTION_MAPS_PATH" \
-        --visualization_output_dir "$VISUALIZATION_OUTPUT_DIR"
+        --visualization_output_dir "$VISUALIZATION_OUTPUT_DIR" \
+        --cross_attention_token_viz_num_workers $CROSS_ATTENTION_TOKEN_VIZ_NUM_WORKERS
 
     echo "Finished cross_attention_token_viz | prompt: $PROMPT | seed: $SEED"
     echo ""

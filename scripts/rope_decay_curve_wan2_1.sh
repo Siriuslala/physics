@@ -1,6 +1,9 @@
 source ./env.sh
 cd $ROOT_DIR
 
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate video
+
 task="t2v-1.3B"
 SIZE="832*480"
 FRAME_NUM=81

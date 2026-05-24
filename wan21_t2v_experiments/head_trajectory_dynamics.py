@@ -626,6 +626,7 @@ def _materialize_wan21_t2v_motion_planning_filtered_centers(
     filtered_center_cache_payload: Dict[str, object],
     filtered_center_cache_path: str,
     center_config: Dict[str, object],
+    num_workers: int,
     progress_desc: str,
     cache_save_interval: int = 256,
 ) -> Tuple[Dict[Tuple[int, int, int], torch.Tensor], int, int]:
@@ -652,6 +653,7 @@ def _materialize_wan21_t2v_motion_planning_filtered_centers(
         progress_bar = None
 
     try:
+        missing_tasks: List[Tuple[int, int, int, torch.Tensor, Dict[str, object]]] = []
         for step_index, layer_index, head_index in keys:
             key = (int(step_index), int(layer_index), int(head_index))
             cached_trajectory = _get_wan21_t2v_cached_center_trajectory(
@@ -661,40 +663,47 @@ def _materialize_wan21_t2v_motion_planning_filtered_centers(
                 head=int(head_index),
             )
             if cached_trajectory is None:
-                filtered_center_trajectory, _ = _extract_wan21_t2v_head_trajectory_centers(
-                    map_fhw=filtered_probability_maps_by_step_layer_head[key],
-                    center_method=str(center_config["center_method"]),
-                    center_power=float(center_config["center_power"]),
-                    center_quantile=float(center_config["center_quantile"]),
-                    preprocessed_center_mode=str(center_config["preprocessed_center_mode"]),
-                    preprocess_winsorize_quantile=float(center_config["preprocess_winsorize_quantile"]),
-                    preprocess_despike_quantile=float(center_config["preprocess_despike_quantile"]),
-                    preprocess_min_component_area=int(center_config["preprocess_min_component_area"]),
-                )
-                _set_wan21_t2v_cached_center_trajectory(
-                    cache_payload=filtered_center_cache_payload,
-                    step=int(step_index),
-                    layer=int(layer_index),
-                    head=int(head_index),
-                    trajectory=filtered_center_trajectory,
-                )
-                filtered_center_trajectories_by_key[key] = _center_trajectory_wan21_t2v_to_tensor(
-                    filtered_center_trajectory
-                )
-                cache_misses += 1
-                pending_cache_writes += 1
-                if pending_cache_writes >= int(cache_save_interval):
-                    _save_wan21_t2v_head_trajectory_cache(
-                        filtered_center_cache_path,
-                        filtered_center_cache_payload,
+                missing_tasks.append(
+                    (
+                        int(step_index),
+                        int(layer_index),
+                        int(head_index),
+                        filtered_probability_maps_by_step_layer_head[key],
+                        dict(center_config),
                     )
-                    pending_cache_writes = 0
+                )
             else:
                 filtered_center_trajectories_by_key[key] = _center_trajectory_wan21_t2v_to_tensor(cached_trajectory)
                 cache_hits += 1
+                if progress_bar is not None:
+                    progress_bar.update(1)
+
+        for key, filtered_center_trajectory in _iter_wan21_t2v_parallel_results(
+            tasks=missing_tasks,
+            worker_fn=_build_wan21_t2v_head_center_extraction_task,
+            num_workers=int(num_workers),
+        ):
+            _set_wan21_t2v_cached_center_trajectory(
+                cache_payload=filtered_center_cache_payload,
+                step=int(key[0]),
+                layer=int(key[1]),
+                head=int(key[2]),
+                trajectory=filtered_center_trajectory,
+            )
+            filtered_center_trajectories_by_key[key] = _center_trajectory_wan21_t2v_to_tensor(
+                filtered_center_trajectory
+            )
+            cache_misses += 1
+            pending_cache_writes += 1
+            if pending_cache_writes >= int(cache_save_interval):
+                _save_wan21_t2v_head_trajectory_cache(
+                    filtered_center_cache_path,
+                    filtered_center_cache_payload,
+                )
+                pending_cache_writes = 0
             if progress_bar is not None:
                 progress_bar.update(1)
-        if pending_cache_writes > 0:
+        if pending_cache_writes > 0 and filtered_center_cache_path:
             _save_wan21_t2v_head_trajectory_cache(
                 filtered_center_cache_path,
                 filtered_center_cache_payload,
@@ -1058,6 +1067,50 @@ def _build_wan21_t2v_filtered_center_cache_basename(
     ]
     return "_".join(parts) + ".json"
 
+
+def _build_wan21_t2v_head_trajectory_center_overlay_dir(
+    output_dir: str,
+    use_motion_planning_region_before_metrics: bool,
+    use_preprocessed_component_center: bool,
+    preprocessed_center_mode: str,
+) -> str:
+    """Build the center-overlay directory name with preprocessing flags."""
+    mode_name = _format_wan21_t2v_value_for_filename(preprocessed_center_mode)
+    return os.path.join(
+        output_dir,
+        "_".join(
+            [
+                "head_trajectory_dynamics_head_center_overlays",
+                "motion_planning_region_on" if bool(use_motion_planning_region_before_metrics) else "motion_planning_region_off",
+                "preprocessed_on" if bool(use_preprocessed_component_center) else "preprocessed_off",
+                f"center_mode_{mode_name}",
+            ]
+        ),
+    )
+
+
+def _build_wan21_t2v_head_trajectory_metrics_output_dir(
+    output_dir: str,
+    hypothesis_name: str,
+    use_motion_planning_region_before_metrics: bool,
+    use_preprocessed_component_center: bool,
+    preprocessed_center_mode: str,
+) -> str:
+    """Build the metric-output directory name with preprocessing flags."""
+    mode_name = _format_wan21_t2v_value_for_filename(preprocessed_center_mode)
+    return os.path.join(
+        output_dir,
+        "_".join(
+            [
+                "head_trajectory_dynamics_metrics",
+                f"hypothesis_{_format_wan21_t2v_value_for_filename(hypothesis_name)}",
+                "motion_planning_region_on" if bool(use_motion_planning_region_before_metrics) else "motion_planning_region_off",
+                "preprocessed_on" if bool(use_preprocessed_component_center) else "preprocessed_off",
+                f"center_mode_{mode_name}",
+            ]
+        ),
+    )
+
 def _load_wan21_t2v_head_trajectory_cache(cache_path: str) -> Dict[str, object]:
     """Load one trajectory-cache JSON file if it exists, otherwise create an empty cache payload."""
     candidate_paths = [cache_path, f"{cache_path}.bak"]
@@ -1099,6 +1152,8 @@ def _save_wan21_t2v_head_trajectory_cache(cache_path: str, payload: Dict[str, ob
 def _build_wan21_t2v_head_trajectory_metrics_subdir(
     hypothesis_name: str,
     use_motion_planning_region_before_metrics: bool,
+    use_preprocessed_component_center: bool,
+    preprocessed_center_mode: str,
 ) -> str:
     """Build the metrics-output subdirectory name."""
     return "_".join(
@@ -1109,6 +1164,8 @@ def _build_wan21_t2v_head_trajectory_metrics_subdir(
                 if bool(use_motion_planning_region_before_metrics)
                 else "motion_planning_region_off"
             ),
+            "preprocessed_on" if bool(use_preprocessed_component_center) else "preprocessed_off",
+            f"center_mode_{_format_wan21_t2v_value_for_filename(preprocessed_center_mode)}",
         ]
     )
 
@@ -1547,6 +1604,10 @@ def _resolve_wan21_t2v_overlay_specs(
     requested_head_lookup = set((int(layer_idx), int(head_idx)) for layer_idx, head_idx in requested_head_set)
     requested_center_lookup = set((int(layer_idx), int(head_idx)) for layer_idx, head_idx in requested_center_viz_head_set)
     requested_support_lookup = set((int(layer_idx), int(head_idx)) for layer_idx, head_idx in requested_support_viz_head_set)
+    all_available_heads_lookup = set(
+        (int(layer_idx), int(head_idx))
+        for _, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
+    )
 
     center_overlay_specs: List[Tuple[int, int, int]] = []
     support_viz_specs: List[Tuple[int, int, int]] = []
@@ -1590,6 +1651,14 @@ def _resolve_wan21_t2v_overlay_specs(
                     if (int(layer_idx), int(head_idx)) in requested_head_lookup
                 ]
             )
+        else:
+            center_overlay_specs = sorted(
+                [
+                    (int(step_idx), int(layer_idx), int(head_idx))
+                    for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
+                    if (int(layer_idx), int(head_idx)) in all_available_heads_lookup
+                ]
+            )
 
     if bool(head_trajectory_dynamics_support_viz_enable):
         explicit_support_viz = (
@@ -1630,6 +1699,14 @@ def _resolve_wan21_t2v_overlay_specs(
                     if (int(layer_idx), int(head_idx)) in requested_head_lookup
                 ]
             )
+        else:
+            support_viz_specs = sorted(
+                [
+                    (int(step_idx), int(layer_idx), int(head_idx))
+                    for step_idx, layer_idx, head_idx in probability_maps_by_step_layer_head.keys()
+                    if (int(layer_idx), int(head_idx)) in all_available_heads_lookup
+                ]
+            )
 
     return center_overlay_specs, support_viz_specs
 
@@ -1655,9 +1732,17 @@ def _render_wan21_t2v_head_trajectory_overlays(
     head_trajectory_dynamics_skip_existing_plots: bool,
     reuse_video_frame_count: int,
     overlay_num_workers: int,
+    use_motion_planning_region_before_metrics: bool,
+    use_preprocessed_component_center: bool,
+    preprocessed_center_mode: str,
 ) -> Tuple[List[str], str, str, int, int]:
     """Render center/support overlays from raw maps, raw centers, and precomputed support masks."""
-    center_overlay_dir = os.path.join(output_dir, "head_trajectory_dynamics_head_center_overlays")
+    center_overlay_dir = _build_wan21_t2v_head_trajectory_center_overlay_dir(
+        output_dir=output_dir,
+        use_motion_planning_region_before_metrics=bool(use_motion_planning_region_before_metrics),
+        use_preprocessed_component_center=bool(use_preprocessed_component_center),
+        preprocessed_center_mode=str(preprocessed_center_mode),
+    )
     support_overlap_mask_dir = os.path.join(output_dir, "head_trajectory_dynamics_support_overlap_masks")
     center_overlay_specs, support_viz_specs = _resolve_wan21_t2v_overlay_specs(
         probability_maps_by_step_layer_head=probability_maps_by_step_layer_head,
@@ -2533,14 +2618,37 @@ def run_wan21_t2v_head_trajectory_dynamics(
     requested_center_viz_head_set = set(parsed_center_viz_heads)
     parsed_support_viz_heads = _parse_wan21_t2v_layer_head_specs(head_trajectory_dynamics_support_viz_heads)
     requested_support_viz_head_set = set(parsed_support_viz_heads)
-    metrics_output_dir = os.path.join(
-        output_dir,
-        _build_wan21_t2v_head_trajectory_metrics_subdir(
-            hypothesis_name=str(head_trajectory_dynamics_hypothesis),
-            use_motion_planning_region_before_metrics=bool(
-                head_trajectory_dynamics_use_motion_planning_region_before_metrics
-            ),
+
+    ordinary_center_config = _resolve_wan21_t2v_head_trajectory_center_config(
+        center_method=str(head_trajectory_dynamics_center_method),
+        center_power=float(head_trajectory_dynamics_center_power),
+        center_quantile=float(head_trajectory_dynamics_center_quantile),
+        preprocessed_center_mode=str(head_trajectory_dynamics_preprocessed_center_mode),
+        preprocess_winsorize_quantile=float(head_trajectory_dynamics_preprocess_winsorize_quantile),
+        preprocess_despike_quantile=float(head_trajectory_dynamics_preprocess_despike_quantile),
+        preprocess_min_component_area=int(head_trajectory_dynamics_preprocess_min_component_area),
+    )
+    reference_center_config = _resolve_wan21_t2v_head_trajectory_reference_center_config(
+        ordinary_center_config=ordinary_center_config,
+        reference_center_method=str(head_trajectory_dynamics_reference_center_method),
+        reference_center_power=float(head_trajectory_dynamics_reference_center_power),
+        reference_center_quantile=float(head_trajectory_dynamics_reference_center_quantile),
+        reference_preprocessed_center_mode=str(head_trajectory_dynamics_reference_preprocessed_center_mode),
+        reference_preprocess_winsorize_quantile=float(head_trajectory_dynamics_reference_preprocess_winsorize_quantile),
+        reference_preprocess_despike_quantile=float(head_trajectory_dynamics_reference_preprocess_despike_quantile),
+        reference_preprocess_min_component_area=int(head_trajectory_dynamics_reference_preprocess_min_component_area),
+    )
+    use_preprocessed_component_center = (
+        str(ordinary_center_config["center_method"]).strip().lower() == "preprocessed_component_center"
+    )
+    metrics_output_dir = _build_wan21_t2v_head_trajectory_metrics_output_dir(
+        output_dir=output_dir,
+        hypothesis_name=str(head_trajectory_dynamics_hypothesis),
+        use_motion_planning_region_before_metrics=bool(
+            head_trajectory_dynamics_use_motion_planning_region_before_metrics
         ),
+        use_preprocessed_component_center=bool(use_preprocessed_component_center),
+        preprocessed_center_mode=str(ordinary_center_config["preprocessed_center_mode"]),
     )
     need_motion_planning_region_masks = (
         bool(head_trajectory_dynamics_support_viz_enable)
@@ -2564,26 +2672,6 @@ def run_wan21_t2v_head_trajectory_dynamics(
     motion_planning_region_cache_misses = 0
     motion_planning_region_pending_cache_writes = 0
     motion_planning_region_cache_save_interval = max(1, int(head_trajectory_dynamics_cache_save_interval))
-
-    ordinary_center_config = _resolve_wan21_t2v_head_trajectory_center_config(
-        center_method=str(head_trajectory_dynamics_center_method),
-        center_power=float(head_trajectory_dynamics_center_power),
-        center_quantile=float(head_trajectory_dynamics_center_quantile),
-        preprocessed_center_mode=str(head_trajectory_dynamics_preprocessed_center_mode),
-        preprocess_winsorize_quantile=float(head_trajectory_dynamics_preprocess_winsorize_quantile),
-        preprocess_despike_quantile=float(head_trajectory_dynamics_preprocess_despike_quantile),
-        preprocess_min_component_area=int(head_trajectory_dynamics_preprocess_min_component_area),
-    )
-    reference_center_config = _resolve_wan21_t2v_head_trajectory_reference_center_config(
-        ordinary_center_config=ordinary_center_config,
-        reference_center_method=str(head_trajectory_dynamics_reference_center_method),
-        reference_center_power=float(head_trajectory_dynamics_reference_center_power),
-        reference_center_quantile=float(head_trajectory_dynamics_reference_center_quantile),
-        reference_preprocessed_center_mode=str(head_trajectory_dynamics_reference_preprocessed_center_mode),
-        reference_preprocess_winsorize_quantile=float(head_trajectory_dynamics_reference_preprocess_winsorize_quantile),
-        reference_preprocess_despike_quantile=float(head_trajectory_dynamics_reference_preprocess_despike_quantile),
-        reference_preprocess_min_component_area=int(head_trajectory_dynamics_reference_preprocess_min_component_area),
-    )
     center_method_name = str(ordinary_center_config["center_method"])
     cache_basename = _build_wan21_t2v_head_trajectory_cache_basename(
         center_method=center_method_name,
@@ -2603,27 +2691,36 @@ def run_wan21_t2v_head_trajectory_dynamics(
     cache_save_interval = max(1, int(head_trajectory_dynamics_cache_save_interval))
     pending_cache_writes = 0
 
-    filtered_center_cache_basename = _build_wan21_t2v_filtered_center_cache_basename(
-        ordinary_center_config=ordinary_center_config,
-        reference_center_config=reference_center_config,
-        support_quantile=float(head_trajectory_dynamics_support_quantile),
-        support_viz_contour_min_component_area=int(head_trajectory_dynamics_support_viz_contour_min_component_area),
-        reference_step=int(head_trajectory_dynamics_reference_step),
-        reference_layer=int(head_trajectory_dynamics_reference_layer),
-    )
-    filtered_center_cache_path = os.path.join(output_dir, filtered_center_cache_basename)
-    filtered_center_cache_payload = _load_wan21_t2v_head_trajectory_cache(filtered_center_cache_path)
-    filtered_center_cache_payload["center_method"] = center_method_name
-    filtered_center_cache_payload["algorithm_params"] = dict(ordinary_center_config)
-    filtered_center_cache_payload["reference_algorithm_params"] = dict(reference_center_config)
-    filtered_center_cache_payload["support_quantile"] = float(head_trajectory_dynamics_support_quantile)
-    filtered_center_cache_payload["support_viz_contour_min_component_area"] = int(
-        head_trajectory_dynamics_support_viz_contour_min_component_area
-    )
-    filtered_center_cache_payload["reference_step"] = int(head_trajectory_dynamics_reference_step)
-    filtered_center_cache_payload["reference_layer"] = int(head_trajectory_dynamics_reference_layer)
+    filtered_center_cache_path = ""
+    filtered_center_cache_payload: Dict[str, object] = {"trajectories": {}}
     filtered_center_cache_hits = 0
     filtered_center_cache_misses = 0
+    filtered_center_cache_enabled = (
+        bool(head_trajectory_dynamics_use_motion_planning_region_before_metrics)
+        and (not bool(use_preprocessed_component_center))
+    )
+    if filtered_center_cache_enabled:
+        filtered_center_cache_basename = _build_wan21_t2v_filtered_center_cache_basename(
+            ordinary_center_config=ordinary_center_config,
+            reference_center_config=reference_center_config,
+            support_quantile=float(head_trajectory_dynamics_support_quantile),
+            support_viz_contour_min_component_area=int(head_trajectory_dynamics_support_viz_contour_min_component_area),
+            reference_step=int(head_trajectory_dynamics_reference_step),
+            reference_layer=int(head_trajectory_dynamics_reference_layer),
+        )
+        filtered_center_cache_path = os.path.join(output_dir, filtered_center_cache_basename)
+        filtered_center_cache_payload = _load_wan21_t2v_head_trajectory_cache(filtered_center_cache_path)
+        filtered_center_cache_payload["center_method"] = center_method_name
+        filtered_center_cache_payload["algorithm_params"] = dict(ordinary_center_config)
+        filtered_center_cache_payload["reference_algorithm_params"] = dict(reference_center_config)
+        filtered_center_cache_payload["support_quantile"] = float(head_trajectory_dynamics_support_quantile)
+        filtered_center_cache_payload["support_viz_contour_min_component_area"] = int(
+            head_trajectory_dynamics_support_viz_contour_min_component_area
+        )
+        filtered_center_cache_payload["reference_step"] = int(head_trajectory_dynamics_reference_step)
+        filtered_center_cache_payload["reference_layer"] = int(head_trajectory_dynamics_reference_layer)
+    else:
+        filtered_center_cache_path = ""
 
     if head_trajectory_dynamics_reference_step not in set(available_steps):
         raise ValueError(
@@ -2831,6 +2928,11 @@ def run_wan21_t2v_head_trajectory_dynamics(
         head_trajectory_dynamics_skip_existing_plots=bool(head_trajectory_dynamics_skip_existing_plots),
         reuse_video_frame_count=int(reuse_video_frame_count),
         overlay_num_workers=int(head_trajectory_dynamics_overlay_num_workers),
+        use_motion_planning_region_before_metrics=bool(
+            head_trajectory_dynamics_use_motion_planning_region_before_metrics
+        ),
+        use_preprocessed_component_center=bool(use_preprocessed_component_center),
+        preprocessed_center_mode=str(ordinary_center_config["preprocessed_center_mode"]),
     )
 
     if bool(head_trajectory_dynamics_overlay_only):
@@ -2880,63 +2982,70 @@ def run_wan21_t2v_head_trajectory_dynamics(
                 progress_desc="head_trajectory apply mask",
             ),
         )
-        (
-            filtered_center_trajectories_by_step_layer_head,
-            filter_cache_hits,
-            filter_cache_misses,
-        ) = _materialize_wan21_t2v_motion_planning_filtered_centers(
-            filtered_probability_maps_by_step_layer_head=filtered_probability_maps_by_step_layer_head,
-            filtered_center_cache_payload=filtered_center_cache_payload,
-            filtered_center_cache_path=filtered_center_cache_path,
-            center_config=ordinary_center_config,
-            progress_desc="head_trajectory filtered centers",
-            cache_save_interval=int(cache_save_interval),
-        )
-        filtered_center_cache_hits += int(filter_cache_hits)
-        filtered_center_cache_misses += int(filter_cache_misses)
-
         probability_maps_by_step_layer_head = filtered_probability_maps_by_step_layer_head
-        center_trajectories_by_step_layer_head = filtered_center_trajectories_by_step_layer_head
+        if bool(use_preprocessed_component_center):
+            filtered_center_trajectories_by_step_layer_head = center_trajectories_by_step_layer_head
+        else:
+            (
+                filtered_center_trajectories_by_step_layer_head,
+                filter_cache_hits,
+                filter_cache_misses,
+            ) = _materialize_wan21_t2v_motion_planning_filtered_centers(
+                filtered_probability_maps_by_step_layer_head=filtered_probability_maps_by_step_layer_head,
+                filtered_center_cache_payload=filtered_center_cache_payload,
+                filtered_center_cache_path=filtered_center_cache_path,
+                center_config=ordinary_center_config,
+                num_workers=int(head_trajectory_dynamics_center_cache_num_workers),
+                progress_desc="head_trajectory filtered centers",
+                cache_save_interval=int(cache_save_interval),
+            )
+            filtered_center_cache_hits += int(filter_cache_hits)
+            filtered_center_cache_misses += int(filter_cache_misses)
+            center_trajectories_by_step_layer_head = filtered_center_trajectories_by_step_layer_head
         reference_probability_map = _apply_wan21_t2v_motion_planning_region_to_probability_map(
             probability_map_fhw=reference_probability_map,
             motion_planning_region_mask_fhw=reference_motion_planning_region_mask,
         )
-        filtered_reference_center_trajectory = _get_wan21_t2v_cached_reference_center_trajectory(
-            cache_payload=filtered_center_cache_payload
-        )
-        if filtered_reference_center_trajectory is None:
-            reference_center_trajectory, reference_center_stats = _extract_wan21_t2v_head_trajectory_centers(
-                map_fhw=reference_probability_map,
-                center_method=str(reference_center_config["center_method"]),
-                center_power=float(reference_center_config["center_power"]),
-                center_quantile=float(reference_center_config["center_quantile"]),
-                preprocessed_center_mode=str(reference_center_config["preprocessed_center_mode"]),
-                preprocess_winsorize_quantile=float(reference_center_config["preprocess_winsorize_quantile"]),
-                preprocess_despike_quantile=float(reference_center_config["preprocess_despike_quantile"]),
-                preprocess_min_component_area=int(reference_center_config["preprocess_min_component_area"]),
-            )
+        if bool(use_preprocessed_component_center):
             filtered_reference_center_trajectory = reference_center_trajectory
-            _set_wan21_t2v_cached_reference_center_trajectory(
-                cache_payload=filtered_center_cache_payload,
-                trajectory=filtered_reference_center_trajectory,
-            )
-            filtered_center_cache_payload["reference_center_stats"] = dict(reference_center_stats)
-            filtered_center_cache_misses += 1
-            _save_wan21_t2v_head_trajectory_cache(filtered_center_cache_path, filtered_center_cache_payload)
+            final_reference_center = _center_trajectory_wan21_t2v_to_tensor(filtered_reference_center_trajectory)
         else:
-            filtered_center_cache_hits += 1
-            reference_center_stats = filtered_center_cache_payload.get("reference_center_stats", {})
-            if not isinstance(reference_center_stats, dict):
-                reference_center_stats = {
-                    "center_method": str(reference_center_config["center_method"]),
-                    "center_power": float(reference_center_config["center_power"]),
-                    "center_quantile": float(reference_center_config["center_quantile"]),
-                    "preprocess_enabled": 1
-                    if str(reference_center_config["center_method"]).strip().lower() == "preprocessed_component_center"
-                    else 0,
-                    "preprocessed_center_mode": str(reference_center_config["preprocessed_center_mode"]).strip().lower(),
-                }
-        final_reference_center = _center_trajectory_wan21_t2v_to_tensor(filtered_reference_center_trajectory)
+            filtered_reference_center_trajectory = _get_wan21_t2v_cached_reference_center_trajectory(
+                cache_payload=filtered_center_cache_payload
+            )
+            if filtered_reference_center_trajectory is None:
+                reference_center_trajectory, reference_center_stats = _extract_wan21_t2v_head_trajectory_centers(
+                    map_fhw=reference_probability_map,
+                    center_method=str(reference_center_config["center_method"]),
+                    center_power=float(reference_center_config["center_power"]),
+                    center_quantile=float(reference_center_config["center_quantile"]),
+                    preprocessed_center_mode=str(reference_center_config["preprocessed_center_mode"]),
+                    preprocess_winsorize_quantile=float(reference_center_config["preprocess_winsorize_quantile"]),
+                    preprocess_despike_quantile=float(reference_center_config["preprocess_despike_quantile"]),
+                    preprocess_min_component_area=int(reference_center_config["preprocess_min_component_area"]),
+                )
+                filtered_reference_center_trajectory = reference_center_trajectory
+                _set_wan21_t2v_cached_reference_center_trajectory(
+                    cache_payload=filtered_center_cache_payload,
+                    trajectory=filtered_reference_center_trajectory,
+                )
+                filtered_center_cache_payload["reference_center_stats"] = dict(reference_center_stats)
+                filtered_center_cache_misses += 1
+                _save_wan21_t2v_head_trajectory_cache(filtered_center_cache_path, filtered_center_cache_payload)
+            else:
+                filtered_center_cache_hits += 1
+                reference_center_stats = filtered_center_cache_payload.get("reference_center_stats", {})
+                if not isinstance(reference_center_stats, dict):
+                    reference_center_stats = {
+                        "center_method": str(reference_center_config["center_method"]),
+                        "center_power": float(reference_center_config["center_power"]),
+                        "center_quantile": float(reference_center_config["center_quantile"]),
+                        "preprocess_enabled": 1
+                        if str(reference_center_config["center_method"]).strip().lower() == "preprocessed_component_center"
+                        else 0,
+                        "preprocessed_center_mode": str(reference_center_config["preprocessed_center_mode"]).strip().lower(),
+                    }
+            final_reference_center = _center_trajectory_wan21_t2v_to_tensor(filtered_reference_center_trajectory)
 
     reference_distance_rows = []
     center_rows = []
@@ -3165,20 +3274,34 @@ def run_wan21_t2v_head_trajectory_dynamics(
                             )
                             future_distances = []
                             for future_step in future_steps:
-                                if int(follower_head) not in future_head_sets[int(future_step)]:
+                                future_head_set = future_head_sets[int(future_step)]
+                                if (
+                                    int(follower_head) not in future_head_set
+                                    or int(leader_head) not in future_head_set
+                                ):
                                     continue
                                 follower_future_key = (int(future_step), int(layer_index), int(follower_head))
+                                leader_future_key = (int(future_step), int(layer_index), int(leader_head))
+                                if (
+                                    follower_future_key not in center_trajectories_by_step_layer_head
+                                    or leader_future_key not in center_trajectories_by_step_layer_head
+                                    or follower_future_key not in probability_maps_by_step_layer_head
+                                    or leader_future_key not in probability_maps_by_step_layer_head
+                                ):
+                                    continue
                                 follower_future = center_trajectories_by_step_layer_head[follower_future_key]
                                 follower_future_prob = probability_maps_by_step_layer_head[follower_future_key]
+                                leader_future = center_trajectories_by_step_layer_head[leader_future_key]
+                                leader_future_prob = probability_maps_by_step_layer_head[leader_future_key]
                                 future_distances.append(
                                     (
                                         int(future_step),
                                         _compute_wan21_t2v_head_trajectory_distance(
                                             metric_name=attractor_distance_metric,
                                             probability_map_a_fhw=follower_future_prob,
-                                            probability_map_b_fhw=leader_prob,
+                                            probability_map_b_fhw=leader_future_prob,
                                             center_traj_a=follower_future,
-                                            center_traj_b=leader_traj,
+                                            center_traj_b=leader_future,
                                             support_quantile=float(head_trajectory_dynamics_support_quantile),
                                             use_motion_planning_region_for_support_overlap=bool(
                                                 head_trajectory_dynamics_use_motion_planning_region_before_metrics
@@ -3188,8 +3311,8 @@ def run_wan21_t2v_head_trajectory_dynamics(
                                                 if follower_future_key in support_masks_by_key else None
                                             ),
                                             support_mask_b_fhw=(
-                                                support_masks_by_key[leader_key]
-                                                if leader_key in support_masks_by_key else None
+                                                support_masks_by_key[leader_future_key]
+                                                if leader_future_key in support_masks_by_key else None
                                             ),
                                         ),
                                     )
@@ -3357,6 +3480,7 @@ def run_wan21_t2v_head_trajectory_dynamics(
         ],
         "center_viz_num_frames": int(head_trajectory_dynamics_center_viz_num_frames),
         "center_overlay_dir": center_overlay_dir,
+        "center_overlay_path_policy": "motion_planning_region_on_or_off_preprocessed_on_or_off_center_mode",
         "num_center_overlay_pdfs": int(num_center_overlay_pdfs),
         "head_trajectory_dynamics_support_viz_enable": bool(head_trajectory_dynamics_support_viz_enable),
         "support_viz_step": int(head_trajectory_dynamics_support_viz_step),
@@ -3373,6 +3497,8 @@ def run_wan21_t2v_head_trajectory_dynamics(
         "motion_planning_region_cache_json": motion_planning_region_cache_path,
         "motion_planning_region_cache_hits": int(motion_planning_region_cache_hits),
         "motion_planning_region_cache_misses": int(motion_planning_region_cache_misses),
+        "filtered_center_cache_json": filtered_center_cache_path,
+        "filtered_center_cache_enabled": bool(filtered_center_cache_enabled),
         "head_trajectory_dynamics_support_cache_num_workers": int(head_trajectory_dynamics_support_cache_num_workers),
         "head_trajectory_dynamics_center_cache_num_workers": int(head_trajectory_dynamics_center_cache_num_workers),
         "head_trajectory_dynamics_overlay_num_workers": int(head_trajectory_dynamics_overlay_num_workers),

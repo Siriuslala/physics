@@ -33,33 +33,15 @@ where:
 
 For map-level distances, each frame is normalized spatially:
 
-\[
-P_f^{(s,\ell,h)}(y,x)
-=
-\frac{A_f^{(s,\ell,h)}(y,x)}
-{\sum_{y'=1}^{H}\sum_{x'=1}^{W} A_f^{(s,\ell,h)}(y',x') + \varepsilon},
-\qquad
-\varepsilon>0.
-\]
+\[ P_f^{(s,\ell,h)}(y,x) = \frac{A_f^{(s,\ell,h)}(y,x)}{\sum_{y'=1}^{H}\sum_{x'=1}^{W} A_f^{(s,\ell,h)}(y',x') + \varepsilon}, \qquad \varepsilon>0. \]
 
 Hence
 
-\[
-P^{(s,\ell,h)} \in \mathbb{R}_{\ge 0}^{F \times H \times W},
-\qquad
-\sum_{y=1}^{H}\sum_{x=1}^{W} P_f^{(s,\ell,h)}(y,x)=1
-\quad \forall f.
-\]
+\[ P^{(s,\ell,h)} \in \mathbb{R}_{\ge 0}^{F \times H \times W}, \qquad \sum_{y=1}^{H}\sum_{x=1}^{W} P_f^{(s,\ell,h)}(y,x)=1 \quad \forall f. \]
 
 For center-based distances, the experiment extracts a trajectory
 
-\[
-\mathcal{T}^{(s,\ell,h)}
-=
-\{c_f^{(s,\ell,h)}\}_{f=1}^{F},
-\qquad
-c_f^{(s,\ell,h)} \in \mathbb{R}^{2},
-\]
+\[ \mathcal{T}^{(s,\ell,h)} = \{c_f^{(s,\ell,h)}\}_{f=1}^{F}, \qquad c_f^{(s,\ell,h)} \in \mathbb{R}^{2}, \]
 
 where the two coordinates represent \((y,x)\) in token-grid space.
 
@@ -77,13 +59,7 @@ The reference object is not a single head. It is the head-mean object map at a u
 
 Let \(N_{\ell_{\mathrm{ref}}}\) be the number of heads at layer \(\ell_{\mathrm{ref}}\). The reference map is
 
-\[
-A^{\mathrm{ref}}
-=
-\frac{1}{N_{\ell_{\mathrm{ref}}}}
-\sum_{h=1}^{N_{\ell_{\mathrm{ref}}}}
-A^{(s_{\mathrm{ref}}, \ell_{\mathrm{ref}}, h)}.
-\]
+\[ A^{\mathrm{ref}} = \frac{1}{N_{\ell_{\mathrm{ref}}}} \sum_{h=1}^{N_{\ell_{\mathrm{ref}}}} A^{(s_{\mathrm{ref}}, \ell_{\mathrm{ref}}, h)}. \]
 
 Its normalized map is
 
@@ -157,25 +133,11 @@ For one frame \(A_f(y,x)\):
 
 If the retained component is denoted by \(\Omega_f\), the weights are
 
-\[
-w_f(y,x)=A_f(y,x)^p,
-\qquad
-(y,x)\in\Omega_f.
-\]
+\[ w_f(y,x)=A_f(y,x)^p, \qquad (y,x)\in\Omega_f. \]
 
 The extracted center is
 
-\[
-\hat y_f
-=
-\frac{\sum_{(y,x)\in\Omega_f} y\,w_f(y,x)}
-{\sum_{(y,x)\in\Omega_f} w_f(y,x)},
-\qquad
-\hat x_f
-=
-\frac{\sum_{(y,x)\in\Omega_f} x\,w_f(y,x)}
-{\sum_{(y,x)\in\Omega_f} w_f(y,x)}.
-\]
+\[ \hat y_f = \frac{\sum_{(y,x)\in\Omega_f} y\,w_f(y,x)}{\sum_{(y,x)\in\Omega_f} w_f(y,x)}, \qquad \hat x_f = \frac{\sum_{(y,x)\in\Omega_f} x\,w_f(y,x)}{\sum_{(y,x)\in\Omega_f} w_f(y,x)}. \]
 
 ### 4.2 `preprocessed_component_center`
 
@@ -197,31 +159,13 @@ If the retained cleaned component is \(\tilde\Omega_f\), then:
 
 - for `centroid`,
 
-\[
-\tilde w_f(y,x)=\tilde A_f(y,x)^p,
-\qquad
-(y,x)\in\tilde\Omega_f,
-\]
+\[ \tilde w_f(y,x)=\tilde A_f(y,x)^p, \qquad (y,x)\in\tilde\Omega_f, \]
 
-\[
-\hat y_f
-=
-\frac{\sum_{(y,x)\in\tilde\Omega_f} y\,\tilde w_f(y,x)}
-{\sum_{(y,x)\in\tilde\Omega_f} \tilde w_f(y,x)},
-\qquad
-\hat x_f
-=
-\frac{\sum_{(y,x)\in\tilde\Omega_f} x\,\tilde w_f(y,x)}
-{\sum_{(y,x)\in\tilde\Omega_f} \tilde w_f(y,x)};
-\]
+\[ \hat y_f = \frac{\sum_{(y,x)\in\tilde\Omega_f} y\,\tilde w_f(y,x)}{\sum_{(y,x)\in\tilde\Omega_f} \tilde w_f(y,x)}, \qquad \hat x_f = \frac{\sum_{(y,x)\in\tilde\Omega_f} x\,\tilde w_f(y,x)}{\sum_{(y,x)\in\tilde\Omega_f} \tilde w_f(y,x)}; \]
 
 - for `geometric_center`,
 
-\[
-\hat y_f=\frac{1}{|\tilde\Omega_f|}\sum_{(y,x)\in\tilde\Omega_f} y,
-\qquad
-\hat x_f=\frac{1}{|\tilde\Omega_f|}\sum_{(y,x)\in\tilde\Omega_f} x;
-\]
+\[ \hat y_f=\frac{1}{|\tilde\Omega_f|}\sum_{(y,x)\in\tilde\Omega_f} y, \qquad \hat x_f=\frac{1}{|\tilde\Omega_f|}\sum_{(y,x)\in\tilde\Omega_f} x; \]
 
 - for `peak`, the output is the argmax coordinate itself.
 
@@ -231,11 +175,7 @@ The experiment supports an additional intermediate object representation called 
 
 For one normalized frame \(P_f(y,x)\), define the raw support set by a quantile threshold \(q\):
 
-\[
-S_f
-=
-\{(y,x)\in\{1,\dots,H\}\times\{1,\dots,W\}: P_f(y,x)\ge Q_q(P_f)\},
-\]
+\[ S_f = \{(y,x)\in\{1,\dots,H\}\times\{1,\dots,W\}: P_f(y,x)\ge Q_q(P_f)\}, \]
 
 where \(Q_q(P_f)\) is the frame-wise empirical \(q\)-quantile of the flattened frame values.
 
@@ -263,12 +203,7 @@ If the experiment keeps only the motion-planning region, the filtered frame beco
 
 However, \(\bar P_f\) is not guaranteed to sum to one. Therefore the experiment renormalizes it:
 
-\[
-P_f^{\mathrm{mpr}}(y,x)
-=
-\frac{\bar P_f(y,x)}
-{\sum_{y'=1}^{H}\sum_{x'=1}^{W}\bar P_f(y',x')+\varepsilon}.
-\]
+\[ P_f^{\mathrm{mpr}}(y,x) = \frac{\bar P_f(y,x)}{\sum_{y'=1}^{H}\sum_{x'=1}^{W}\bar P_f(y',x')+\varepsilon}. \]
 
 This renormalization is necessary because:
 
@@ -282,11 +217,7 @@ If a frame becomes empty after filtering, the implementation falls back to the u
 
 If `head_trajectory_dynamics_use_motion_planning_region_before_metrics=True`, then for every analyzed head the experiment replaces
 
-\[
-P^{(s,\ell,h)}
-\longrightarrow
-P_{\mathrm{mpr}}^{(s,\ell,h)}
-\]
+\[ P^{(s,\ell,h)} \longrightarrow P_{\mathrm{mpr}}^{(s,\ell,h)} \]
 
 before computing:
 
@@ -296,7 +227,8 @@ before computing:
 - reference distances
 - convergence summaries
 
-The corresponding center trajectories are re-extracted from the filtered map.
+For `region_centroid`, the corresponding center trajectories are re-extracted from the filtered map.
+For `preprocessed_component_center`, the center extraction itself already includes the denoising stage, so the experiment reuses the original center trajectories and does not build a separate filtered-center cache.
 
 ## 6. Map-Level Distance Metrics
 
@@ -312,34 +244,15 @@ m_f=\frac{1}{2}(p_f+q_f).
 
 Then
 
-\[
-D_{\mathrm{JS}}(f)
-=
-\sqrt{
-\frac{1}{2}\operatorname{KL}(p_f\|m_f)
-+
-\frac{1}{2}\operatorname{KL}(q_f\|m_f)
-}.
-\]
+\[ D_{\mathrm{JS}}(f) = \sqrt{ \frac{1}{2}\operatorname{KL}(p_f\|m_f) + \frac{1}{2}\operatorname{KL}(q_f\|m_f) }. \]
 
 The stored distance is the frame mean:
 
-\[
-\bar D_{\mathrm{JS}}
-=
-\frac{1}{F}\sum_{f=1}^{F} D_{\mathrm{JS}}(f).
-\]
+\[ \bar D_{\mathrm{JS}} = \frac{1}{F}\sum_{f=1}^{F} D_{\mathrm{JS}}(f). \]
 
 ### 6.2 Hellinger Distance
 
-\[
-D_{\mathrm{Hell}}(f)
-=
-\frac{1}{\sqrt{2}}
-\left\|
-\sqrt{p_f}-\sqrt{q_f}
-\right\|_2.
-\]
+\[ D_{\mathrm{Hell}}(f) = \frac{1}{\sqrt{2}} \left\| \sqrt{p_f}-\sqrt{q_f} \right\|_2. \]
 
 Again the experiment stores the frame mean.
 
@@ -349,48 +262,21 @@ This metric is a project-specific map-level Wasserstein proxy, not full 2D optim
 
 For one frame, define row and column marginals:
 
-\[
-p_f^y(y)=\sum_{x=1}^{W} P_f(y,x),
-\qquad
-p_f^x(x)=\sum_{y=1}^{H} P_f(y,x),
-\]
+\[ p_f^y(y)=\sum_{x=1}^{W} P_f(y,x), \qquad p_f^x(x)=\sum_{y=1}^{H} P_f(y,x), \]
 
 and similarly \(q_f^y, q_f^x\).
 
 The 1D Wasserstein-1 distance on the row axis is computed by cumulative sums:
 
-\[
-W_1(p_f^y,q_f^y)
-=
-\sum_{y=1}^{H}
-\left|
-\operatorname{CDF}(p_f^y)(y)-\operatorname{CDF}(q_f^y)(y)
-\right|.
-\]
+\[ W_1(p_f^y,q_f^y) = \sum_{y=1}^{H} \left| \operatorname{CDF}(p_f^y)(y)-\operatorname{CDF}(q_f^y)(y) \right|. \]
 
 Likewise on the column axis:
 
-\[
-W_1(p_f^x,q_f^x)
-=
-\sum_{x=1}^{W}
-\left|
-\operatorname{CDF}(p_f^x)(x)-\operatorname{CDF}(q_f^x)(x)
-\right|.
-\]
+\[ W_1(p_f^x,q_f^x) = \sum_{x=1}^{W} \left| \operatorname{CDF}(p_f^x)(x)-\operatorname{CDF}(q_f^x)(x) \right|. \]
 
 The final proxy is
 
-\[
-D_{\mathrm{W-map}}(f)
-=
-\frac{1}{2}
-\Big(
-W_1(p_f^y,q_f^y)
-+
-W_1(p_f^x,q_f^x)
-\Big).
-\]
+\[ D_{\mathrm{W-map}}(f) = \frac{1}{2}\left[ W_1(p_f^y,q_f^y) + W_1(p_f^x,q_f^x) \right]. \]
 
 There is no claim that `wasserstein_map` is a standard published benchmark name. It is a descriptive project-specific label for this row/column-marginal proxy.
 
@@ -398,24 +284,11 @@ There is no claim that `wasserstein_map` is a standard published benchmark name.
 
 For two normalized frame distributions \(P_f\) and \(Q_f\), define raw support sets
 
-\[
-S_f^P
-=
-\{(y,x):P_f(y,x)\ge Q_q(P_f)\},
-\qquad
-S_f^Q
-=
-\{(y,x):Q_f(y,x)\ge Q_q(Q_f)\}.
-\]
+\[ S_f^P = \{(y,x):P_f(y,x)\ge Q_q(P_f)\}, \qquad S_f^Q = \{(y,x):Q_f(y,x)\ge Q_q(Q_f)\}. \]
 
 The frame-wise IoU is
 
-\[
-\operatorname{IoU}_f
-=
-\frac{|S_f^P \cap S_f^Q|}
-{|S_f^P \cup S_f^Q|}.
-\]
+\[ \operatorname{IoU}_f = \frac{|S_f^P \cap S_f^Q|}{|S_f^P \cup S_f^Q|}. \]
 
 The stored overlap score is the frame mean \(\frac{1}{F}\sum_f \operatorname{IoU}_f\), and the corresponding distance is
 
@@ -429,13 +302,7 @@ This definition uses the raw quantile support \(S_f\), not the contour-filtered 
 
 For two center trajectories
 
-\[
-\mathcal{T}^A=\{c_f^A\}_{f=1}^{F},
-\qquad
-\mathcal{T}^B=\{c_f^B\}_{f=1}^{F},
-\qquad
-c_f^A,c_f^B\in\mathbb{R}^{2},
-\]
+\[ \mathcal{T}^A=\{c_f^A\}_{f=1}^{F}, \qquad \mathcal{T}^B=\{c_f^B\}_{f=1}^{F}, \qquad c_f^A,c_f^B\in\mathbb{R}^{2}, \]
 
 the frame-wise Euclidean distance is
 
@@ -445,11 +312,7 @@ D_{\mathrm{center}}(f)=\|c_f^A-c_f^B\|_2.
 
 The stored `center_l2` distance is
 
-\[
-\bar D_{\mathrm{center}}
-=
-\frac{1}{F}\sum_{f=1}^{F} D_{\mathrm{center}}(f).
-\]
+\[ \bar D_{\mathrm{center}} = \frac{1}{F}\sum_{f=1}^{F} D_{\mathrm{center}}(f). \]
 
 ## 8. Consensus
 
@@ -457,20 +320,11 @@ For one fixed \((s,\ell)\), let the analyzed heads be indexed by \(h_1,\dots,h_n
 
 For a chosen metric \(d\), define all unordered pairwise distances
 
-\[
-d_{ij}^{(s,\ell)} = d\big(h_i,h_j\big),
-\qquad
-1\le i<j\le n.
-\]
+\[ d_{ij}^{(s,\ell)} = d\big(h_i,h_j\big), \qquad 1\le i<j\le n. \]
 
 Their mean is
 
-\[
-\bar d^{(s,\ell)}
-=
-\frac{1}{\binom{n}{2}}
-\sum_{1\le i<j\le n} d_{ij}^{(s,\ell)}.
-\]
+\[ \bar d^{(s,\ell)} = \frac{1}{\binom{n}{2}} \sum_{1\le i<j\le n} d_{ij}^{(s,\ell)}. \]
 
 The consensus score is
 
@@ -507,21 +361,13 @@ The convergence summary is derived from the reference-distance curve. For one he
 
 Then the lock-in thresholds are
 
-\[
-\tau_{0.2}=r_{\mathrm{final}}+0.2\Delta,
-\qquad
-\tau_{0.5}=r_{\mathrm{final}}+0.5\Delta.
-\]
+\[ \tau_{0.2}=r_{\mathrm{final}}+0.2\Delta, \qquad \tau_{0.5}=r_{\mathrm{final}}+0.5\Delta. \]
 
 The reported lock-in step is the earliest analyzed step whose reference distance falls below the chosen threshold.
 
 The summary also stores
 
-\[
-\operatorname{AUC}
-=
-\frac{1}{T}\sum_{t=1}^{T} r_t,
-\]
+\[ \operatorname{AUC} = \frac{1}{T}\sum_{t=1}^{T} r_t, \]
 
 that is, the arithmetic mean of the sampled reference-distance values across analyzed diffusion steps.
 
@@ -529,68 +375,42 @@ In this experiment, the word **convergence** therefore means "how a head approac
 
 ## 10. Attractor Metrics
 
-The current hypothesis-specific implementation still supports the attractor-style leader-follower test.
+Attractor analysis compares a follower head and a leader head at the same diffusion step.
+For a fixed layer \(\ell\), current step \(s\), candidate leader head \(h_L\), candidate follower head \(h_F\), metric \(d\), and future-window length \(K\), define:
 
-For a fixed layer \(\ell\), current step \(s\), candidate leader head \(h_L\), candidate follower head \(h_F\), and metric \(d\):
-
-1. compute the current distance
-
-\[
-d_{\mathrm{cur}}
-=
-d\Big(
-(s,\ell,h_F),
-(s,\ell,h_L)
-\Big)
-\]
-
-2. compute future distances for the same follower head at later steps
+1. the current-step distance
 
 \[
-d_{\mathrm{future}}(s')
-=
-d\Big(
-(s',\ell,h_F),
-(s,\ell,h_L)
-\Big),
-\qquad
-s' \in \mathcal{W}(s)
+d_{\mathrm{cur}} = d\big((s,\ell,h_F), (s,\ell,h_L)\big)
 \]
 
-where \(\mathcal{W}(s)\) is the chosen future-step window.
+2. the future-step distances
+
+\[
+d_{\mathrm{future}}(k) = d\big((s+k,\ell,h_F), (s+k,\ell,h_L)\big), \qquad 1 \le k \le K
+\]
 
 The implementation reports three aggregated follower deltas:
 
 - `one_step`:
 
 \[
-\Delta_{\mathrm{one}}
-=
-d_{\mathrm{cur}}-d_{\mathrm{future}}(s_{\mathrm{next}})
+\Delta_{\mathrm{one}} = d_{\mathrm{cur}} - d_{\mathrm{future}}(1)
 \]
 
 - `window_mean`:
 
 \[
-\Delta_{\mathrm{mean}}
-=
-d_{\mathrm{cur}}
--
-\frac{1}{|\mathcal{W}(s)|}
-\sum_{s'\in\mathcal{W}(s)} d_{\mathrm{future}}(s')
+\Delta_{\mathrm{mean}} = d_{\mathrm{cur}} - \frac{1}{K}\sum_{k=1}^{K} d_{\mathrm{future}}(k)
 \]
 
 - `best_future`:
 
 \[
-\Delta_{\mathrm{best}}
-=
-d_{\mathrm{cur}}
--
-\min_{s'\in\mathcal{W}(s)} d_{\mathrm{future}}(s')
+\Delta_{\mathrm{best}} = d_{\mathrm{cur}} - \min_{1 \le k \le K} d_{\mathrm{future}}(k)
 \]
 
-Positive values mean the follower becomes closer to the current leader prototype under the chosen metric.
+Positive values mean the follower becomes closer to the leader head at later steps under the chosen metric.
 
 The current implementation performs this analysis layer-wise.
 
@@ -623,11 +443,11 @@ Metric-dependent outputs are written to a dedicated subdirectory:
 
 ```text
 output_dir/
-  head_trajectory_dynamics_head_center_overlays/
+  head_trajectory_dynamics_head_center_overlays_motion_planning_region_<on|off>_preprocessed_<on|off>_center_mode_<peak|centroid|geometric_center>/
   head_trajectory_dynamics_support_overlap_masks/
   head_trajectory_dynamics_trajectory_cache_*.json
   head_trajectory_dynamics_motion_planning_region_cache_*.json
-  head_trajectory_dynamics_metrics_hypothesis_<name>_motion_planning_region_<on|off>/
+  head_trajectory_dynamics_metrics_hypothesis_<name>_motion_planning_region_<on|off>_preprocessed_<on|off>_center_mode_<peak|centroid|geometric_center>/
 ```
 
 The metric subdirectory contains:
@@ -757,11 +577,7 @@ D_{\mathrm{sup}}(f) = 1 - \operatorname{IoU}(f).
 
 For two center trajectories
 
-\[
-\mathcal{T}^{(1)} = \{c_f^{(1)}\}_{f=1}^{F},
-\qquad
-\mathcal{T}^{(2)} = \{c_f^{(2)}\}_{f=1}^{F},
-\]
+\[ \mathcal{T}^{(1)} = \{c_f^{(1)}\}_{f=1}^{F}, \qquad \mathcal{T}^{(2)} = \{c_f^{(2)}\}_{f=1}^{F}, \]
 
 the center distance is
 
@@ -858,7 +674,7 @@ D_h(s)
 
 ## 10. Attractor Metrics
 
-Attractor analysis uses a selectable distance metric. For a leader head at step \(s\), and a follower head, define
+Attractor analysis uses a selectable distance metric. For a leader head at step \(s\), and a follower head, define the current-step distance
 
 \[
 d_{\mathrm{current}} = D\big(\mathcal{H}^{(s)}_{\mathrm{follower}}, \mathcal{H}^{(s)}_{\mathrm{leader}}\big),
@@ -886,10 +702,14 @@ d_{\mathrm{current}} = D_{\mathrm{center}}\big(\mathcal{T}^{(s)}_{\mathrm{follow
 
 所以目前代码的实际假设是：同层 heads 的时序演化更可比，不直接把不同层的 heads 放进同一个 attractor pool。
 
+未来步上的距离也必须使用同一个 future step 的 follower 和 leader：
+
+\[ d_{\mathrm{future}}(k) = D\big(\mathcal{H}^{(s+k)}_{\mathrm{follower}}, \mathcal{H}^{(s+k)}_{\mathrm{leader}}\big), \qquad 1 \le k \le K. \]
+
 ### 8.1 One-step attractor
 
 \[
-\Delta^{\mathrm{one}} = d_{\mathrm{current}} - D_{\mathrm{center}}\big(\mathcal{T}^{(s+1)}_{\mathrm{follower}}, \mathcal{T}^{(s)}_{\mathrm{leader}}\big).
+\Delta^{\mathrm{one}} = d_{\mathrm{current}} - d_{\mathrm{future}}(1).
 \]
 
 ### 8.2 Window-mean attractor
@@ -897,13 +717,13 @@ d_{\mathrm{current}} = D_{\mathrm{center}}\big(\mathcal{T}^{(s)}_{\mathrm{follow
 For a future window \(s+1, \dots, s+K\), define
 
 \[
-\Delta^{\mathrm{mean}} = d_{\mathrm{current}} - \frac{1}{K}\sum_{k=1}^{K} D_{\mathrm{center}}\big(\mathcal{T}^{(s+k)}_{\mathrm{follower}}, \mathcal{T}^{(s)}_{\mathrm{leader}}\big).
+\Delta^{\mathrm{mean}} = d_{\mathrm{current}} - \frac{1}{K}\sum_{k=1}^{K} d_{\mathrm{future}}(k).
 \]
 
 ### 8.3 Best-future attractor
 
 \[
-\Delta^{\mathrm{best}} = d_{\mathrm{current}} - \min_{1 \le k \le K} D_{\mathrm{center}}\big(\mathcal{T}^{(s+k)}_{\mathrm{follower}}, \mathcal{T}^{(s)}_{\mathrm{leader}}\big).
+\Delta^{\mathrm{best}} = d_{\mathrm{current}} - \min_{1 \le k \le K} d_{\mathrm{future}}(k).
 \]
 
 The experiment reports all three methods:

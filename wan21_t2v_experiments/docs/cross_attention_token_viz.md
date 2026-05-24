@@ -121,11 +121,7 @@ The exponent \(p\) sharpens large values when \(p > 1\).
 
 The final frame center is
 
-\[
-\hat y_f = \frac{\sum_{(y,x) \in \Omega_f} y \, w_f(y, x)}{\sum_{(y,x) \in \Omega_f} w_f(y, x)},
-\qquad
-\hat x_f = \frac{\sum_{(y,x) \in \Omega_f} x \, w_f(y, x)}{\sum_{(y,x) \in \Omega_f} w_f(y, x)}.
-\]
+\[ \hat y_f = \frac{\sum_{(y,x) \in \Omega_f} y \, w_f(y, x)}{\sum_{(y,x) \in \Omega_f} w_f(y, x)}, \qquad \hat x_f = \frac{\sum_{(y,x) \in \Omega_f} x \, w_f(y, x)}{\sum_{(y,x) \in \Omega_f} w_f(y, x)}. \]
 
 If the denominator is numerically zero, the algorithm falls back to the peak point.
 
@@ -149,7 +145,26 @@ This smoothing is used **only for visualization**.
 
 The CSV export intentionally uses the **raw frame-local centers before temporal smoothing**, so downstream analyses do not inherit plotting-specific smoothing bias.
 
-## 6. Interpretation
+## 6. CPU Parallel Materialization
+
+After the cross-attention maps have been collected or reloaded from disk, the experiment materializes per-head attention PDFs and object-token trajectories using a CPU worker pool.
+
+Let
+
+\[
+\mathcal{K} = \{(s_i, \ell_i, t_i, h_i)\}_{i=1}^{N}
+\]
+
+be the ordered set of materialization tasks, where each element corresponds to one diffusion step \(s_i\), one layer \(\ell_i\), one token \(t_i\), and one head \(h_i\). Each task independently renders:
+
+- the per-head attention PDF,
+- the optional trajectory PDF,
+- the optional trajectory timeline PDF,
+- the associated CSV rows for that head or head-mean bundle.
+
+The worker count is controlled by `cross_attention_token_viz_num_workers`. If this value is non-positive, the implementation falls back to `os.cpu_count()` and then clamps the effective worker count to the number of tasks. This parallelization changes only the execution schedule, not the mathematical definition of the exported maps or trajectories.
+
+## 7. Interpretation
 
 This experiment's center extractor can be summarized as:
 
@@ -159,6 +174,6 @@ This experiment's center extractor can be summarized as:
 
 Compared with a global soft center, it is much less sensitive to unrelated bright regions such as background or floor highlights, as long as those regions are not connected to the peak region.
 
-## 7. Current Limitation
+## 8. Current Limitation
 
 This method still depends on the peak-containing component. If the peak itself lands on a spurious region, the extracted center will follow that region. So the method is more robust than a global expectation, but it is not immune to all failure cases.

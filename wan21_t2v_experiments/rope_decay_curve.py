@@ -1,4 +1,4 @@
-"""Simple RoPE decay visualization for Wan2.1 T2V."""
+"""RoPE-only temporal/spatial decay visualization for Wan2.1 T2V."""
 
 import os
 from typing import Optional, Tuple
@@ -75,6 +75,49 @@ def _plot_wan21_t2v_rope_decay_curve(
     return save_file
 
 
+def _plot_wan21_t2v_rope_heatmap(
+    heatmap: torch.Tensor,
+    save_file: str,
+    title: str,
+    x_label: str,
+    y_label: str,
+):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axis = plt.subplots(1, 1, figsize=(7.2, 5.8))
+    image = axis.imshow(heatmap.detach().cpu().numpy(), cmap="viridis", origin="lower", aspect="auto")
+    axis.set_title(title)
+    axis.set_xlabel(x_label)
+    axis.set_ylabel(y_label)
+    fig.colorbar(image, ax=axis, shrink=0.85)
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _wan21_t2v_spatial_radial_profile(spatial_heatmap: torch.Tensor, center_y: int, center_x: int):
+    """Return mean kernel value as a function of integer-rounded spatial radius."""
+    h, w = spatial_heatmap.shape
+    yy, xx = torch.meshgrid(
+        torch.arange(h, dtype=torch.float64),
+        torch.arange(w, dtype=torch.float64),
+        indexing="ij",
+    )
+    radius = torch.sqrt((yy - float(center_y)).square() + (xx - float(center_x)).square()).round().long()
+    max_radius = int(radius.max().item())
+
+    radius_values = list(range(max_radius + 1))
+    profile = []
+    for radius_value in radius_values:
+        mask = radius == int(radius_value)
+        profile.append(float(spatial_heatmap[mask].mean().item()) if bool(mask.any().item()) else 0.0)
+    return radius_values, profile
+
+
 def run_wan21_t2v_rope_decay_curve(
     wan21_root: str,
     ckpt_dir: str,
@@ -92,7 +135,7 @@ def run_wan21_t2v_rope_decay_curve(
     offload_model: bool = True,
     parallel_cfg=None,
 ):
-    """Visualize Wan2.1 RoPE decay without loading the model."""
+    """Visualize Wan2.1 RoPE-only temporal/spatial decay without loading the model."""
     del wan21_root, ckpt_dir, prompt, shift, sample_solver, sampling_steps, guide_scale, seed, device_id, offload_model, parallel_cfg
 
     from projects.Wan2_1 import wan
@@ -130,6 +173,59 @@ def run_wan21_t2v_rope_decay_curve(
         for delta_frame in frame_distances
     ]
 
+    height_distances = list(range(token_grid_height))
+    height_full_kernel = [
+        _wan21_t2v_full_rope_kernel(
+            delta_f=0,
+            delta_h=delta_h,
+            delta_w=0,
+            temporal_frequencies=temporal_frequencies,
+            height_frequencies=height_frequencies,
+            width_frequencies=width_frequencies,
+        )
+        for delta_h in height_distances
+    ]
+    height_axis_only_kernel = [
+        _wan21_t2v_mean_rope_cosine_kernel(delta_h, height_frequencies)
+        for delta_h in height_distances
+    ]
+
+    width_distances = list(range(token_grid_width))
+    width_full_kernel = [
+        _wan21_t2v_full_rope_kernel(
+            delta_f=0,
+            delta_h=0,
+            delta_w=delta_w,
+            temporal_frequencies=temporal_frequencies,
+            height_frequencies=height_frequencies,
+            width_frequencies=width_frequencies,
+        )
+        for delta_w in width_distances
+    ]
+    width_axis_only_kernel = [
+        _wan21_t2v_mean_rope_cosine_kernel(delta_w, width_frequencies)
+        for delta_w in width_distances
+    ]
+
+    spatial_anchor_y = token_grid_height // 2
+    spatial_anchor_x = token_grid_width // 2
+    spatial_heatmap = torch.zeros((token_grid_height, token_grid_width), dtype=torch.float64)
+    for yy in range(token_grid_height):
+        for xx in range(token_grid_width):
+            spatial_heatmap[yy, xx] = _wan21_t2v_full_rope_kernel(
+                delta_f=0,
+                delta_h=int(yy - spatial_anchor_y),
+                delta_w=int(xx - spatial_anchor_x),
+                temporal_frequencies=temporal_frequencies,
+                height_frequencies=height_frequencies,
+                width_frequencies=width_frequencies,
+            )
+    spatial_radius_values, spatial_radial_profile = _wan21_t2v_spatial_radial_profile(
+        spatial_heatmap=spatial_heatmap,
+        center_y=spatial_anchor_y,
+        center_x=spatial_anchor_x,
+    )
+
     token_distances = list(range(sequence_token_count))
     token_full_kernel = []
     spatial_area = token_grid_height * token_grid_width
@@ -161,6 +257,54 @@ def run_wan21_t2v_rope_decay_curve(
         x_label="relative frame distance in latent token frames",
         y_label="mean RoPE cosine kernel",
     )
+    temporal_plot_path = _plot_wan21_t2v_rope_decay_curve(
+        x_values=frame_distances,
+        series=[
+            ("full_head_same_spatial", frame_full_kernel),
+            ("temporal_axis_only", frame_temporal_only_kernel),
+        ],
+        save_file=os.path.join(output_dir, "rope_decay_curve_temporal_frame_level.pdf"),
+        title=f"Wan2.1 RoPE Temporal Decay vs Frame Distance | {task} | size={size[0]}x{size[1]}",
+        x_label="relative frame distance in latent token frames",
+        y_label="mean RoPE cosine kernel",
+    )
+    height_plot_path = _plot_wan21_t2v_rope_decay_curve(
+        x_values=height_distances,
+        series=[
+            ("full_head_same_frame_same_width", height_full_kernel),
+            ("height_axis_only", height_axis_only_kernel),
+        ],
+        save_file=os.path.join(output_dir, "rope_decay_curve_spatial_height_axis.pdf"),
+        title=f"Wan2.1 RoPE Spatial Decay vs Height Offset | {task} | size={size[0]}x{size[1]}",
+        x_label="relative token-grid height offset",
+        y_label="mean RoPE cosine kernel",
+    )
+    width_plot_path = _plot_wan21_t2v_rope_decay_curve(
+        x_values=width_distances,
+        series=[
+            ("full_head_same_frame_same_height", width_full_kernel),
+            ("width_axis_only", width_axis_only_kernel),
+        ],
+        save_file=os.path.join(output_dir, "rope_decay_curve_spatial_width_axis.pdf"),
+        title=f"Wan2.1 RoPE Spatial Decay vs Width Offset | {task} | size={size[0]}x{size[1]}",
+        x_label="relative token-grid width offset",
+        y_label="mean RoPE cosine kernel",
+    )
+    spatial_heatmap_path = _plot_wan21_t2v_rope_heatmap(
+        heatmap=spatial_heatmap,
+        save_file=os.path.join(output_dir, "rope_decay_curve_spatial_center_heatmap.pdf"),
+        title=f"Wan2.1 RoPE Spatial Coherence Heatmap | {task} | anchor=({spatial_anchor_y},{spatial_anchor_x})",
+        x_label="token-grid width index",
+        y_label="token-grid height index",
+    )
+    spatial_radial_plot_path = _plot_wan21_t2v_rope_decay_curve(
+        x_values=spatial_radius_values,
+        series=[("same_frame_center_anchor", spatial_radial_profile)],
+        save_file=os.path.join(output_dir, "rope_decay_curve_spatial_radial_profile.pdf"),
+        title=f"Wan2.1 RoPE Spatial Radial Profile | {task} | size={size[0]}x{size[1]}",
+        x_label="integer-rounded spatial radius in token grid",
+        y_label="mean RoPE cosine kernel",
+    )
     token_plot_path = _plot_wan21_t2v_rope_decay_curve(
         x_values=token_distances,
         series=[("flattened_token_anchor_curve", token_full_kernel)],
@@ -186,7 +330,13 @@ def run_wan21_t2v_rope_decay_curve(
         "token_grid_width": int(token_grid_width),
         "sequence_token_count": int(sequence_token_count),
         "frame_plot_path": frame_plot_path,
+        "temporal_plot_path": temporal_plot_path,
+        "spatial_height_plot_path": height_plot_path,
+        "spatial_width_plot_path": width_plot_path,
+        "spatial_heatmap_path": spatial_heatmap_path,
+        "spatial_radial_plot_path": spatial_radial_plot_path,
         "token_plot_path": token_plot_path,
+        "spatial_anchor_token_index": [int(spatial_anchor_y), int(spatial_anchor_x)],
     }
     _save_json(os.path.join(output_dir, "rope_decay_curve_summary.json"), summary)
     return summary

@@ -10,7 +10,7 @@ conda activate video
 # 1) object-region query tokens -> object/non-object key mass
 # 2) global query tokens -> signed-dt frame-mass distribution
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0
 
 build_prompt_tag() {
     local prompt="$1"
@@ -80,7 +80,7 @@ SELF_ATTENTION_DISTRIBUTION_GLOBAL_QUERY_TOKENS_PER_FRAME=64  # ! (for global an
 
 SELF_ATTENTION_DISTRIBUTION_PLOT_PER_HEAD=True  # if True, additionally export per-head plots under step_xxx/layer_xx/head_xx/
 SELF_ATTENTION_DISTRIBUTION_STOP_AFTER_LAST_PROBE_STEP=True  # if True, stop diffusion right after the last requested probe step
-SELF_ATTENTION_DISTRIBUTION_PLOT_ONLY_FROM_CSV=True  # ! if True, only plot, no sampling
+SELF_ATTENTION_DISTRIBUTION_PLOT_ONLY_FROM_CSV=False  # ! if True, only plot, no sampling
 SELF_ATTENTION_DISTRIBUTION_SKIP_EXISTING_PLOTS=True
 SAVE_VIDEO=True
 

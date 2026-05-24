@@ -6,6 +6,9 @@ __pycache__/
 .vscode/
 
 /projects/PhyGenBench
+/projects/spatialMetaphor
+
+/utils/Attribution_Patching_Demo.ipynb
 
 README0.md
 AGENTS.md

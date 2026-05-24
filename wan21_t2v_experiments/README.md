@@ -15,8 +15,11 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - `trajectory_entropy`
 - `head_evolution`
 - `head_trajectory_dynamics`
+- `trajectory_consensus_dynamics`
 - `self_attention_temporal_kernel`
 - `self_attention_distribution`
+- `self_attention_viz`
+- `self_attention_modulation`
 - `seed_to_trajectory_predictability`
 - `event_token_value`
 - `motion_aligned_attention`
@@ -48,11 +51,19 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - `frame_num`: e.g. `81`
 - Output:
   - `rope_decay_curve_frame_level.pdf`
+  - `rope_decay_curve_temporal_frame_level.pdf`
+  - `rope_decay_curve_spatial_height_axis.pdf`
+  - `rope_decay_curve_spatial_width_axis.pdf`
+  - `rope_decay_curve_spatial_center_heatmap.pdf`
+  - `rope_decay_curve_spatial_radial_profile.pdf`
   - `rope_decay_curve_token_level.pdf`
   - `rope_decay_curve_summary.json`
 - Key readout:
-  - frame-level RoPE kernel decay vs latent frame distance
+  - temporal RoPE kernel decay vs latent frame distance
+  - spatial RoPE decay along height / width axes inside one frame
+  - same-frame spatial coherence heatmap for one center anchor token
   - flattened token-level RoPE kernel decay vs relative video-token distance
+  - the token-level figure is an auxiliary canonical-anchor view rather than the main temporal/spatial analysis target
   - see detailed note: `docs/rope_decay_curve.md`
 
 ### 1c) `rope_modification`
@@ -106,6 +117,7 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - `plot_during_sampling`: if `true`, render PDFs during sampling; if `false`, defer plotting
   - `draw_attention_map_only`: redraw mode from saved map tensors without rerunning sampling
   - `visualization_output_dir`: optional directory to store newly rendered PDFs
+  - `cross_attention_token_viz_num_workers`: CPU worker count for PDF and trajectory materialization; non-positive values fall back to `os.cpu_count()`
 - Output:
   - per-token attention PDFs
   - object-token trajectory PDFs/CSV
@@ -114,6 +126,36 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - Key readout:
   - object trajectory shape
   - attention concentration and drift across layers/steps.
+
+### 5b) `self_attention_viz`
+- Motivation: visualize object-guided self-attention maps while keeping the original diffusion forward path unchanged.
+- 动机：在不改变原始 diffusion forward 路径的前提下，可视化 object-guided 的 self-attention map。
+- Core idea:
+  - reuse `cross_attention_token_viz` outputs
+  - extract a reference object support mask from cross-attention head-mean map at `step=50`, `layer=27`
+  - sample object-region query tokens only on selected query frames
+  - compute a side-channel sampled self-attention probe from q/k tensors without replacing Wan's own attention output
+- Input:
+  - `reuse_cross_attention_dir`: existing `cross_attention_token_viz` output directory
+  - `target_object_words`: object words used to build the reference support mask
+  - `self_attention_viz_steps`: diffusion steps to probe
+  - `self_attention_viz_layers`: optional layer list; empty means all layers
+  - `self_attention_viz_query_video_frame_indices`: selected 1-based video-frame labels for query frames, default `1,33,41,81`
+  - `self_attention_viz_object_query_token_limit_per_frame`: optional uniform subsampling budget inside the object support region
+  - `self_attention_viz_num_viz_frames`: number of key-frame panels shown in each PDF
+  - `draw_self_attention_maps_only`: if `true`, skip sampling and redraw PDFs only from an existing `.pt` map file
+  - `draw_self_attention_maps_path`: optional explicit `.pt` path used by redraw-only mode
+  - `self_attention_viz_num_workers`: CPU worker count for PDF materialization; non-positive values fall back to `os.cpu_count()`
+- Output:
+  - `self_attention_viz_maps.pt` with values of shape `[num_heads, F, H, W]`
+  - per-head and head-mean PDFs rendered with `viridis`
+  - `self_attention_viz_index.csv`
+  - `self_attention_viz_reference_support.csv`
+  - `self_attention_viz_summary.json`
+- Key readout:
+  - layer/head-specific temporal reach from object queries to full video latent keys
+  - signed long-range decay patterns under different query-frame positions
+  - asymmetry between early / middle / late query frames.
 
 ### 6) `token_trajectory_seed_stability`
 - Motivation: quantify same-prompt variability across seeds using object-token trajectories.
@@ -257,46 +299,63 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - `head_trajectory_dynamics_attractor_distance_metric`: metric list for attractor analysis; empty string means all supported metrics
   - `head_trajectory_dynamics_hypothesis`: output-label suffix such as `attractor`, `reference-leading`, or `cross-layer-transmission`
   - `head_trajectory_dynamics_use_motion_planning_region_before_metrics`: whether to zero out and renormalize attention outside the contour-filtered motion-planning region before computing metrics
-- Center extraction:
-  - `head_trajectory_dynamics_center_method`: `region_centroid` or `preprocessed_component_center`
-  - `head_trajectory_dynamics_center_power`, `head_trajectory_dynamics_center_quantile`: center extraction parameters for `region_centroid`
-  - `head_trajectory_dynamics_preprocessed_center_mode`: `peak`, `centroid`, or `geometric_center`
-  - `head_trajectory_dynamics_preprocess_winsorize_quantile`, `head_trajectory_dynamics_preprocess_despike_quantile`, `head_trajectory_dynamics_preprocess_min_component_area`: preprocessing parameters used by `preprocessed_component_center`
-  - `head_trajectory_dynamics_reference_center_method`: reference-only center method; `same_as_head` reuses the ordinary-head setting
-  - `head_trajectory_dynamics_reference_center_power`, `head_trajectory_dynamics_reference_center_quantile`: reference-only center parameters
-  - `head_trajectory_dynamics_reference_preprocessed_center_mode`: reference-only preprocessing-center mode
-  - `head_trajectory_dynamics_reference_preprocess_winsorize_quantile`, `head_trajectory_dynamics_reference_preprocess_despike_quantile`, `head_trajectory_dynamics_reference_preprocess_min_component_area`: reference-only preprocessing parameters
-- Overlays and caches:
-  - `head_trajectory_dynamics_center_viz_enable`: render per-head center-overlay PDFs
-  - `head_trajectory_dynamics_center_viz_step` / `head_trajectory_dynamics_center_viz_layer` / `head_trajectory_dynamics_center_viz_heads`: optional overlay selection
-  - `head_trajectory_dynamics_support_viz_enable`: render support-overlap contour PDFs
-  - `head_trajectory_dynamics_support_viz_step` / `head_trajectory_dynamics_support_viz_layer` / `head_trajectory_dynamics_support_viz_heads`: optional support-overlay selection
-  - `head_trajectory_dynamics_support_viz_num_frames`: number of timeline frames shown in each support-overlay PDF
-  - `head_trajectory_dynamics_support_viz_contour_min_component_area`: minimum connected-component area before a green contour is drawn
-  - `head_trajectory_dynamics_plot_only_from_csv`: reuse existing metric CSVs and only redraw plots
-  - `head_trajectory_dynamics_overlay_only`: reuse cached maps and only redraw overlays
-  - `head_trajectory_dynamics_skip_existing_plots`: keep existing plot files and do not overwrite them
+
+### 15) `trajectory_consensus_dynamics`
+- Motivation: explain how early multi-candidate motion patterns collapse into one shared winner trajectory, and why small seed differences can push the model toward different final paths.
+- Type: stage-based hybrid experiment. The current implementation exposes two stages:
+  - `candidate_consensus`: offline analysis from reused cross-attention maps
+  - `head_contribution`: runtime exact zero-ablation plus optional direct readout proxy
+- Planned next stages:
+  - `candidate_intervention`: exact zero-ablation of selected cross-attention or self-attention heads followed by downstream winner-gap, entropy, and winner-flip readouts on the clean candidate partition
+  - `self_attention_coupling`: candidate-to-candidate self-attention coupling, coupling entropy, dominant-link ratio, and compatibility scores
+- De-prioritized appendix:
+  - `trajectory_graph`: optional derived summary only; it is not a near-term implementation priority
+- Engineering note:
+  - the stages are meant to be run separately, not as one monolithic long run
+  - the recommended practice is to reuse the same `output_dir` for the same prompt and seed so that later stage runs can reuse earlier CSV and tensor caches
+  - `trajectory_consensus_plot_only_from_csv=True` redraws plots from saved outputs; for candidate-region visualizations it still needs `reuse_cross_attention_dir`, because the first row uses the original per-head attention maps
+- See detailed note: `docs/trajectory_consensus_dynamics.md`
+- Required inputs for normal non-plot-only runs:
+  - `target_object_words`
+  - `reuse_cross_attention_dir`
+- Main controls:
+  - `trajectory_consensus_stages`: CSV stage list. Supported values are `candidate_consensus` and `head_contribution`.
+  - `trajectory_consensus_steps`: optional diffusion-step list. Empty means all available steps in the reused maps.
+  - `trajectory_consensus_layers`: optional layer list. Empty means all available layers in the reused maps.
+  - `trajectory_consensus_cross_heads`: optional cross-attention head list such as `L4H1,L7H8`. It is used by candidate visualization and by `head_contribution` when module `cross` is enabled. Empty string means all cross-attention heads in the selected layers; `None` means no cross-attention head.
+  - `trajectory_consensus_self_heads`: optional self-attention head list such as `L4H1,L7H8`. It is used by `head_contribution` when module `self` is enabled. Empty string means all self-attention heads in the selected layers; `None` means no self-attention head.
+  - `trajectory_consensus_modules`: optional module list for `head_contribution`; supported values are `cross` and `self`. If one module is enabled, the corresponding head list should be provided.
+  - `trajectory_consensus_branch`: CFG branch used by `head_contribution`; supported values are `cond` and `uncond`.
+  - `reuse_head_trajectory_dynamics_dir`: optional `head_trajectory_dynamics` output directory used for early-alignment scatter plots.
+- Candidate-region extraction parameters:
+  - `trajectory_consensus_candidate_base_quantile`
+  - `trajectory_consensus_candidate_split_quantiles`
+  - `trajectory_consensus_candidate_smooth_radius`
+  - `trajectory_consensus_candidate_stable_peak_min_levels`
+  - `trajectory_consensus_candidate_peak_merge_distance`
+  - `trajectory_consensus_candidate_preprocess_winsorize_quantile`
+  - `trajectory_consensus_candidate_preprocess_despike_quantile`
+  - `trajectory_consensus_candidate_min_component_area`
+  - `trajectory_consensus_candidate_viz_num_frames`
+  - Interpretation note: the current candidate extractor is a peak-seeded weighted clustering method. `candidate_smooth_radius` is the box-filter radius used before seed detection, `candidate_base_quantile` controls the shared support threshold after background suppression, `candidate_split_quantiles` now serve as seed-support levels for local-maximum proposals, `candidate_stable_peak_min_levels` is the minimum number of seed levels required for a seed to survive, `candidate_peak_merge_distance` is the greedy seed-merging radius, and `candidate_min_component_area` defaults to `4` to suppress tiny 2-3 patch speckles.
+- Contribution parameters:
+  - `trajectory_consensus_compute_direct_projection`
+  - `trajectory_consensus_object_mask_reference_step`
+  - `trajectory_consensus_object_mask_reference_layer`
+  - `trajectory_consensus_reference_distance_metric`
 - Output:
-  - Shared outputs in `output_dir/`: center trajectory cache JSON, motion-planning-region cache JSON, center-overlay PDFs, support-overlay PDFs
-  - Metric outputs in `output_dir/head_trajectory_dynamics_metrics_hypothesis_<name>_motion_planning_region_<on|off>/`
-    - `head_trajectory_dynamics_head_maps.csv`
-    - `head_trajectory_dynamics_pairwise.csv`
-    - `head_trajectory_dynamics_consensus.csv`
-    - `head_trajectory_dynamics_attractor.csv`
-    - `head_trajectory_dynamics_reference_distance.csv`
-    - `head_trajectory_dynamics_convergence.csv`
-    - `head_trajectory_dynamics_trajectory_centers.csv`
-    - `head_trajectory_dynamics_soft_centers.csv`
-    - `head_trajectory_dynamics_plots/`
-    - `head_trajectory_dynamics_summary.json`
-- Metrics:
-  - `js_distance`: Jensen-Shannon distance between per-frame spatial probability maps.
-  - `hellinger_distance`: Hellinger distance between per-frame spatial probability maps.
-  - `wasserstein_map_distance`: project-specific row/column-marginal Wasserstein proxy.
-  - `support_overlap_distance`: \(1-\mathrm{IoU}\) of high-response support masks.
-  - `center_l2_distance`: mean per-frame Euclidean distance between extracted center trajectories.
-  - `consensus = 1 / (1 + mean_pairwise_distance)`: larger means heads in the same layer-step group are more similar.
-  - `attractor_score_mean`: reported for `one_step`, `window_mean`, and `best_future`; positive means followers move closer to the leader prototype.
+  - `trajectory_consensus_candidate_regions.csv`
+  - `trajectory_consensus_candidate_regions.pt`
+  - `trajectory_consensus_candidate_regions_per_head.csv`
+  - `trajectory_consensus_candidate_regions_per_head.pt`
+  - `trajectory_consensus_candidate_weights.csv`
+  - `trajectory_consensus_winner_gap.csv`
+  - `trajectory_consensus_candidate_region_viz/`
+  - `trajectory_consensus_candidate_plots/`
+  - `trajectory_consensus_head_contribution.csv`
+  - `trajectory_consensus_head_contribution_plots/`
+  - `trajectory_consensus_head_contribution/<method>/trajectory_consensus_summary.json`
+  - Note: both candidate-region `.pt` files keep only compact integer label maps; the CSV files keep only the necessary frame-wise metadata.
 
 ### 15) `self_attention_temporal_kernel`
 - Motivation: intervene on self-attention's temporal coherence path and test whether smoother longer-range temporal mixing improves or disrupts motion planning.
@@ -356,7 +415,29 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - whether object-region self-attention actually lands on object regions in other frames
   - how object vs non-object mass changes with signed `dt`
   - how global self-attention differs for early / middle / late query frames
+  - signed-`dt` rows are normalized by the number of query tokens that actually have that `dt`, so edge bins are no longer artificially suppressed
   - see detailed note: `docs/self_attention_distribution.md`
+
+### 15c) `self_attention_modulation`
+- Motivation: profile the self-attention modulation tensors `e0/e1/e2` over diffusion steps and DiT layers, with extra write-strength readouts for `e2`.
+- 动机：逐扩散步、逐层分析 self-attention 分支的 modulation tensors `e0/e1/e2`，并重点观察 `e2` 对残差写入强度的调节。
+- Type: online probe with runtime monkey patch. It captures generic statistics for `e0/e1/e2`, and for `e2` it additionally records raw/gated self-attention output RMS statistics.
+- Input:
+  - `self_attention_modulation_steps`: diffusion steps to probe
+  - `self_attention_modulation_layers`: optional layer list; empty means all layers
+  - `self_attention_modulation_branch`: `cond`, `uncond`, or `both`
+  - `self_attention_modulation_stop_after_last_probe_step`: if true, stop diffusion immediately after the last requested probe step
+- Output:
+  - `self_attention_modulation_rows.csv`
+  - `self_attention_modulation_summary.json`
+  - `self_attention_modulation_plots/e0/<metric>/`: `heatmap.pdf`, `step_curves_bucketed.pdf`, `step_curves_per_layer.pdf`, and `per_layer/layer_xx.pdf` for `gate_mean`, `gate_abs_mean`, `gate_rms`, `gate_positive_fraction`, `gate_negative_fraction`, and `gate_max_abs`; the bucketed plot splits the selected layers into three count-balanced contiguous layer-index ranges and prints those ranges in the legend, while the per-layer overview includes a layer color bar
+  - `self_attention_modulation_plots/e1/<metric>/`: same metric set and plot types as `e0`
+  - `self_attention_modulation_plots/e2/<metric>/`: same gate metrics as `e0/e1`, plus `sa_output_rms`, `gated_sa_output_rms`, and `gated_to_raw_rms_ratio`
+- Key readout:
+  - whether `e0/e1/e2` are primarily step-driven or layer-driven
+  - which layers consistently use stronger modulation magnitude
+  - whether the effective `e2`-gated SA write tracks the raw SA output RMS or selectively attenuates it
+  - see detailed note: `docs/self_attention_modulation.md`
 
 ### 16) `seed_to_trajectory_predictability`
 - Motivation: test whether the selected reference object trajectory is predictable from the initial latent noise and/or early cross-attention trajectories.

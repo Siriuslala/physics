@@ -121,11 +121,7 @@ For each frame \(f\):
 
 Using quantile threshold `head_evolution_traj_quantile = q`, form
 
-\[
-M_f^{\mathrm{traj}}(y,x) = \mathbf{1}[\tilde A_f(y,x) \ge \tau_f^{\mathrm{traj}}],
-\qquad
-\tau_f^{\mathrm{traj}} = \operatorname{Quantile}(\{\tilde A_f(y,x)\}_{y,x}, q).
-\]
+\[ M_f^{\mathrm{traj}}(y,x) = \mathbf{1}[\tilde A_f(y,x) \ge \tau_f^{\mathrm{traj}}], \qquad \tau_f^{\mathrm{traj}} = \operatorname{Quantile}(\{\tilde A_f(y,x)\}_{y,x}, q). \]
 
 Then keep only the connected component \(\Omega_f\) that contains the peak.
 
@@ -139,27 +135,13 @@ w_f(y,x) = \tilde A_f(y,x)^p, \qquad (y,x) \in \Omega_f.
 
 Then the centroid is
 
-\[
-(y_f^{\mathrm{centroid}}, x_f^{\mathrm{centroid}})
-=
-\left(
-\frac{\sum_{(y,x)\in\Omega_f} y \, w_f(y,x)}{\sum_{(y,x)\in\Omega_f} w_f(y,x)},
-\frac{\sum_{(y,x)\in\Omega_f} x \, w_f(y,x)}{\sum_{(y,x)\in\Omega_f} w_f(y,x)}
-\right).
-\]
+\[ (y_f^{\mathrm{centroid}}, x_f^{\mathrm{centroid}}) = \left( \frac{\sum_{(y,x)\in\Omega_f} y \, w_f(y,x)}{\sum_{(y,x)\in\Omega_f} w_f(y,x)}, \frac{\sum_{(y,x)\in\Omega_f} x \, w_f(y,x)}{\sum_{(y,x)\in\Omega_f} w_f(y,x)} \right). \]
 
 ### 5.4 Geometric center of the component
 
 If \(|\Omega_f|\) is the number of pixels in the component, then
 
-\[
-(y_f^{\mathrm{geom}}, x_f^{\mathrm{geom}})
-=
-\left(
-\frac{1}{|\Omega_f|} \sum_{(y,x)\in\Omega_f} y,
-\frac{1}{|\Omega_f|} \sum_{(y,x)\in\Omega_f} x
-\right).
-\]
+\[ (y_f^{\mathrm{geom}}, x_f^{\mathrm{geom}}) = \left( \frac{1}{|\Omega_f|} \sum_{(y,x)\in\Omega_f} y, \frac{1}{|\Omega_f|} \sum_{(y,x)\in\Omega_f} x \right). \]
 
 ### 5.5 Final reference trajectory choice
 
