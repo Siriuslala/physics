@@ -8,7 +8,7 @@ All changes are applied through runtime monkey patching.
 The experiment currently contains two schemes:
 
 1. `manual`: a training-free scheme with manually chosen axis-wise scales.
-2. `step_conditioned`: a training-oriented scheme in which the axis-wise scales are produced by a small timestep-conditioned module.
+2. `timestep_conditioned`: a training-oriented scale-learning scheme with `global` and `head_aware` modes.
 
 Both schemes preserve one joint attention softmax over the full token sequence.
 This experiment does **not** split attention into separate spatial and temporal softmax branches.
@@ -104,7 +104,17 @@ This is the notation used in the rest of the note.
 ### 4.1 Motivation
 
 The first scheme is the simplest one and should be implemented first.
-The idea is:
+
+The motivation is not that the temporal axis must always be much longer than the spatial axes.
+Instead, the more stable argument is the following:
+
+- video is anisotropic data, and the temporal axis and the spatial axes correspond to different physical constraints, so the three axes do not have to share exactly the same RoPE phase-growth speed,
+- reducing \(\lambda_f\) is mainly a way to relax the temporal phase constraint when cross-frame token matching is needed, while keeping \(\lambda_h\) and \(\lambda_w\) unchanged or larger is mainly a way to preserve spatial locality and spatial sharpness.
+
+Under this view, Scheme 1 does not assume that temporal decay is necessarily the only bottleneck.
+It simply introduces a controlled axis-wise inductive bias.
+
+The implementation idea is:
 
 - keep the original joint attention softmax,
 - keep the original head-channel split,
@@ -180,11 +190,67 @@ This means that outside the selected steps, the model falls back to the original
 
 In the current implementation, the step index is tracked from the model forward pass, and the step window is applied inside the monkey-patched RoPE function.
 
-## 6. Scheme 2: Step-Conditioned Extension
+## 6. Scheme 2: Timestep-Conditioned Scale Learning
 
-Scheme 2 keeps the same idea as Scheme 1, but replaces the fixed scales with a small trainable timestep-conditioned module.
+Scheme 2 is the unified training-oriented formulation of axis-wise RoPE scaling.
 
-### 6.1 Timestep embedding
+The core idea is to stop treating the scale vector
+
+\[
+\lambda = [\lambda_f, \lambda_h, \lambda_w]
+\]
+
+as a purely manual hyperparameter.
+Instead, the model is allowed to learn:
+
+- a base axis-wise scale,
+- and a timestep-dependent correction on top of that base.
+
+Under this view, the old manual scheme becomes a special case in which the base scale is fixed and the timestep-dependent correction is removed.
+
+### 6.1 Learnable base scale
+
+Define the log-scale base parameter
+
+\[
+\mu = [\mu_f, \mu_h, \mu_w] \in \mathbb{R}^3.
+\]
+
+The corresponding positive base scale is
+
+\[
+\lambda^{\text{base}} = \exp(\mu)
+=
+\big[
+\lambda_f^{\text{base}},
+\lambda_h^{\text{base}},
+\lambda_w^{\text{base}}
+\big]
+\in
+\mathbb{R}_{>0}^3.
+\]
+
+Here:
+
+- \(\mu_f, \mu_h, \mu_w\) are unconstrained trainable parameters in log space,
+- \(\lambda_f^{\text{base}}, \lambda_h^{\text{base}}, \lambda_w^{\text{base}}\) are the positive base scales actually used by the model.
+
+This formulation has two advantages:
+
+- positivity is guaranteed by the exponential map,
+- the base scale itself can now be learned rather than manually fixed forever.
+
+If one wants to recover the manual scheme, one can simply freeze \(\mu\) at
+
+\[
+\mu_a = \log \lambda_a,
+\qquad a \in \{f,h,w\}.
+\]
+
+So Scheme 1 is not a different family.
+It is the fixed-base special case of Scheme 2.
+
+### 6.2 Timestep embedding
 
 Let
 
@@ -194,54 +260,76 @@ e_t \in \mathbb{R}^{d_e}
 
 be the timestep embedding for diffusion step \(t\), where \(d_e\) is the timestep-embedding width.
 
-In the implementation, the timestep embedding is produced by the same sinusoidal embedding function used by Wan2.1.
+In the implementation, \(e_t\) is produced by the same sinusoidal timestep embedding used by Wan2.1.
 
-### 6.2 Scale head output
+### 6.3 Global timestep-conditioned mode
 
-The step-conditioned scale head is a small MLP:
+In the simplest learned variant, the model predicts one axis-wise correction vector for each timestep:
 
 \[
 g(e_t) \in \mathbb{R}^3.
 \]
 
-Its output is converted into positive dynamic scales:
+The effective scale vector is then
 
-\[ \lambda^{\text{dyn}}(t) = \exp(g(e_t)) = \big[ \lambda_f^{\text{dyn}}(t), \lambda_h^{\text{dyn}}(t), \lambda_w^{\text{dyn}}(t) \big]. \]
+\[
+\lambda(t)
+=
+\exp\big(\mu + g(e_t)\big)
+\in
+\mathbb{R}_{>0}^3.
+\]
 
-Here:
+Write
 
-- \(\lambda_f^{\text{dyn}}(t)\) is the dynamic frame-axis multiplier,
-- \(\lambda_h^{\text{dyn}}(t)\) is the dynamic height-axis multiplier,
-- \(\lambda_w^{\text{dyn}}(t)\) is the dynamic width-axis multiplier.
+\[
+\lambda(t)
+=
+\big[
+\lambda_f(t),
+\lambda_h(t),
+\lambda_w(t)
+\big].
+\]
 
-### 6.3 Effective scale
+Then:
 
-Scheme 2 still uses the manual scales as a base.
-The final scale applied at diffusion step \(t\) is
+- \(\lambda_f(t)\) is the frame-axis scale used at step \(t\),
+- \(\lambda_h(t)\) is the height-axis scale used at step \(t\),
+- \(\lambda_w(t)\) is the width-axis scale used at step \(t\).
 
-\[ \lambda_a^{\text{eff}}(t) = \lambda_a \cdot \lambda_a^{\text{dyn}}(t). \]
+Conceptually, if diffusion had only a finite set of timesteps and we tabulated these values directly, this mode would correspond to one learned \(3\)-vector per timestep.
+So its role is exactly the global step-wise scale controller.
 
-So:
+### 6.4 Effective scale under step gating
 
-- \(\lambda_a\) is the manual base scale,
-- \(\lambda_a^{\text{dyn}}(t)\) is the learned timestep-dependent multiplier,
-- \(\lambda_a^{\text{eff}}(t)\) is the scale actually used by RoPE.
+If a diffusion-step window \(S\) is also specified, then the actually used scale is
 
-If a diffusion-step window \(S\) is also specified, then
+\[
+\lambda^{\text{used}}_a(t)
+=
+\begin{cases}
+\lambda_a(t), & t \in S, \\
+1, & t \notin S,
+\end{cases}
+\qquad a \in \{f,h,w\}.
+\]
 
-\[ \lambda_a^{\text{used}}(t) = \begin{cases} \lambda_a^{\text{eff}}(t), & t \in S, \\ 1, & t \notin S. \end{cases} \]
+So outside the selected steps, the model falls back to the original Wan2.1 RoPE.
 
-### 6.4 Engineering implementation
+### 6.5 Why this formulation is preferable
 
-The step-conditioned scale head is implemented as a small module attached to the monkey-patched model at runtime.
-This is done in [wan21_t2v_experiment_patch.py](</home/liyueyan/Interpretability/physics/wan21_t2v_experiments/wan21_t2v_experiment_patch.py:57>).
+This unified view is preferable to "manual \(\lambda\) times learned multiplier" as a primary formulation.
 
-Important engineering properties:
+The reason is simple:
 
-- it is attached as an `nn.Module`, so its parameters appear in `state_dict`,
-- it can optionally load a checkpoint by path,
-- it does not require editing `projects/Wan2_1`,
-- it is therefore compatible with a later training framework.
+- if the base scale is always frozen by hand, the learned module can only make multiplicative corrections around a manually chosen anchor,
+- if the base scale is itself learnable, the model can jointly determine the long-range prior and the timestep-dependent modulation.
+
+So the cleanest training-oriented parameterization is:
+
+- manual mode: fix \(\mu\) and remove \(g(e_t)\),
+- learned global mode: learn both \(\mu\) and \(g(e_t)\).
 
 ## 7. Why We Do Not Split the Softmax
 
@@ -256,81 +344,303 @@ For example:
 
 So the current experiment changes the RoPE phase but preserves the original joint attention probability.
 
-## 8. Soft Head Specialization as a Future Extension
+## 8. Scheme 2B: Head-Aware Timestep-Conditioned Scaling
 
-Soft Head Specialization is a later-stage design.
-It is not implemented in the current code.
+The global timestep-conditioned mode in Section 6 uses one scale vector for all heads.
+That is the cleanest starting point, but it may still be too restrictive.
 
-The goal is to let different heads prefer different RoPE scale patterns without hard-coding head ids by hand.
+The natural refinement is not a completely different scheme.
+It is simply a different mode of the same timestep-conditioned family:
 
-### 8.1 Router definition
+- `global` mode: one scale vector for the whole attention layer at step \(t\),
+- `head_aware` mode: different heads may use different scale vectors at the same step \(t\).
 
-For layer \(\ell\), head \(m\), and diffusion step \(t\), define a router output
+This is why the head-aware design should be treated as a mode choice inside Scheme 2 rather than as a separate family.
 
-\[ \beta_{\ell,m}(t) = \big[ \beta_{\ell,m}^{(f)}(t), \beta_{\ell,m}^{(s)}(t), \beta_{\ell,m}^{(j)}(t) \big] \in \mathbb{R}^3, \]
+### 8.1 Head-aware correction tensor
 
-where:
-
-- \(\beta_{\ell,m}^{(f)}(t)\) is the temporal-specialist weight,
-- \(\beta_{\ell,m}^{(s)}(t)\) is the spatial-specialist weight,
-- \(\beta_{\ell,m}^{(j)}(t)\) is the joint-head weight.
-
-The router is normalized by softmax:
+For self-attention layer \(\ell\), head \(m\), and diffusion step \(t\), define
 
 \[
-\beta_{\ell,m}(t) = \mathrm{softmax}(W_{\ell,m} e_t + c_{\ell,m}),
+g_{\ell,m}(e_t)
+\in
+\mathbb{R}^3.
 \]
 
-so its three coordinates are nonnegative and sum to \(1\).
+Its three coordinates are:
 
-### 8.2 Three reference scale triplets
+- \(g_{\ell,m}^{(f)}(e_t)\): frame-axis correction for head \(m\),
+- \(g_{\ell,m}^{(h)}(e_t)\): height-axis correction for head \(m\),
+- \(g_{\ell,m}^{(w)}(e_t)\): width-axis correction for head \(m\).
 
-Define three reference scale triplets:
+So the correction now depends on:
 
-\[ \lambda^{(f)} = \big[ \lambda_f^{(f)}, \lambda_h^{(f)}, \lambda_w^{(f)} \big], \]
+- timestep \(t\),
+- layer index \(\ell\),
+- head index \(m\).
 
-\[ \lambda^{(s)} = \big[ \lambda_f^{(s)}, \lambda_h^{(s)}, \lambda_w^{(s)} \big], \]
+Conceptually, if these values were tabulated directly for discrete timesteps, this mode would correspond to a head-resolved family of timestep-specific scale factors rather than a single shared \(3\)-vector.
 
-\[ \lambda^{(j)} = \big[ \lambda_f^{(j)}, \lambda_h^{(j)}, \lambda_w^{(j)} \big]. \]
+### 8.2 Effective head-aware scale
 
-Their meanings are:
+The head-aware scale vector is
 
-- \(\lambda^{(f)}\): the reference scale triplet for a temporal-specialist head,
-- \(\lambda^{(s)}\): the reference scale triplet for a spatial-specialist head,
-- \(\lambda^{(j)}\): the reference scale triplet for a joint head.
+\[
+\lambda_{\ell,m}(t)
+=
+\exp\big(\mu + g_{\ell,m}(e_t)\big)
+\in
+\mathbb{R}_{>0}^3.
+\]
 
-### 8.3 Effective per-head scale
+Write
 
-The effective scale triplet for layer \(\ell\), head \(m\), and step \(t\) is
+\[
+\lambda_{\ell,m}(t)
+=
+\big[
+\lambda_{\ell,m}^{(f)}(t),
+\lambda_{\ell,m}^{(h)}(t),
+\lambda_{\ell,m}^{(w)}(t)
+\big].
+\]
 
-\[ \lambda_{\ell,m}(t) = \beta_{\ell,m}^{(f)}(t)\lambda^{(f)} + \beta_{\ell,m}^{(s)}(t)\lambda^{(s)} + \beta_{\ell,m}^{(j)}(t)\lambda^{(j)}. \]
+Then:
 
-This formula means:
+- \(\lambda_{\ell,m}^{(f)}(t)\) is the frame-axis scale used by head \(m\) at layer \(\ell\),
+- \(\lambda_{\ell,m}^{(h)}(t)\) is the height-axis scale used by head \(m\) at layer \(\ell\),
+- \(\lambda_{\ell,m}^{(w)}(t)\) is the width-axis scale used by head \(m\) at layer \(\ell\).
 
-- if \(\beta_{\ell,m}^{(f)}(t)\) is large, the head behaves more like a temporal specialist,
-- if \(\beta_{\ell,m}^{(s)}(t)\) is large, the head behaves more like a spatial specialist,
-- if \(\beta_{\ell,m}^{(j)}(t)\) is large, the head stays closer to a joint head.
+These three scales are inserted into the same RoPE phase definition from Section 4.
+The attention operator itself is unchanged.
 
-Crucially, this still modifies RoPE through scales only.
-It does **not** create three separate attention matrices.
+### 8.3 Relationship to the global mode
 
-### 8.4 Why this is safer than hard head assignment
+The global timestep-conditioned mode from Section 6 is a special case of the head-aware mode.
 
-This future extension is softer than manually declaring:
+If all heads share the same correction,
 
-- "head 0 to head 3 are temporal heads",
-- "head 4 to head 7 are spatial heads".
+\[
+g_{\ell,m}(e_t) = g(e_t)
+\]
 
-Instead, the model learns a continuous preference distribution over head behaviors.
-That is the main reason why this idea is safer, but it should still be treated as a second-stage extension rather than the first implementation target.
+for all \(\ell\) and \(m\), then
 
-## 9. Current Code Path
+\[
+\lambda_{\ell,m}(t) = \lambda(t)
+\]
+
+for all heads.
+
+So the difference between the two modes is not conceptual.
+It is only the resolution at which the timestep-conditioned correction is applied.
+
+### 8.4 Why this unification is cleaner
+
+This unification avoids the previous duplication in which:
+
+- one scheme learned timestep-dependent global multipliers,
+- another scheme separately introduced head-specific gains.
+
+Both objects were controlling the same mathematical quantity: the axis-wise RoPE scale.
+
+The cleaner view is:
+
+- the object being controlled is always the scale vector \(\lambda\),
+- the only design choice is the resolution of the controller.
+
+That resolution can be:
+
+- global across all heads,
+- or head-aware.
+
+### 8.5 Engineering interpretation
+
+Under this unified view, the mode switch should control which tensor shape is predicted by the timestep-conditioned module:
+
+- `global` mode predicts one \(3\)-vector,
+- `head_aware` mode predicts a head-indexed collection of \(3\)-vectors.
+
+So the two modes differ only in output shape and parameter sharing pattern.
+They do not need to be presented as unrelated mechanisms.
+
+## 9. Semantic Residual Self-Attention as a Compatible Extension
+
+This section describes another compatible extension.
+It is implemented in the current code as an optional self-attention logit correction.
+
+The purpose of this extension is different from axis-wise RoPE scaling.
+Axis-wise scaling changes the positional phase prior.
+Semantic residual self-attention adds a content-based correction term on top of the original RoPE attention logit.
+
+The two ideas are therefore compatible.
+
+### 9.1 Motivation
+
+In video self-attention, a query token from a moving object may attend strongly to the same spatial coordinate in other frames, instead of attending to the new location of the same object.
+
+That bias is not always wrong:
+
+- it helps static background consistency,
+- it preserves a natural same-coordinate prior across frames.
+
+However, if that bias becomes too strong, it can hurt motion planning.
+The model may over-read features from a static coordinate and under-read features from the true object trajectory.
+
+The goal of semantic residual self-attention is therefore not to remove the positional prior.
+The goal is to add a controlled semantic correction for cross-frame token matching.
+
+### 9.2 Standard RoPE logit
+
+For layer \(\ell\), head \(m\), query token \(i\), and key token \(j\), let
+
+- \(q_i^{(\ell,m)} \in \mathbb{R}^d\) be the query before RoPE,
+- \(k_j^{(\ell,m)} \in \mathbb{R}^d\) be the key before RoPE,
+- \(\widetilde q_i^{(\ell,m)} \in \mathbb{R}^d\) be the query after RoPE,
+- \(\widetilde k_j^{(\ell,m)} \in \mathbb{R}^d\) be the key after RoPE.
+
+The standard RoPE attention logit is
+
+\[
+s_{ij}^{\mathrm{rope},(\ell,m)}
+=
+\frac{
+\langle \widetilde q_i^{(\ell,m)}, \widetilde k_j^{(\ell,m)} \rangle
+}{
+\sqrt d
+}
+\in
+\mathbb{R}.
+\]
+
+### 9.3 Semantic residual logit
+
+Define a pure semantic logit by using the pre-RoPE query and key:
+
+\[
+s_{ij}^{\mathrm{sem},(\ell,m)}
+=
+\frac{
+\langle q_i^{(\ell,m)}, k_j^{(\ell,m)} \rangle
+}{
+\sqrt d
+}
+\in
+\mathbb{R}.
+\]
+
+This term is intentionally computed before RoPE, so that it emphasizes feature similarity rather than positional phase alignment.
+
+Next define a cross-frame mask
+
+\[
+M_{ij}
+=
+\begin{cases}
+1, & f_i \neq f_j, \\
+0, & f_i = f_j,
+\end{cases}
+\]
+
+where \(f_i\) and \(f_j\) are the frame indices of tokens \(i\) and \(j\).
+
+So \(M_{ij}\) activates the residual term only for cross-frame token pairs.
+
+### 9.4 Final attention logit
+
+Let
+
+\[
+\alpha(t) \in \mathbb{R}_{\ge 0}
+\]
+
+be the semantic residual weight at diffusion step \(t\).
+
+In the current implementation, \(\alpha(t)\) can be used in two ways:
+
+- as a manually specified constant scalar,
+- as a manual base scalar multiplied by an optional timestep-conditioned positive scalar head.
+
+The final attention logit is
+
+\[
+\hat s_{ij}^{(\ell,m)}
+=
+s_{ij}^{\mathrm{rope},(\ell,m)}
++
+\alpha(t)\, M_{ij}\, s_{ij}^{\mathrm{sem},(\ell,m)}.
+\]
+
+Then the model computes the attention probability in the usual way:
+
+\[
+A_{ij}^{(\ell,m)}
+=
+\mathrm{softmax}_j
+\left(
+\hat s_{ij}^{(\ell,m)}
+\right).
+\]
+
+This construction preserves a single attention matrix and a single softmax.
+It does **not** split the head into separate spatial and temporal branches.
+
+### 9.5 Relation to the RoPE scale schemes
+
+The role of the RoPE scale schemes is to modify the positional prior through the phase.
+The role of the semantic residual term is to modify cross-frame content matching at the logit level.
+
+So the two mechanisms act at different places:
+
+- Schemes 1, 2, and 8 change how \(\widetilde q\) and \(\widetilde k\) are formed,
+- Scheme 9 changes the final logit after the RoPE term has already been computed.
+
+This is why Scheme 9 is compatible with axis-wise \(\lambda\) scaling.
+One can use both at the same time:
+
+- the RoPE term keeps geometric structure and positional stability,
+- the semantic residual term helps cross-frame semantic correspondence.
+
+### 9.6 Step control
+
+The semantic residual term can use the same diffusion-step window idea from Section 5.
+Let \(S \subseteq \{1, 2, \dots, K\}\) be the active step set.
+
+Define
+
+\[
+\alpha^{\mathrm{used}}(t)
+=
+\begin{cases}
+\alpha(t), & t \in S, \\
+0, & t \notin S.
+\end{cases}
+\]
+
+Then the final logit becomes
+
+\[
+\hat s_{ij}^{(\ell,m)}
+=
+s_{ij}^{\mathrm{rope},(\ell,m)}
++
+\alpha^{\mathrm{used}}(t)\, M_{ij}\, s_{ij}^{\mathrm{sem},(\ell,m)}.
+\]
+
+This makes the extension especially suitable for early denoising steps, where global layout and rough motion planning are most strongly formed.
+
+## 10. Current Code Path
 
 The current code implements:
 
 - Scheme 1: manual axis-wise \(\lambda_f, \lambda_h, \lambda_w\),
 - diffusion-step gating,
-- Scheme 2: a timestep-conditioned scale head with checkpoint-loading support.
+- Scheme 2, `global` mode: a timestep-conditioned scale head with checkpoint-loading support,
+- Scheme 2B, `head_aware` mode: a head-aware timestep-conditioned scaling module with runtime attachment and checkpoint-loading support,
+- Scheme 9: Semantic Residual Self-Attention with cross-frame masking, step gating, and optional timestep-conditioned \(\alpha(t)\).
+
+In the current implementation, the global and head-aware modes are still exposed through separate switches.
+The unified presentation in Sections 6 and 8 is the cleaner mathematical view of the same scale-learning family.
 
 The main files are:
 
@@ -338,7 +648,7 @@ The main files are:
 - [wan21_t2v_experiment_patch.py](/home/liyueyan/Interpretability/physics/wan21_t2v_experiments/wan21_t2v_experiment_patch.py)
 - [run_wan21_t2v_experiments.py](/home/liyueyan/Interpretability/physics/wan21_t2v_experiments/run_wan21_t2v_experiments.py)
 
-## 10. Recommended Evaluation
+## 11. Recommended Evaluation
 
 The most relevant existing experiments for evaluating this proposal are:
 

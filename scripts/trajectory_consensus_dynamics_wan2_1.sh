@@ -39,10 +39,16 @@ VAGUE_TRAJ_CROSS_ATTN_HEADS="L0H2,L0H4,L0H10,L1H6,L1H7,L3H3,L4H1,L4H2,L4H9,L4H11
 #   offline stage, reuses cross_attention_token_viz maps only.
 # - head_contribution:
 #   runtime patch stage, runs exact zero-ablation for selected heads.
+# - self_attention_coupling:
+#   runtime probe stage, collects self-attention candidate coupling and
+#   aggregates winner-versus-loser features plus temporal precedence.
 # - plot_candidate / plot_head:
 #   plot-only redraw modes from saved outputs.
+# - plot_self:
+#   plot-only redraw for self_attention_coupling from saved CSV files.
 # - all:
-#   sequentially run candidate_consensus first, then head_contribution,
+#   sequentially run candidate_consensus, self_attention_coupling, then
+#   head_contribution,
 #   using the same SAVE_DIR so all outputs stay together.
 #
 # Dependency notes
@@ -82,10 +88,12 @@ TARGET_OBJECT_WORDS="basketball"
 TARGET_VERB_WORDS="falls,bounces,up"
 
 # ==============================
-# RUN_MODE="head_contribution"  # candidate_consensus | head_contribution | plot_candidate | plot_head | all
-RUN_MODE="candidate_consensus"
+# candidate_consensus | head_contribution | self_attention_coupling | plot_candidate | plot_head | plot_self| all
+# RUN_MODE="candidate_consensus"  # candidate_consensus | plot_candidate
+# RUN_MODE="head_contribution"  # head_contribution | plot_head
+RUN_MODE="plot_self"  # self_attention_coupling | plot_self
 
-# Empty -> all heads
+# For candidate region extraction & head contribution. Empty -> all heads
 CROSS_ATTN_TRAJ_TYPE="all"  # ! all, null, traj_clear, traj_vague, traj_clear_vague
 if [ "$CROSS_ATTN_TRAJ_TYPE" == "traj_clear" ]; then
     CROSS_ATTN_HEADS="$CLEAR_TRAJ_CROSS_ATTN_HEADS"
@@ -103,10 +111,10 @@ else
 fi
 
 # Optional scope controls
-TRAJECTORY_CONSENSUS_STEPS=""  # "1,2,3,4,5"；empty -> all available reused-map steps; "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+TRAJECTORY_CONSENSUS_STEPS="1,2,3,4,5,6,7,8,9,10"  # "1,2,3,4,5"；empty -> all available reused-map steps; "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
 TRAJECTORY_CONSENSUS_LAYERS=""  # empty -> all available reused-map layers
 TRAJECTORY_CONSENSUS_CROSS_HEADS="$CROSS_ATTN_HEADS"  # "" -> all cross-attention heads in selected layers; None -> no cross-attention head
-TRAJECTORY_CONSENSUS_SELF_HEADS="None"  # "" -> all self-attention heads in selected layers; None -> no self-attention head
+TRAJECTORY_CONSENSUS_SELF_HEADS=""  # "" -> all self-attention heads in selected layers; None -> no self-attention head
 TRAJECTORY_CONSENSUS_MODULES="cross"  # enable `self` only when TRAJECTORY_CONSENSUS_SELF_HEADS is not None
 TRAJECTORY_CONSENSUS_BRANCH="cond"
 
@@ -135,8 +143,14 @@ TRAJECTORY_CONSENSUS_TAYLOR_USE_GRADIENT_CHECKPOINTING=True
 TRAJECTORY_CONSENSUS_REFERENCE_DISTANCE_METRIC="center_l2,support_overlap,js,hellinger,wasserstein_map"  # !
 TRAJECTORY_CONSENSUS_SCATTER_OUTLIER_HEADS="L0H4,"  # !
 
+# Self-attention candidate coupling
+TRAJECTORY_CONSENSUS_SA_ANCHOR_STEP=49
+TRAJECTORY_CONSENSUS_SA_ANCHOR_LAYER=27
+TRAJECTORY_CONSENSUS_SA_COVERED_MASS_MIN=0.0
+TRAJECTORY_CONSENSUS_SA_PRECEDENCE_PERSISTENCE=2  # whether a winner keeps leading for a long time
+
 # Engineering controls
-TRAJECTORY_CONSENSUS_SKIP_EXISTING_PLOTS=False  # if False, redraw existing plots
+TRAJECTORY_CONSENSUS_SKIP_EXISTING_PLOTS=True  # if False, redraw existing plots
 TRAJECTORY_CONSENSUS_NUM_WORKERS=16
 
 run_once() {
@@ -218,6 +232,17 @@ run_once() {
         )
     fi
 
+    if [[ "$stage_csv" == *"self_attention_coupling"* ]]; then
+        cmd+=(
+            --trajectory_consensus_self_heads "$TRAJECTORY_CONSENSUS_SELF_HEADS"
+            --trajectory_consensus_branch $TRAJECTORY_CONSENSUS_BRANCH
+            --trajectory_consensus_sa_anchor_step $TRAJECTORY_CONSENSUS_SA_ANCHOR_STEP
+            --trajectory_consensus_sa_anchor_layer $TRAJECTORY_CONSENSUS_SA_ANCHOR_LAYER
+            --trajectory_consensus_sa_covered_mass_min $TRAJECTORY_CONSENSUS_SA_COVERED_MASS_MIN
+            --trajectory_consensus_sa_precedence_persistence $TRAJECTORY_CONSENSUS_SA_PRECEDENCE_PERSISTENCE
+        )
+    fi
+
     "${cmd[@]}"
 }
 
@@ -237,17 +262,24 @@ for SEED in "${SEEDS[@]}"; do
         candidate_consensus)
             run_once "$PROMPT" "$SEED" "$SAVE_DIR" "candidate_consensus" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
             ;;
+        self_attention_coupling)
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "self_attention_coupling" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            ;;
         head_contribution)
             run_once "$PROMPT" "$SEED" "$SAVE_DIR" "head_contribution" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
             ;;
         plot_candidate)
             run_once "$PROMPT" "$SEED" "$SAVE_DIR" "candidate_consensus" "True" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
             ;;
+        plot_self)
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "self_attention_coupling" "True" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            ;;
         plot_head)
             run_once "$PROMPT" "$SEED" "$SAVE_DIR" "head_contribution" "True" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
             ;;
         all)
             run_once "$PROMPT" "$SEED" "$SAVE_DIR" "candidate_consensus" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "self_attention_coupling" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
             run_once "$PROMPT" "$SEED" "$SAVE_DIR" "head_contribution" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
             ;;
         *)

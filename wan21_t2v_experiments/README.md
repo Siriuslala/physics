@@ -71,7 +71,7 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
 - 动机：通过轴向 lambda 缩放、可选的扩散步窗口控制、以及可选的 timestep-conditioned scale head 改造 Wan2.1 T2V 的 self-attention RoPE。
 - Modes:
   - `manual`: training-free manual `lambda_f/lambda_h/lambda_w`
-  - `step_conditioned`: training-oriented timestep-conditioned scale head attached by monkey patch
+  - `timestep_conditioned`: unified timestep-conditioned scale learner with `global` and `head_aware` modes, attached by monkey patch
 - See detailed note: `docs/rope_modification.md`
 
 ### 2) `attention_dt_profile`

@@ -46,10 +46,26 @@ class Wan21T2VRopePatchConfig:
     lambda_h: float = 1.0
     lambda_w: float = 1.0
     apply_steps: Tuple[int, ...] = tuple()
-    step_conditioned: bool = False
-    step_conditioned_hidden_dim: int = 128
-    step_conditioned_module_name: str = "rope_scale_net"
-    step_conditioned_checkpoint: str = ""
+    scale_mode: str = "manual"  # manual, timestep_conditioned
+    timestep_conditioned_resolution: str = "global"  # global, head_aware
+    timestep_conditioned_hidden_dim: int = 128
+    timestep_conditioned_module_name: str = "rope_timestep_conditioned_scale_net"
+    timestep_conditioned_checkpoint: str = ""
+
+
+@dataclass
+class Wan21T2VSemanticResidualConfig:
+    """Configuration for semantic residual self-attention."""
+
+    enabled: bool = False
+    alpha: float = 0.0
+    apply_steps: Tuple[int, ...] = tuple()
+    query_chunk_size: int = 64
+    timestep_conditioned: bool = False
+    timestep_conditioned_resolution: str = "global"  # global, head_aware
+    timestep_conditioned_hidden_dim: int = 128
+    timestep_conditioned_module_name: str = "semantic_residual_timestep_conditioned_alpha_net"
+    timestep_conditioned_checkpoint: str = ""
 
 
 @dataclass
@@ -81,6 +97,10 @@ class Wan21T2VAttentionProbeConfig:
     distribution_global_query_tokens_per_frame: int = 64
     distribution_object_query_token_limit_per_frame: int = 0
     distribution_object_support_mask: Optional[torch.Tensor] = None
+    collect_candidate_coupling: bool = False
+    candidate_coupling_layers: Tuple[int, ...] = tuple()
+    candidate_coupling_label_maps_by_step_layer: Optional[Dict[Tuple[int, int], torch.Tensor]] = None
+    candidate_coupling_head_indices_by_layer: Optional[Dict[int, Tuple[int, ...]]] = None
     collect_self_attention_viz: bool = False
     self_attention_viz_layers: Tuple[int, ...] = tuple()
     self_attention_viz_query_video_frame_indices: Tuple[int, ...] = (1, 33, 41, 81)
@@ -118,21 +138,47 @@ class Wan21T2VPatchBundleConfig:
     """Composable bundle of patch configurations."""
 
     rope: Wan21T2VRopePatchConfig = field(default_factory=Wan21T2VRopePatchConfig)
+    semantic: Wan21T2VSemanticResidualConfig = field(default_factory=Wan21T2VSemanticResidualConfig)
     probe: Wan21T2VAttentionProbeConfig = field(default_factory=Wan21T2VAttentionProbeConfig)
     causal: Wan21T2VCausalAttentionConfig = field(default_factory=Wan21T2VCausalAttentionConfig)
 
 
-class Wan21T2VRopeStepConditionedScale(nn.Module):
-    """Small timestep-conditioned axis-scale head for RoPE modification."""
+class Wan21T2VRopeTimestepConditionedScale(nn.Module):
+    """Unified timestep-conditioned scale learner for RoPE.
 
-    def __init__(self, freq_dim: int, hidden_dim: int = 128):
+    This module learns:
+    - a positive base axis-wise scale shared across heads,
+    - a timestep-conditioned correction,
+    - either a global correction or a head-aware correction.
+    """
+
+    def __init__(
+        self,
+        freq_dim: int,
+        hidden_dim: int = 128,
+        num_heads: int = 16,
+        resolution: str = "global",
+        init_lambdas: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ):
         super().__init__()
         self.freq_dim = int(freq_dim)
         self.hidden_dim = int(hidden_dim)
+        self.num_heads = int(num_heads)
+        self.resolution = str(resolution)
+        if self.resolution not in {"global", "head_aware"}:
+            raise ValueError(
+                "resolution must be one of {'global', 'head_aware'}, "
+                f"got {self.resolution!r}."
+            )
+
+        init_tensor = torch.tensor(init_lambdas, dtype=torch.float32).clamp_min(1e-8)
+        self.base_log_scale = nn.Parameter(init_tensor.log())
+
+        out_dim = 3 if self.resolution == "global" else (self.num_heads * 3)
         self.net = nn.Sequential(
             nn.Linear(self.freq_dim, self.hidden_dim),
             nn.SiLU(),
-            nn.Linear(self.hidden_dim, 3),
+            nn.Linear(self.hidden_dim, out_dim),
         )
         self.reset_parameters()
 
@@ -143,14 +189,78 @@ class Wan21T2VRopeStepConditionedScale(nn.Module):
             nn.init.zeros_(last.bias)
 
     def forward(self, timestep: torch.Tensor) -> torch.Tensor:
-        """Return positive multiplicative scales of shape [B, 3]."""
+        """Return positive scales of shape [B, 3] or [B, num_heads, 3]."""
         if not torch.is_tensor(timestep):
             timestep = torch.tensor([float(timestep)], dtype=torch.float32)
         if timestep.ndim == 0:
             timestep = timestep.unsqueeze(0)
         timestep = timestep.to(dtype=torch.float32)
         emb = wan.modules.model.sinusoidal_embedding_1d(self.freq_dim, timestep).float()
-        return torch.exp(self.net(emb))
+        delta = self.net(emb)
+        base = self.base_log_scale.to(device=delta.device, dtype=delta.dtype)
+        if self.resolution == "global":
+            return torch.exp(base.view(1, 3) + delta.view(-1, 3))
+        return torch.exp(base.view(1, 1, 3) + delta.view(-1, self.num_heads, 3))
+
+
+class Wan21T2VSemanticResidualTimestepConditionedAlpha(nn.Module):
+    """Unified timestep-conditioned alpha learner for semantic residual attention."""
+
+    def __init__(
+        self,
+        freq_dim: int,
+        hidden_dim: int = 128,
+        num_heads: int = 16,
+        resolution: str = "global",
+        init_alpha: float = 0.0,
+    ):
+        super().__init__()
+        self.freq_dim = int(freq_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_heads = int(num_heads)
+        self.resolution = str(resolution)
+        if self.resolution not in {"global", "head_aware"}:
+            raise ValueError(
+                "resolution must be one of {'global', 'head_aware'}, "
+                f"got {self.resolution!r}."
+            )
+
+        init_alpha = max(float(init_alpha), 1e-8)
+        if self.resolution == "global":
+            self.base_log_alpha = nn.Parameter(torch.tensor([init_alpha], dtype=torch.float32).log())
+            out_dim = 1
+        else:
+            self.base_log_alpha = nn.Parameter(
+                torch.full((self.num_heads,), init_alpha, dtype=torch.float32).log()
+            )
+            out_dim = self.num_heads
+
+        self.net = nn.Sequential(
+            nn.Linear(self.freq_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, out_dim),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        last = self.net[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+        """Return positive alpha of shape [B] or [B, num_heads]."""
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([float(timestep)], dtype=torch.float32)
+        if timestep.ndim == 0:
+            timestep = timestep.unsqueeze(0)
+        timestep = timestep.to(dtype=torch.float32)
+        emb = wan.modules.model.sinusoidal_embedding_1d(self.freq_dim, timestep).float()
+        delta = self.net(emb)
+        base = self.base_log_alpha.to(device=delta.device, dtype=delta.dtype)
+        if self.resolution == "global":
+            return torch.exp(base.view(1, 1) + delta.view(-1, 1))
+        return torch.exp(base.view(1, self.num_heads) + delta.view(-1, self.num_heads))
 
 
 class Wan21T2VProbeState:
@@ -183,6 +293,13 @@ class Wan21T2VProbeState:
         self.distribution_global_dt_sum: Dict[Tuple[int, int, str], torch.Tensor] = {}
         self.distribution_global_dt_valid_count: Dict[Tuple[int, int, str], torch.Tensor] = {}
         self.distribution_grid_size: Optional[Tuple[int, int, int]] = None
+        self.candidate_coupling_sum: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.candidate_coupling_covered_mass_sum: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.candidate_coupling_query_token_count_sum: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.candidate_coupling_observation_count: Dict[Tuple[int, int], int] = {}
+        self.candidate_coupling_candidate_count_by_frame: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.candidate_coupling_selected_head_indices: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.candidate_coupling_grid_size: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
         self.self_attention_viz_sum: Dict[Tuple[int, int, int], torch.Tensor] = {}
         self.self_attention_viz_count: Dict[Tuple[int, int, int], int] = {}
         self.self_attention_viz_query_video_frames: Dict[Tuple[int, int, int], int] = {}
@@ -413,6 +530,35 @@ class Wan21T2VProbeState:
             )
         return torch.cat(query_indices, dim=0), torch.cat(query_frames, dim=0)
 
+    def _get_candidate_coupling_label_map(
+        self,
+        layer_idx: int,
+        f: int,
+        h: int,
+        w: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Return the candidate label map for the current `(step, layer)`."""
+        label_maps_by_step_layer = self.config.probe.candidate_coupling_label_maps_by_step_layer
+        if not label_maps_by_step_layer:
+            return None
+        label_map = label_maps_by_step_layer.get((int(self.current_step), int(layer_idx)))
+        if label_map is None:
+            return None
+        label_map = label_map.to(device=device, dtype=torch.long)
+        if label_map.ndim != 3:
+            raise ValueError(
+                "candidate_coupling_label_maps_by_step_layer must store tensors with shape [F, H, W]."
+            )
+        expected_shape = (int(f), int(h), int(w))
+        if tuple(int(x) for x in label_map.shape) != expected_shape:
+            raise ValueError(
+                "candidate_coupling label map shape does not match the current token grid: "
+                f"expected {expected_shape}, got {tuple(int(x) for x in label_map.shape)} "
+                f"at step={int(self.current_step)} layer={int(layer_idx)}."
+            )
+        return label_map
+
     def _resolve_self_attention_viz_query_token_frames(self, token_frame_count: int) -> List[Tuple[int, int]]:
         """Project requested 1-based video-frame labels to token-frame indices."""
         requested_video_frames = [
@@ -545,6 +691,10 @@ class Wan21T2VProbeState:
             (not self.config.probe.distribution_layers)
             or (int(layer_idx) in self.config.probe.distribution_layers)
         )
+        need_candidate_coupling = bool(self.config.probe.collect_candidate_coupling) and (
+            (not self.config.probe.candidate_coupling_layers)
+            or (int(layer_idx) in self.config.probe.candidate_coupling_layers)
+        )
         need_self_attention_viz = bool(self.config.probe.collect_self_attention_viz) and (
             (not self.config.probe.self_attention_viz_layers)
             or (int(layer_idx) in self.config.probe.self_attention_viz_layers)
@@ -555,7 +705,7 @@ class Wan21T2VProbeState:
             (not self.config.probe.maas_layers) or (int(layer_idx) in self.config.probe.maas_layers)
         )
 
-        if not (need_dt_histograms or need_distribution or need_self_attention_viz or need_maas):
+        if not (need_dt_histograms or need_distribution or need_candidate_coupling or need_self_attention_viz or need_maas):
             return
 
         bsz = q.size(0)
@@ -714,6 +864,128 @@ class Wan21T2VProbeState:
 
                 self.distribution_grid_size = (f, h, w)
 
+            if need_candidate_coupling:
+                label_map = self._get_candidate_coupling_label_map(
+                    layer_idx=int(layer_idx),
+                    f=int(f),
+                    h=int(h),
+                    w=int(w),
+                    device=q.device,
+                )
+                if label_map is not None:
+                    candidate_counts = [int(label_map[frame_index].max().item()) for frame_index in range(int(f))]
+                    if any(int(count) > 0 for count in candidate_counts):
+                        head_index_map = self.config.probe.candidate_coupling_head_indices_by_layer or {}
+                        selected_head_indices = tuple(
+                            sorted(
+                                {
+                                    int(head_index)
+                                    for head_index in head_index_map.get(int(layer_idx), tuple(range(int(self.num_heads))))
+                                    if 0 <= int(head_index) < int(self.num_heads)
+                                }
+                            )
+                        )
+                        if not selected_head_indices:
+                            selected_head_indices = tuple(range(int(self.num_heads)))
+                        num_selected_heads = int(len(selected_head_indices))
+                        max_candidate_count = int(max(candidate_counts))
+                        group_key = (int(self.current_step), int(layer_idx))
+
+                        if group_key not in self.candidate_coupling_sum:
+                            self.candidate_coupling_sum[group_key] = torch.zeros(
+                                (num_selected_heads, int(f), max_candidate_count, int(f), max_candidate_count),
+                                dtype=torch.float32,
+                            )
+                            self.candidate_coupling_covered_mass_sum[group_key] = torch.zeros(
+                                (num_selected_heads, int(f), max_candidate_count, int(f)),
+                                dtype=torch.float32,
+                            )
+                            self.candidate_coupling_query_token_count_sum[group_key] = torch.zeros(
+                                (int(f), max_candidate_count),
+                                dtype=torch.float32,
+                            )
+                            self.candidate_coupling_observation_count[group_key] = 0
+                            self.candidate_coupling_candidate_count_by_frame[group_key] = torch.tensor(
+                                candidate_counts,
+                                dtype=torch.int64,
+                            )
+                            self.candidate_coupling_selected_head_indices[group_key] = torch.tensor(
+                                selected_head_indices,
+                                dtype=torch.int64,
+                            )
+                            self.candidate_coupling_grid_size[group_key] = (int(f), int(h), int(w))
+
+                        flat_labels = label_map.reshape(-1)
+                        query_token_indices = torch.nonzero(flat_labels > 0, as_tuple=False).flatten()
+                        if int(query_token_indices.numel()) > 0:
+                            query_candidate_labels = flat_labels[query_token_indices]
+                            query_frames = torch.div(query_token_indices, int(h * w), rounding_mode="floor")
+
+                            q_sel = q_i[query_token_indices][:, list(selected_head_indices), :]
+                            k_sel = k_i[:, list(selected_head_indices), :]
+                            logits = torch.einsum("qhd,khd->hqk", q_sel.float(), k_sel.float()) * scale
+                            probs = torch.softmax(logits, dim=-1).reshape(
+                                num_selected_heads,
+                                int(query_token_indices.numel()),
+                                int(f),
+                                int(h * w),
+                            )
+
+                            key_candidate_mass_by_frame: Dict[int, torch.Tensor] = {}
+                            key_covered_mass_by_frame: Dict[int, torch.Tensor] = {}
+                            for key_frame in range(int(f)):
+                                key_candidate_count = int(candidate_counts[key_frame])
+                                if key_candidate_count <= 0:
+                                    continue
+                                key_labels = label_map[key_frame].reshape(-1)
+                                key_one_hot = F.one_hot(
+                                    key_labels.clamp_min(0),
+                                    num_classes=key_candidate_count + 1,
+                                ).to(dtype=torch.float32)[:, 1:]
+                                key_frame_probs = probs[:, :, key_frame, :]
+                                key_candidate_mass = torch.einsum("hqn,nk->hqk", key_frame_probs, key_one_hot)
+                                key_candidate_mass_by_frame[key_frame] = key_candidate_mass
+                                key_covered_mass_by_frame[key_frame] = key_candidate_mass.sum(dim=-1)
+
+                            coupling_sum = self.candidate_coupling_sum[group_key]
+                            covered_mass_sum = self.candidate_coupling_covered_mass_sum[group_key]
+                            query_token_count_sum = self.candidate_coupling_query_token_count_sum[group_key]
+                            for query_frame in range(int(f)):
+                                query_candidate_count = int(candidate_counts[query_frame])
+                                if query_candidate_count <= 0:
+                                    continue
+                                for query_candidate in range(1, query_candidate_count + 1):
+                                    candidate_mask = (query_frames == int(query_frame)) & (
+                                        query_candidate_labels == int(query_candidate)
+                                    )
+                                    candidate_query_count = int(candidate_mask.sum().item())
+                                    if candidate_query_count <= 0:
+                                        continue
+                                    query_token_count_sum[int(query_frame), int(query_candidate - 1)] += float(candidate_query_count)
+                                    for key_frame, key_candidate_mass in key_candidate_mass_by_frame.items():
+                                        if int(key_frame) == int(query_frame):
+                                            continue
+                                        key_candidate_count = int(candidate_counts[int(key_frame)])
+                                        if key_candidate_count <= 0:
+                                            continue
+                                        mean_candidate_mass = key_candidate_mass[:, candidate_mask, :].mean(dim=1).detach().cpu()
+                                        mean_covered_mass = key_covered_mass_by_frame[int(key_frame)][:, candidate_mask].mean(dim=1).detach().cpu()
+                                        coupling_sum[
+                                            :,
+                                            int(query_frame),
+                                            int(query_candidate - 1),
+                                            int(key_frame),
+                                            :int(key_candidate_count),
+                                        ] += mean_candidate_mass
+                                        covered_mass_sum[
+                                            :,
+                                            int(query_frame),
+                                            int(query_candidate - 1),
+                                            int(key_frame),
+                                        ] += mean_covered_mass
+
+                            self.candidate_coupling_observation_count[group_key] += 1
+
             if need_self_attention_viz:
                 query_info_by_frame = self._get_self_attention_viz_query_indices(
                     f=f,
@@ -839,6 +1111,69 @@ class Wan21T2VProbeState:
             "object_dt_rows": object_dt_rows,
             "global_dt_rows": global_dt_rows,
         }
+
+    def export_candidate_coupling_rows(self) -> List[Dict[str, float]]:
+        """Export candidate-to-candidate self-attention coupling rows."""
+        rows: List[Dict[str, float]] = []
+        for group_key in sorted(self.candidate_coupling_sum.keys()):
+            step, layer = group_key
+            observation_count = max(1, int(self.candidate_coupling_observation_count.get(group_key, 1)))
+            coupling_mean = (self.candidate_coupling_sum[group_key] / float(observation_count)).float()
+            covered_mass_mean = (self.candidate_coupling_covered_mass_sum[group_key] / float(observation_count)).float()
+            query_token_count_mean = (self.candidate_coupling_query_token_count_sum[group_key] / float(observation_count)).float()
+            candidate_counts = self.candidate_coupling_candidate_count_by_frame[group_key]
+            selected_head_indices = self.candidate_coupling_selected_head_indices[group_key]
+            grid_f, grid_h, grid_w = self.candidate_coupling_grid_size[group_key]
+
+            for head_offset, head_index in enumerate(selected_head_indices.tolist()):
+                for query_frame in range(int(grid_f)):
+                    query_candidate_count = int(candidate_counts[query_frame].item())
+                    for query_candidate in range(1, query_candidate_count + 1):
+                        query_token_count = float(query_token_count_mean[query_frame, int(query_candidate - 1)].item())
+                        for key_frame in range(int(grid_f)):
+                            if int(key_frame) == int(query_frame):
+                                continue
+                            key_candidate_count = int(candidate_counts[key_frame].item())
+                            if key_candidate_count <= 0:
+                                continue
+                            covered_mass = float(
+                                covered_mass_mean[
+                                    head_offset,
+                                    int(query_frame),
+                                    int(query_candidate - 1),
+                                    int(key_frame),
+                                ].item()
+                            )
+                            for key_candidate in range(1, key_candidate_count + 1):
+                                raw_coupling = float(
+                                    coupling_mean[
+                                        head_offset,
+                                        int(query_frame),
+                                        int(query_candidate - 1),
+                                        int(key_frame),
+                                        int(key_candidate - 1),
+                                    ].item()
+                                )
+                                rows.append(
+                                    {
+                                        "step": int(step),
+                                        "layer": int(layer),
+                                        "head": int(head_index),
+                                        "query_frame": int(query_frame),
+                                        "query_candidate": int(query_candidate),
+                                        "query_token_count": float(query_token_count),
+                                        "key_frame": int(key_frame),
+                                        "key_candidate": int(key_candidate),
+                                        "key_candidate_count": int(key_candidate_count),
+                                        "grid_frames": int(grid_f),
+                                        "grid_height": int(grid_h),
+                                        "grid_width": int(grid_w),
+                                        "covered_mass": float(covered_mass),
+                                        "raw_coupling": float(raw_coupling),
+                                        "normalized_coupling": float(raw_coupling / max(1e-8, covered_mass)),
+                                    }
+                                )
+        return rows
 
     def export_self_attention_viz_maps(self) -> Dict[Tuple[int, int, int], torch.Tensor]:
         """Export averaged self-attention visualization maps with shape [num_heads, F, H, W]."""
@@ -1036,7 +1371,7 @@ def _rescale_complex_phase(freq: torch.Tensor, scale) -> torch.Tensor:
 
 def _resolve_rope_manual_scales(rope_cfg: Wan21T2VRopePatchConfig) -> Tuple[float, float, float]:
     use_lambda_fields = (
-        rope_cfg.step_conditioned
+        rope_cfg.scale_mode == "timestep_conditioned"
         or bool(rope_cfg.apply_steps)
         or rope_cfg.lambda_f != 1.0
         or rope_cfg.lambda_h != 1.0
@@ -1047,21 +1382,83 @@ def _resolve_rope_manual_scales(rope_cfg: Wan21T2VRopePatchConfig) -> Tuple[floa
     return float(rope_cfg.f_scale), float(rope_cfg.h_scale), float(rope_cfg.w_scale)
 
 
-def _maybe_get_step_conditioned_scales(
+def _maybe_get_timestep_conditioned_scales(
     rope_cfg: Wan21T2VRopePatchConfig,
+    num_heads: int,
     state: Optional[Wan21T2VProbeState],
     device: torch.device,
     dtype: torch.dtype,
 ) -> Optional[torch.Tensor]:
-    if not rope_cfg.step_conditioned:
+    if rope_cfg.scale_mode != "timestep_conditioned":
         return None
     if state is None or state.current_timestep_value is None:
         return None
-    module = getattr(rope_cfg, "step_conditioned_module", None)
+    module = getattr(rope_cfg, "timestep_conditioned_module", None)
     if module is None:
         return None
     timestep = torch.tensor([float(state.current_timestep_value)], device=device, dtype=torch.float32)
-    return module(timestep).to(device=device, dtype=dtype).squeeze(0)
+    scales = module(timestep).to(device=device, dtype=dtype).squeeze(0)
+    resolution = str(rope_cfg.timestep_conditioned_resolution)
+    if resolution == "global":
+        if scales.ndim != 1 or scales.size(0) != 3:
+            raise ValueError(
+                "Global timestep-conditioned scale module must return shape [3], "
+                f"got {tuple(scales.shape)}."
+            )
+        return scales
+    if resolution == "head_aware":
+        if scales.ndim != 2 or scales.size(0) != int(num_heads) or scales.size(1) != 3:
+            raise ValueError(
+                "Head-aware timestep-conditioned scale module must return shape [num_heads, 3], "
+                f"got {tuple(scales.shape)} for num_heads={int(num_heads)}."
+            )
+        return scales
+    raise ValueError(
+        "timestep_conditioned_resolution must be one of {'global', 'head_aware'}, "
+        f"got {resolution!r}."
+    )
+
+
+def _maybe_get_semantic_residual_alpha(
+    semantic_cfg: Wan21T2VSemanticResidualConfig,
+    num_heads: int,
+    state: Optional[Wan21T2VProbeState],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    alpha = float(semantic_cfg.alpha)
+    if semantic_cfg.apply_steps and (state is None or int(state.current_step) not in {int(v) for v in semantic_cfg.apply_steps}):
+        alpha = 0.0
+    if not semantic_cfg.timestep_conditioned:
+        return torch.tensor(alpha, device=device, dtype=dtype)
+    if state is None or state.current_timestep_value is None:
+        return None
+    module = getattr(semantic_cfg, "timestep_conditioned_module", None)
+    if module is None:
+        return None
+    timestep = torch.tensor([float(state.current_timestep_value)], device=device, dtype=torch.float32)
+    learned = module(timestep).to(device=device, dtype=dtype).squeeze(0)
+    resolution = str(semantic_cfg.timestep_conditioned_resolution)
+    if resolution == "global":
+        if learned.ndim == 0:
+            return learned.reshape(())
+        if learned.ndim == 1 and learned.numel() == 1:
+            return learned.reshape(())
+        raise ValueError(
+            "Global semantic residual alpha module must return shape [1], "
+            f"got {tuple(learned.shape)}."
+        )
+    if resolution == "head_aware":
+        if learned.ndim != 1 or learned.size(0) != int(num_heads):
+            raise ValueError(
+                "Head-aware semantic residual alpha module must return shape [num_heads], "
+                f"got {tuple(learned.shape)} for num_heads={int(num_heads)}."
+            )
+        return learned
+    raise ValueError(
+        "semantic timestep_conditioned_resolution must be one of {'global', 'head_aware'}, "
+        f"got {resolution!r}."
+    )
 
 
 @torch.cuda.amp.autocast(enabled=False)
@@ -1071,6 +1468,7 @@ def apply_wan21_t2v_rope_patch(
     freqs: torch.Tensor,
     rope_cfg: Wan21T2VRopePatchConfig,
     state: Optional[Wan21T2VProbeState] = None,
+    layer_idx: Optional[int] = None,
 ):
     """Apply configurable 3D RoPE intervention on q/k tensors."""
     if not rope_cfg.enabled:
@@ -1136,29 +1534,50 @@ def apply_wan21_t2v_rope_patch(
         scale_f = torch.tensor(manual_scale_f, device=ff.device, dtype=torch.float64)
         scale_h = torch.tensor(manual_scale_h, device=fh.device, dtype=torch.float64)
         scale_w = torch.tensor(manual_scale_w, device=fw.device, dtype=torch.float64)
-        learned_scales = _maybe_get_step_conditioned_scales(
-            rope_cfg=rope_cfg,
-            state=state,
-            device=ff.device,
-            dtype=torch.float64,
-        )
-        if learned_scales is not None:
-            scale_f = scale_f * learned_scales[0]
-            scale_h = scale_h * learned_scales[1]
-            scale_w = scale_w * learned_scales[2]
+        learned_scales = None
+        if rope_cfg.scale_mode == "timestep_conditioned":
+            learned_scales = _maybe_get_timestep_conditioned_scales(
+                rope_cfg=rope_cfg,
+                num_heads=n,
+                state=state,
+                device=ff.device,
+                dtype=torch.float64,
+            )
 
-        ff = _rescale_complex_phase(ff, scale_f) if enable_f else torch.ones_like(ff)
-        fh = _rescale_complex_phase(fh, scale_h) if enable_h else torch.ones_like(fh)
-        fw = _rescale_complex_phase(fw, scale_w) if enable_w else torch.ones_like(fw)
+        if learned_scales is None or learned_scales.ndim == 1:
+            if learned_scales is not None:
+                scale_f = learned_scales[0]
+                scale_h = learned_scales[1]
+                scale_w = learned_scales[2]
+            ff = _rescale_complex_phase(ff, scale_f) if enable_f else torch.ones_like(ff)
+            fh = _rescale_complex_phase(fh, scale_h) if enable_h else torch.ones_like(fh)
+            fw = _rescale_complex_phase(fw, scale_w) if enable_w else torch.ones_like(fw)
 
-        freq_i_full = torch.cat(
-            [
-                ff.view(f, 1, 1, -1).expand(f, h, w, -1),
-                fh.view(1, h, 1, -1).expand(f, h, w, -1),
-                fw.view(1, 1, w, -1).expand(f, h, w, -1),
-            ],
-            dim=-1,
-        ).reshape(seq_len, 1, -1)
+            freq_i_full = torch.cat(
+                [
+                    ff.view(f, 1, 1, -1).expand(f, h, w, -1),
+                    fh.view(1, h, 1, -1).expand(f, h, w, -1),
+                    fw.view(1, 1, w, -1).expand(f, h, w, -1),
+                ],
+                dim=-1,
+            ).reshape(seq_len, 1, -1)
+        else:
+            scale_f = learned_scales[:, 0]
+            scale_h = learned_scales[:, 1]
+            scale_w = learned_scales[:, 2]
+
+            ff = _rescale_complex_phase(ff.unsqueeze(1), scale_f.view(1, n, 1)) if enable_f else torch.ones((f, n, ff.size(1)), dtype=ff.dtype, device=ff.device)
+            fh = _rescale_complex_phase(fh.unsqueeze(1), scale_h.view(1, n, 1)) if enable_h else torch.ones((h, n, fh.size(1)), dtype=fh.dtype, device=fh.device)
+            fw = _rescale_complex_phase(fw.unsqueeze(1), scale_w.view(1, n, 1)) if enable_w else torch.ones((w, n, fw.size(1)), dtype=fw.dtype, device=fw.device)
+
+            freq_i_full = torch.cat(
+                [
+                    ff.view(f, 1, 1, n, -1).expand(f, h, w, n, -1),
+                    fh.view(1, h, 1, n, -1).expand(f, h, w, n, -1),
+                    fw.view(1, 1, w, n, -1).expand(f, h, w, n, -1),
+                ],
+                dim=-1,
+            ).reshape(seq_len, n, -1)
         freq_i = _slice_freqs_for_local_shard(freq_i_full, local_len)
 
         x_i = torch.view_as_real(x_i * freq_i).flatten(2)
@@ -1344,6 +1763,100 @@ def _attention_dispatch(
     )
 
 
+def _attention_semantic_residual(
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    v: torch.Tensor,
+    q_sem: torch.Tensor,
+    k_sem: torch.Tensor,
+    seq_lens: torch.Tensor,
+    grid_sizes: torch.Tensor,
+    causal_enabled: bool,
+    causal_mode: str,
+    window_size: Tuple[int, int],
+    alpha: torch.Tensor,
+    query_chunk_size: int,
+) -> torch.Tensor:
+    """Attention with semantic residual logits added on top of RoPE logits."""
+    bsz, s, n, d = q_rope.shape
+    out = q_rope.new_zeros((bsz, s, n, d))
+    scale = float(d) ** -0.5
+    chunk_size = max(1, int(query_chunk_size))
+
+    if alpha.ndim == 0:
+        alpha_is_zero = float(alpha.item()) == 0.0
+    else:
+        alpha_is_zero = bool(torch.all(alpha == 0).item())
+
+    if alpha_is_zero:
+        return _attention_torch_sdpa(
+            q=q_rope,
+            k=k_rope,
+            v=v,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            causal_enabled=causal_enabled,
+            causal_mode=causal_mode,
+            window_size=window_size,
+        )
+
+    for b in range(bsz):
+        l = int(seq_lens[b].item())
+        if l <= 0:
+            continue
+
+        q_rope_b = q_rope[b, :l].permute(1, 0, 2).to(torch.float32)
+        k_rope_b = k_rope[b, :l].permute(1, 0, 2).to(torch.float32)
+        q_sem_b = q_sem[b, :l].permute(1, 0, 2).to(torch.float32)
+        k_sem_b = k_sem[b, :l].permute(1, 0, 2).to(torch.float32)
+        v_b = v[b, :l].permute(1, 0, 2)
+        grid_size = tuple(int(x) for x in grid_sizes[b].tolist())
+
+        base_mask = _build_attention_mask(
+            seq_len=l,
+            grid_size=grid_size,
+            causal_enabled=causal_enabled,
+            causal_mode=causal_mode,
+            window_size=window_size,
+            device=q_rope_b.device,
+            dtype=q_rope_b.dtype,
+        )
+        spatial = max(1, int(grid_size[1]) * int(grid_size[2]))
+        frame_ids = (torch.arange(l, device=q_rope_b.device) // spatial).to(torch.long)
+
+        for q_start in range(0, l, chunk_size):
+            q_end = min(l, q_start + chunk_size)
+            if q_end <= q_start:
+                continue
+
+            rope_logits = torch.matmul(
+                q_rope_b[:, q_start:q_end, :],
+                k_rope_b.transpose(-1, -2),
+            ) * scale
+            sem_logits = torch.matmul(
+                q_sem_b[:, q_start:q_end, :],
+                k_sem_b.transpose(-1, -2),
+            ) * scale
+
+            cross_frame_mask = (
+                frame_ids[q_start:q_end].view(-1, 1) != frame_ids.view(1, -1)
+            ).to(dtype=rope_logits.dtype)
+            if alpha.ndim == 0:
+                logits = rope_logits + (alpha.to(dtype=rope_logits.dtype) * sem_logits * cross_frame_mask.unsqueeze(0))
+            else:
+                alpha_heads = alpha.to(device=rope_logits.device, dtype=rope_logits.dtype).view(n, 1, 1)
+                logits = rope_logits + (alpha_heads * sem_logits * cross_frame_mask.unsqueeze(0))
+
+            if base_mask is not None:
+                logits = logits + base_mask[q_start:q_end].unsqueeze(0)
+
+            probs = torch.softmax(logits, dim=-1).to(dtype=v_b.dtype)
+            out_chunk = torch.matmul(probs, v_b)
+            out[b, q_start:q_end] = out_chunk.permute(1, 0, 2).to(dtype=out.dtype)
+
+    return out
+
+
 def _unwrap_dit_model(model):
     """Return the actual DiT module containing `blocks` and `forward`.
 
@@ -1352,6 +1865,27 @@ def _unwrap_dit_model(model):
     if hasattr(model, "module") and hasattr(model.module, "blocks"):
         return model.module
     return model
+
+
+def _load_optional_module_checkpoint(module: nn.Module, module_name: str, checkpoint_path: str):
+    """Load an optional state_dict-like checkpoint into a runtime-attached module."""
+    checkpoint_path = str(checkpoint_path).strip()
+    if not checkpoint_path:
+        return
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(payload, dict) and "state_dict" in payload and isinstance(payload["state_dict"], dict):
+        payload = payload["state_dict"]
+    if not isinstance(payload, dict):
+        raise TypeError(
+            f"{module_name} checkpoint must contain a state_dict-like object, got {type(payload)!r}."
+        )
+    cleaned = {}
+    for key, value in payload.items():
+        if key.startswith(f"{module_name}."):
+            cleaned[key[len(module_name) + 1:]] = value
+        else:
+            cleaned[key] = value
+    module.load_state_dict(cleaned, strict=False)
 
 
 def _rope_cfg_is_identity(rope_cfg: Wan21T2VRopePatchConfig) -> bool:
@@ -1367,7 +1901,18 @@ def _rope_cfg_is_identity(rope_cfg: Wan21T2VRopePatchConfig) -> bool:
         and rope_cfg.lambda_h == 1.0
         and rope_cfg.lambda_w == 1.0
         and not rope_cfg.apply_steps
-        and not rope_cfg.step_conditioned
+        and rope_cfg.scale_mode == "manual"
+    )
+
+
+def _semantic_cfg_is_identity(semantic_cfg: Wan21T2VSemanticResidualConfig) -> bool:
+    """Return True when semantic residual behavior is equivalent to original attention."""
+    if not semantic_cfg.enabled:
+        return True
+    return (
+        semantic_cfg.alpha == 0.0
+        and not semantic_cfg.apply_steps
+        and not semantic_cfg.timestep_conditioned
     )
 
 
@@ -1400,9 +1945,66 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
         num_heads=target.num_heads,
     )
     restore_items = []
-    needs_custom_attn = patch_cfg.probe.enabled or patch_cfg.causal.enabled
+    semantic_is_identity = _semantic_cfg_is_identity(patch_cfg.semantic)
+    needs_custom_attn = (
+        patch_cfg.probe.enabled
+        or patch_cfg.causal.enabled
+        or not semantic_is_identity
+    )
     rope_is_identity = _rope_cfg_is_identity(patch_cfg.rope)
-    needs_rope_step_tracking = bool(patch_cfg.rope.apply_steps) or patch_cfg.rope.step_conditioned
+    needs_rope_step_tracking = (
+        bool(patch_cfg.rope.apply_steps)
+        or patch_cfg.rope.scale_mode == "timestep_conditioned"
+        or bool(patch_cfg.semantic.apply_steps)
+        or patch_cfg.semantic.timestep_conditioned
+    )
+
+    if patch_cfg.rope.scale_mode == "timestep_conditioned":
+        module_name = str(
+            patch_cfg.rope.timestep_conditioned_module_name or "rope_timestep_conditioned_scale_net"
+        )
+        scale_module = Wan21T2VRopeTimestepConditionedScale(
+            freq_dim=int(getattr(target, "freq_dim")),
+            hidden_dim=int(patch_cfg.rope.timestep_conditioned_hidden_dim),
+            num_heads=int(target.num_heads),
+            resolution=str(patch_cfg.rope.timestep_conditioned_resolution),
+            init_lambdas=(
+                float(patch_cfg.rope.lambda_f),
+                float(patch_cfg.rope.lambda_h),
+                float(patch_cfg.rope.lambda_w),
+            ),
+        )
+        scale_module = scale_module.to(next(target.parameters()).device)
+        _load_optional_module_checkpoint(
+            scale_module,
+            module_name,
+            patch_cfg.rope.timestep_conditioned_checkpoint,
+        )
+        setattr(target, module_name, scale_module)
+        restore_items.append((target, module_name, _RESTORE_DELETE_SENTINEL))
+        patch_cfg.rope.timestep_conditioned_module = scale_module
+
+    if patch_cfg.semantic.timestep_conditioned:
+        module_name = str(
+            patch_cfg.semantic.timestep_conditioned_module_name
+            or "semantic_residual_timestep_conditioned_alpha_net"
+        )
+        semantic_module = Wan21T2VSemanticResidualTimestepConditionedAlpha(
+            freq_dim=int(getattr(target, "freq_dim")),
+            hidden_dim=int(patch_cfg.semantic.timestep_conditioned_hidden_dim),
+            num_heads=int(target.num_heads),
+            resolution=str(patch_cfg.semantic.timestep_conditioned_resolution),
+            init_alpha=float(patch_cfg.semantic.alpha),
+        )
+        semantic_module = semantic_module.to(next(target.parameters()).device)
+        _load_optional_module_checkpoint(
+            semantic_module,
+            module_name,
+            patch_cfg.semantic.timestep_conditioned_checkpoint,
+        )
+        setattr(target, module_name, semantic_module)
+        restore_items.append((target, module_name, _RESTORE_DELETE_SENTINEL))
+        patch_cfg.semantic.timestep_conditioned_module = semantic_module
 
     # Pure RoPE experiments: patch rope_apply only and keep Wan's original
     # attention path (including USP xFuser long-context attention).
@@ -1419,34 +2021,6 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
 
             target.forward = MethodType(patched_dit_forward, target)
             restore_items.append((target, "forward", original_forward))
-
-        if patch_cfg.rope.step_conditioned:
-            module_name = str(patch_cfg.rope.step_conditioned_module_name or "rope_scale_net")
-            scale_module = Wan21T2VRopeStepConditionedScale(
-                freq_dim=int(getattr(target, "freq_dim")),
-                hidden_dim=int(patch_cfg.rope.step_conditioned_hidden_dim),
-            )
-            scale_module = scale_module.to(next(target.parameters()).device)
-            checkpoint_path = str(patch_cfg.rope.step_conditioned_checkpoint).strip()
-            if checkpoint_path:
-                payload = torch.load(checkpoint_path, map_location="cpu")
-                if isinstance(payload, dict) and "state_dict" in payload and isinstance(payload["state_dict"], dict):
-                    payload = payload["state_dict"]
-                if not isinstance(payload, dict):
-                    raise TypeError(
-                        "step_conditioned_checkpoint must contain a state_dict-like object, "
-                        f"got {type(payload)!r}."
-                    )
-                cleaned = {}
-                for key, value in payload.items():
-                    if key.startswith(f"{module_name}."):
-                        cleaned[key[len(module_name) + 1:]] = value
-                    else:
-                        cleaned[key] = value
-                scale_module.load_state_dict(cleaned, strict=False)
-            setattr(target, module_name, scale_module)
-            restore_items.append((target, module_name, _RESTORE_DELETE_SENTINEL))
-            patch_cfg.rope.step_conditioned_module = scale_module
 
         if not rope_is_identity:
             original_model_rope_apply = wan.modules.model.rope_apply
@@ -1512,24 +2086,67 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
 
-            q = apply_wan21_t2v_rope_patch(q, grid_sizes, freqs, patch_cfg.rope, state=state)
-            k = apply_wan21_t2v_rope_patch(k, grid_sizes, freqs, patch_cfg.rope, state=state)
+            q_rope = apply_wan21_t2v_rope_patch(
+                q,
+                grid_sizes,
+                freqs,
+                patch_cfg.rope,
+                state=state,
+                layer_idx=layer_idx,
+            )
+            k_rope = apply_wan21_t2v_rope_patch(
+                k,
+                grid_sizes,
+                freqs,
+                patch_cfg.rope,
+                state=state,
+                layer_idx=layer_idx,
+            )
 
-            state.collect(layer_idx=layer_idx, q=q, k=k, seq_lens=seq_lens, grid_sizes=grid_sizes)
+            state.collect(layer_idx=layer_idx, q=q_rope, k=k_rope, seq_lens=seq_lens, grid_sizes=grid_sizes)
 
             causal_enabled = state.should_apply_causal()
-            out = _attention_dispatch(
-                attn_module=wan.modules.attention,
-                q=q,
-                k=k,
-                v=v,
-                seq_lens=seq_lens,
-                grid_sizes=grid_sizes,
-                causal_enabled=causal_enabled,
-                causal_mode=patch_cfg.causal.mode,
-                window_size=self.window_size,
-                backend=patch_cfg.causal.backend,
+            semantic_alpha = _maybe_get_semantic_residual_alpha(
+                semantic_cfg=patch_cfg.semantic,
+                num_heads=n,
+                state=state,
+                device=q_rope.device,
+                dtype=torch.float32,
             )
+            semantic_active = False
+            if semantic_alpha is not None and not _semantic_cfg_is_identity(patch_cfg.semantic):
+                if semantic_alpha.ndim == 0:
+                    semantic_active = float(semantic_alpha.item()) > 0.0
+                else:
+                    semantic_active = bool(torch.any(semantic_alpha > 0).item())
+            if semantic_active:
+                out = _attention_semantic_residual(
+                    q_rope=q_rope,
+                    k_rope=k_rope,
+                    v=v,
+                    q_sem=q,
+                    k_sem=k,
+                    seq_lens=seq_lens,
+                    grid_sizes=grid_sizes,
+                    causal_enabled=causal_enabled,
+                    causal_mode=patch_cfg.causal.mode,
+                    window_size=self.window_size,
+                    alpha=semantic_alpha,
+                    query_chunk_size=int(patch_cfg.semantic.query_chunk_size),
+                )
+            else:
+                out = _attention_dispatch(
+                    attn_module=wan.modules.attention,
+                    q=q_rope,
+                    k=k_rope,
+                    v=v,
+                    seq_lens=seq_lens,
+                    grid_sizes=grid_sizes,
+                    causal_enabled=causal_enabled,
+                    causal_mode=patch_cfg.causal.mode,
+                    window_size=self.window_size,
+                    backend=patch_cfg.causal.backend,
+                )
 
             out = out.flatten(2)
             out = self.o(out)

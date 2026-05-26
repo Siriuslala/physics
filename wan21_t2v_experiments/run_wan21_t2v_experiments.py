@@ -131,8 +131,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--rope_modification_mode",
         type=str,
         default="manual",
-        choices=["manual", "step_conditioned"],
-        help="RoPE modification mode: training-free manual scaling or timestep-conditioned scale head.",
+        choices=["manual", "timestep_conditioned"],
+        help="RoPE modification mode: training-free manual scaling or unified timestep-conditioned scale learning.",
     )
     parser.add_argument("--rope_modification_lambda_f", type=float, default=1.0)
     parser.add_argument("--rope_modification_lambda_h", type=float, default=1.0)
@@ -143,12 +143,43 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="CSV diffusion-step list for rope_modification. Empty means apply to all steps.",
     )
-    parser.add_argument("--rope_modification_step_conditioned_hidden_dim", type=int, default=128)
     parser.add_argument(
-        "--rope_modification_step_conditioned_checkpoint",
+        "--rope_modification_timestep_conditioned_resolution",
+        type=str,
+        default="global",
+        choices=["global", "head_aware"],
+        help="Resolution of timestep-conditioned scale learning.",
+    )
+    parser.add_argument("--rope_modification_timestep_conditioned_hidden_dim", type=int, default=128)
+    parser.add_argument(
+        "--rope_modification_timestep_conditioned_checkpoint",
         type=str,
         default="",
-        help="Optional state_dict path for the timestep-conditioned RoPE scale head.",
+        help="Optional state_dict path for the timestep-conditioned RoPE scale learner.",
+    )
+    parser.add_argument("--rope_modification_semantic_residual_enabled", type=_str2bool, default=False)
+    parser.add_argument("--rope_modification_semantic_residual_alpha", type=float, default=0.0)
+    parser.add_argument(
+        "--rope_modification_semantic_residual_steps",
+        type=str,
+        default="",
+        help="CSV diffusion-step list for semantic residual attention. Empty means apply to all steps.",
+    )
+    parser.add_argument("--rope_modification_semantic_residual_query_chunk_size", type=int, default=64)
+    parser.add_argument("--rope_modification_semantic_residual_timestep_conditioned", type=_str2bool, default=False)
+    parser.add_argument(
+        "--rope_modification_semantic_residual_timestep_conditioned_resolution",
+        type=str,
+        default="global",
+        choices=["global", "head_aware"],
+        help="Resolution of timestep-conditioned semantic residual alpha learning.",
+    )
+    parser.add_argument("--rope_modification_semantic_residual_timestep_conditioned_hidden_dim", type=int, default=128)
+    parser.add_argument(
+        "--rope_modification_semantic_residual_timestep_conditioned_checkpoint",
+        type=str,
+        default="",
+        help="Optional state_dict path for the timestep-conditioned semantic residual alpha head.",
     )
 
     # Motion-aligned options
@@ -940,7 +971,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--trajectory_consensus_stages",
         type=str,
         default="candidate_consensus,head_contribution",
-        help="CSV stages for trajectory_consensus_dynamics. Supported: candidate_consensus,head_contribution.",
+        help=(
+            "CSV stages for trajectory_consensus_dynamics. Supported: "
+            "candidate_consensus,head_contribution,self_attention_coupling."
+        ),
     )
     parser.add_argument(
         "--trajectory_consensus_steps",
@@ -985,7 +1019,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="cond",
         choices=["cond", "uncond"],
-        help="CFG branch analyzed by trajectory_consensus_dynamics head_contribution.",
+        help="CFG branch analyzed by trajectory_consensus_dynamics head_contribution and self_attention_coupling.",
     )
     parser.add_argument(
         "--trajectory_consensus_reference_distance_metric",
@@ -1083,6 +1117,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="When True, trajectory_consensus_dynamics Taylor attribution uses gradient checkpointing for downstream Wan blocks.",
     )
+    parser.add_argument("--trajectory_consensus_sa_anchor_step", type=int, default=49)
+    parser.add_argument("--trajectory_consensus_sa_anchor_layer", type=int, default=27)
+    parser.add_argument(
+        "--trajectory_consensus_sa_covered_mass_min",
+        type=float,
+        default=0.0,
+        help="Optional candidate-covered-mass threshold used by filtered self_attention_coupling aggregates.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_sa_precedence_persistence",
+        type=int,
+        default=2,
+        help="Persistence window used by trajectory_consensus_dynamics self_attention_coupling temporal precedence.",
+    )
     parser.add_argument("--trajectory_consensus_plot_only_from_csv", type=_str2bool, default=False)
     parser.add_argument("--trajectory_consensus_skip_existing_plots", type=_str2bool, default=True)
     parser.add_argument(
@@ -1138,6 +1186,7 @@ def main():
     cross_attn_steps = _parse_csv_ints(args.cross_attn_steps)
     head_ablation_steps = _parse_csv_ints(args.head_ablation_steps)
     rope_modification_steps = _parse_csv_ints(args.rope_modification_steps)
+    rope_modification_semantic_residual_steps = _parse_csv_ints(args.rope_modification_semantic_residual_steps)
     trajectory_entropy_steps = _parse_csv_ints(args.trajectory_entropy_steps)
     trajectory_entropy_layerwise_steps = _parse_csv_ints(args.trajectory_entropy_layerwise_steps)
     head_evolution_steps = _parse_csv_ints(args.head_evolution_steps)
@@ -1353,8 +1402,17 @@ def main():
             rope_modification_lambda_h=args.rope_modification_lambda_h,
             rope_modification_lambda_w=args.rope_modification_lambda_w,
             rope_modification_steps=rope_modification_steps,
-            rope_modification_step_conditioned_hidden_dim=args.rope_modification_step_conditioned_hidden_dim,
-            rope_modification_step_conditioned_checkpoint=args.rope_modification_step_conditioned_checkpoint,
+            rope_modification_timestep_conditioned_resolution=args.rope_modification_timestep_conditioned_resolution,
+            rope_modification_timestep_conditioned_hidden_dim=args.rope_modification_timestep_conditioned_hidden_dim,
+            rope_modification_timestep_conditioned_checkpoint=args.rope_modification_timestep_conditioned_checkpoint,
+            rope_modification_semantic_residual_enabled=args.rope_modification_semantic_residual_enabled,
+            rope_modification_semantic_residual_alpha=args.rope_modification_semantic_residual_alpha,
+            rope_modification_semantic_residual_steps=rope_modification_semantic_residual_steps,
+            rope_modification_semantic_residual_query_chunk_size=args.rope_modification_semantic_residual_query_chunk_size,
+            rope_modification_semantic_residual_timestep_conditioned=args.rope_modification_semantic_residual_timestep_conditioned,
+            rope_modification_semantic_residual_timestep_conditioned_resolution=args.rope_modification_semantic_residual_timestep_conditioned_resolution,
+            rope_modification_semantic_residual_timestep_conditioned_hidden_dim=args.rope_modification_semantic_residual_timestep_conditioned_hidden_dim,
+            rope_modification_semantic_residual_timestep_conditioned_checkpoint=args.rope_modification_semantic_residual_timestep_conditioned_checkpoint,
         )
     elif experiment_name == "self_attention_temporal_kernel":
         run_wan21_t2v_self_attention_temporal_kernel(
@@ -1678,6 +1736,10 @@ def main():
             trajectory_consensus_taylor_num_latent_frames=args.trajectory_consensus_taylor_num_latent_frames,
             trajectory_consensus_taylor_metric_scope=args.trajectory_consensus_taylor_metric_scope,
             trajectory_consensus_taylor_use_gradient_checkpointing=args.trajectory_consensus_taylor_use_gradient_checkpointing,
+            trajectory_consensus_sa_anchor_step=args.trajectory_consensus_sa_anchor_step,
+            trajectory_consensus_sa_anchor_layer=args.trajectory_consensus_sa_anchor_layer,
+            trajectory_consensus_sa_covered_mass_min=args.trajectory_consensus_sa_covered_mass_min,
+            trajectory_consensus_sa_precedence_persistence=args.trajectory_consensus_sa_precedence_persistence,
             trajectory_consensus_plot_only_from_csv=args.trajectory_consensus_plot_only_from_csv,
             trajectory_consensus_skip_existing_plots=args.trajectory_consensus_skip_existing_plots,
             trajectory_consensus_num_workers=args.trajectory_consensus_num_workers,

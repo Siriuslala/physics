@@ -4,10 +4,12 @@ Main entry:
 - run_wan21_t2v_trajectory_consensus_dynamics
 
 This experiment is a stage-based 2.0 framework for motion-planning analysis.
-The initial implementation focuses on two stages:
+The current implementation focuses on three stages:
 1) candidate_consensus: offline candidate-region extraction and winner-gap analysis
 2) head_contribution: runtime head-wise contribution analysis via exact zero-ablation,
    first-order Taylor approximation, and direct-proxy readout
+3) self_attention_coupling: runtime self-attention candidate-coupling analysis,
+   winner-versus-loser feature extraction, and temporal precedence summaries
 
 Later stages documented in the technical note can be added on the same
 engineering scaffold without modifying the official Wan2.1 source tree.
@@ -61,12 +63,19 @@ from .utils import (
     _resolve_wan21_t2v_branch_from_forward_call_index,
     _resolve_wan21_t2v_num_workers,
     _resolve_wan21_t2v_offload_model,
+    _run_wan21_t2v_once_with_patch,
     _save_csv,
     _save_json,
     _unwrap_wan21_t2v_dit_model_for_runtime_patch,
     _wan21_t2v_branch_matches,
 )
-from .wan21_t2v_experiment_patch import Wan21T2VEarlyStopRequested
+from .wan21_t2v_experiment_patch import (
+    Wan21T2VAttentionProbeConfig,
+    Wan21T2VCausalAttentionConfig,
+    Wan21T2VEarlyStopRequested,
+    Wan21T2VPatchBundleConfig,
+    Wan21T2VRopePatchConfig,
+)
 from projects.Wan2_1.wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from projects.Wan2_1.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
@@ -3908,6 +3917,2035 @@ def _render_wan21_t2v_head_contribution_plots(
     return [path for path in plot_paths if path]
 
 
+def _plot_wan21_t2v_trajectory_consensus_bar(
+    rows: Sequence[Dict[str, object]],
+    save_file: str,
+    x_key: str,
+    y_key: str,
+    title: str,
+    x_label: str,
+    y_label: str,
+):
+    """Render a simple bar chart from row dictionaries."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_rows = [row for row in rows if row.get(x_key, "") != "" and row.get(y_key, "") != ""]
+    if not plot_rows:
+        return ""
+
+    ordered_rows = sorted(plot_rows, key=lambda row: float(row[y_key]))
+    x_values = [str(row[x_key]) for row in ordered_rows]
+    y_values = [float(row[y_key]) for row in ordered_rows]
+
+    fig_width = max(8.4, 0.42 * len(x_values))
+    fig, axis = plt.subplots(1, 1, figsize=(fig_width, 5.0))
+    axis.bar(list(range(len(x_values))), y_values, color="#0f766e", alpha=0.88)
+    axis.set_title(title)
+    axis.set_xlabel(x_label)
+    axis.set_ylabel(y_label)
+    axis.set_xticks(list(range(len(x_values))))
+    axis.set_xticklabels(x_values, rotation=45, ha="right", fontsize=8)
+    axis.grid(axis="y", alpha=0.22, linestyle="--")
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _load_wan21_t2v_trajectory_consensus_candidate_cache(
+    output_dir: str,
+) -> Tuple[
+    Dict[Tuple[int, int], Dict[str, object]],
+    List[Dict[str, object]],
+    List[Dict[str, object]],
+    List[Dict[str, object]],
+]:
+    """Load cached candidate-consensus outputs from one trajectory-consensus directory."""
+    candidate_regions_pt_path = os.path.join(output_dir, "trajectory_consensus_candidate_regions.pt")
+    candidate_regions_csv_path = os.path.join(output_dir, "trajectory_consensus_candidate_regions.csv")
+    candidate_weights_csv_path = os.path.join(output_dir, "trajectory_consensus_candidate_weights.csv")
+    winner_gap_csv_path = os.path.join(output_dir, "trajectory_consensus_winner_gap.csv")
+    if not os.path.exists(candidate_regions_pt_path):
+        raise FileNotFoundError(
+            "self_attention_coupling requires cached candidate regions from candidate_consensus: "
+            f"{candidate_regions_pt_path}"
+        )
+    candidate_region_cache = {
+        (int(step), int(layer)): {
+            "label_map_fhw": (
+                torch.from_numpy(np.asarray(candidate_payload["label_map_fhw_np"])).to(torch.int64)
+                if "label_map_fhw_np" in candidate_payload
+                else candidate_payload["label_map_fhw"].detach().cpu().to(torch.int64)
+            )
+        }
+        for (step, layer), candidate_payload in _load_wan21_t2v_torch_cache(candidate_regions_pt_path).items()
+    }
+    candidate_region_rows = _load_wan21_t2v_csv_rows(candidate_regions_csv_path) if os.path.exists(candidate_regions_csv_path) else []
+    candidate_weight_rows = _load_wan21_t2v_csv_rows(candidate_weights_csv_path) if os.path.exists(candidate_weights_csv_path) else []
+    winner_gap_rows = _load_wan21_t2v_csv_rows(winner_gap_csv_path) if os.path.exists(winner_gap_csv_path) else []
+    return candidate_region_cache, candidate_region_rows, candidate_weight_rows, winner_gap_rows
+
+
+def _safe_wan21_t2v_float(value: object, default: float = float("nan")) -> float:
+    """Best-effort conversion to float with a fallback."""
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _mean_wan21_t2v_finite(values: Sequence[float]) -> float:
+    """Average finite values only."""
+    finite_values = [float(v) for v in values if math.isfinite(float(v))]
+    if not finite_values:
+        return float("nan")
+    return float(sum(finite_values) / len(finite_values))
+
+
+def _compute_wan21_t2v_binary_auroc(labels: Sequence[int], scores: Sequence[float]) -> float:
+    """Compute AUROC without sklearn."""
+    paired = [
+        (int(label), float(score))
+        for label, score in zip(labels, scores)
+        if math.isfinite(float(score))
+    ]
+    positives = [score for label, score in paired if int(label) == 1]
+    negatives = [score for label, score in paired if int(label) == 0]
+    if not positives or not negatives:
+        return float("nan")
+    wins = 0.0
+    total = float(len(positives) * len(negatives))
+    for positive_score in positives:
+        for negative_score in negatives:
+            if positive_score > negative_score:
+                wins += 1.0
+            elif positive_score == negative_score:
+                wins += 0.5
+    return float(wins / max(1.0, total))
+
+
+def _build_wan21_t2v_anchor_union_payload(
+    candidate_region_cache: Dict[Tuple[int, int], Dict[str, object]],
+    anchor_step: int,
+    anchor_layer: int,
+) -> Dict[str, object]:
+    """Build the anchor union mask and per-frame centroids."""
+    anchor_payload = candidate_region_cache.get((int(anchor_step), int(anchor_layer)))
+    if anchor_payload is None:
+        raise KeyError(
+            "Missing anchor candidate-region cache for self_attention_coupling: "
+            f"step={int(anchor_step)} layer={int(anchor_layer)}"
+        )
+    anchor_label_map = anchor_payload["label_map_fhw"].detach().cpu().to(torch.int64)
+    anchor_union_mask = anchor_label_map > 0
+    anchor_centers: List[Tuple[float, float]] = []
+    for frame_index in range(int(anchor_union_mask.shape[0])):
+        frame_points = torch.nonzero(anchor_union_mask[frame_index], as_tuple=False)
+        if int(frame_points.numel()) <= 0:
+            anchor_centers.append((float("nan"), float("nan")))
+            continue
+        anchor_centers.append(
+            (
+                float(frame_points[:, 0].float().mean().item()),
+                float(frame_points[:, 1].float().mean().item()),
+            )
+        )
+    return {
+        "mask_fhw": anchor_union_mask,
+        "centers": anchor_centers,
+    }
+
+
+def _compute_wan21_t2v_pearson_correlation(xs: Sequence[float], ys: Sequence[float]) -> float:
+    """Compute Pearson correlation on finite pairs only."""
+    paired = [
+        (float(x), float(y))
+        for x, y in zip(xs, ys)
+        if math.isfinite(float(x)) and math.isfinite(float(y))
+    ]
+    if len(paired) < 2:
+        return float("nan")
+    x_values = np.asarray([x for x, _ in paired], dtype=np.float64)
+    y_values = np.asarray([y for _, y in paired], dtype=np.float64)
+    x_centered = x_values - x_values.mean()
+    y_centered = y_values - y_values.mean()
+    denom = float(np.sqrt((x_centered ** 2).sum()) * np.sqrt((y_centered ** 2).sum()))
+    if denom <= 1e-12:
+        return float("nan")
+    return float((x_centered * y_centered).sum() / denom)
+
+
+def _smooth_wan21_t2v_curve_values(
+    xs: Sequence[float],
+    ys: Sequence[float],
+    window_radius: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return a simple local-mean smoothed curve on sorted finite points."""
+    paired = [
+        (float(x), float(y))
+        for x, y in zip(xs, ys)
+        if math.isfinite(float(x)) and math.isfinite(float(y))
+    ]
+    if not paired:
+        return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
+    paired = sorted(paired, key=lambda item: float(item[0]))
+    x_values = np.asarray([x for x, _ in paired], dtype=np.float64)
+    y_values = np.asarray([y for _, y in paired], dtype=np.float64)
+    radius = max(0, int(window_radius))
+    if radius <= 0 or len(y_values) <= 2:
+        return x_values, y_values
+    smoothed = np.zeros_like(y_values)
+    for index in range(len(y_values)):
+        left = max(0, int(index - radius))
+        right = min(len(y_values), int(index + radius + 1))
+        smoothed[index] = float(y_values[left:right].mean())
+    return x_values, smoothed
+
+
+def _build_wan21_t2v_self_attention_pairwise_layer_stats(
+    pairwise_rows: Sequence[Dict[str, object]],
+) -> Tuple[
+    Dict[Tuple[int, int, int], np.ndarray],
+    Dict[Tuple[int, int, int], Dict[str, float]],
+]:
+    """Build layer-mean pairwise coupling vectors and summary metrics.
+
+    For each `(query_frame, query_candidate, key_frame)` group, this helper
+    averages the candidate-normalized coupling vectors across all selected
+    self-attention heads in the layer and computes the corresponding layer-level
+    sharpness metrics.
+    """
+    selected_heads: List[int] = sorted({int(row["head"]) for row in pairwise_rows})
+    pairwise_vectors: Dict[Tuple[int, int, int], Dict[int, np.ndarray]] = defaultdict(dict)
+    pairwise_covered: Dict[Tuple[int, int, int], Dict[int, float]] = defaultdict(dict)
+    for row in pairwise_rows:
+        query_frame = int(row["query_frame"])
+        query_candidate = int(row["query_candidate"])
+        key_frame = int(row["key_frame"])
+        key_candidate = int(row["key_candidate"])
+        key_candidate_count = int(row["key_candidate_count"])
+        head_index = int(row["head"])
+        group_key = (int(query_frame), int(query_candidate), int(key_frame))
+        if head_index not in pairwise_vectors[group_key]:
+            pairwise_vectors[group_key][head_index] = np.zeros((int(key_candidate_count),), dtype=np.float32)
+        pairwise_vectors[group_key][head_index][int(key_candidate - 1)] = np.float32(
+            _safe_wan21_t2v_float(row.get("normalized_coupling", 0.0), default=0.0)
+        )
+        pairwise_covered[group_key][head_index] = float(
+            _safe_wan21_t2v_float(row.get("covered_mass", 0.0), default=0.0)
+        )
+
+    pairwise_layer_vectors: Dict[Tuple[int, int, int], np.ndarray] = {}
+    pairwise_layer_metrics: Dict[Tuple[int, int, int], Dict[str, float]] = {}
+    for group_key, head_map in pairwise_vectors.items():
+        if not head_map:
+            continue
+        key_candidate_count = max(int(vector.shape[0]) for vector in head_map.values())
+        valid_vote_targets: List[int] = []
+        layer_vectors: List[np.ndarray] = []
+        layer_covered_values: List[float] = []
+        for head_index in selected_heads:
+            vector = np.zeros((int(key_candidate_count),), dtype=np.float32)
+            if head_index in head_map:
+                stored_vector = head_map[head_index]
+                vector[: int(stored_vector.shape[0])] = stored_vector
+            covered_mass = float(pairwise_covered.get(group_key, {}).get(int(head_index), 0.0))
+            if float(vector.sum()) > 1e-8:
+                valid_vote_targets.append(int(vector.argmax()) + 1)
+            layer_vectors.append(vector)
+            layer_covered_values.append(float(covered_mass))
+
+        layer_mean_vector = np.mean(np.stack(layer_vectors, axis=0), axis=0)
+        pairwise_layer_vectors[group_key] = layer_mean_vector
+        if float(layer_mean_vector.sum()) > 1e-8:
+            layer_entropy = float(-(layer_mean_vector * np.log(np.clip(layer_mean_vector, 1e-8, None))).sum())
+            layer_dominant = float(layer_mean_vector.max())
+            sorted_layer_vector = np.sort(layer_mean_vector)[::-1]
+            layer_margin = float(
+                sorted_layer_vector[0] - (sorted_layer_vector[1] if int(sorted_layer_vector.shape[0]) > 1 else 0.0)
+            )
+        else:
+            layer_entropy = float("nan")
+            layer_dominant = float("nan")
+            layer_margin = float("nan")
+        vote_counts: Dict[int, int] = defaultdict(int)
+        for target_candidate in valid_vote_targets:
+            vote_counts[int(target_candidate)] += 1
+        head_agreement = (
+            float(max(vote_counts.values()) / max(1, len(valid_vote_targets)))
+            if vote_counts
+            else float("nan")
+        )
+        pairwise_layer_metrics[group_key] = {
+            "covered_mass": float(_mean_wan21_t2v_finite(layer_covered_values)),
+            "entropy": float(layer_entropy),
+            "dominant_link_ratio": float(layer_dominant),
+            "link_margin": float(layer_margin),
+            "head_agreement": float(head_agreement),
+        }
+    return pairwise_layer_vectors, pairwise_layer_metrics
+
+
+def _build_wan21_t2v_self_attention_pairwise_layer_value_vectors(
+    pairwise_rows: Sequence[Dict[str, object]],
+    value_key: str,
+) -> Dict[Tuple[int, int, int], np.ndarray]:
+    """Average one pairwise scalar field across selected heads on the shared head-mean partition."""
+    selected_heads: List[int] = sorted({int(row["head"]) for row in pairwise_rows})
+    per_group_values: Dict[Tuple[int, int, int], Dict[int, np.ndarray]] = defaultdict(dict)
+    for row in pairwise_rows:
+        query_frame = int(row["query_frame"])
+        query_candidate = int(row["query_candidate"])
+        key_frame = int(row["key_frame"])
+        key_candidate = int(row["key_candidate"])
+        key_candidate_count = int(row["key_candidate_count"])
+        head_index = int(row["head"])
+        group_key = (int(query_frame), int(query_candidate), int(key_frame))
+        if head_index not in per_group_values[group_key]:
+            per_group_values[group_key][head_index] = np.zeros((int(key_candidate_count),), dtype=np.float32)
+        per_group_values[group_key][head_index][int(key_candidate - 1)] = np.float32(
+            _safe_wan21_t2v_float(row.get(value_key, 0.0), default=0.0)
+        )
+    group_mean_vectors: Dict[Tuple[int, int, int], np.ndarray] = {}
+    for group_key, head_map in per_group_values.items():
+        key_candidate_count = max(int(vector.shape[0]) for vector in head_map.values())
+        layer_vectors: List[np.ndarray] = []
+        for head_index in selected_heads:
+            vector = np.zeros((int(key_candidate_count),), dtype=np.float32)
+            if head_index in head_map:
+                stored_vector = head_map[head_index]
+                vector[: int(stored_vector.shape[0])] = stored_vector
+            layer_vectors.append(vector)
+        group_mean_vectors[group_key] = np.mean(np.stack(layer_vectors, axis=0), axis=0)
+    return group_mean_vectors
+
+
+def _build_wan21_t2v_self_attention_observation_order(
+    candidate_feature_rows: Sequence[Dict[str, object]],
+) -> List[Tuple[int, int]]:
+    """Return the ordered `(step, layer)` observation list."""
+    return sorted({(int(row["step"]), int(row["layer"])) for row in candidate_feature_rows})
+
+
+def _build_wan21_t2v_self_attention_feature_gap_rows(
+    candidate_feature_rows: Sequence[Dict[str, object]],
+    feature_names: Sequence[str],
+) -> List[Dict[str, object]]:
+    """Convert candidate-level rows into winner/loser feature traces."""
+    observation_order = _build_wan21_t2v_self_attention_observation_order(candidate_feature_rows)
+    observation_to_index = {
+        (int(step), int(layer)): int(index)
+        for index, (step, layer) in enumerate(observation_order)
+    }
+    rows_by_step_layer_frame: Dict[Tuple[int, int, int], List[Dict[str, object]]] = defaultdict(list)
+    for row in candidate_feature_rows:
+        rows_by_step_layer_frame[(int(row["step"]), int(row["layer"]), int(row["frame"]))].append(row)
+
+    gap_rows: List[Dict[str, object]] = []
+    for (step, layer, frame_index), group_rows in sorted(rows_by_step_layer_frame.items()):
+        winner_rows = [row for row in group_rows if int(row.get("is_winner_aligned", 0)) == 1]
+        loser_rows = [row for row in group_rows if int(row.get("is_strongest_loser", 0)) == 1]
+        if not winner_rows or not loser_rows:
+            continue
+        winner_row = winner_rows[0]
+        loser_row = loser_rows[0]
+        observation_index = int(observation_to_index[(int(step), int(layer))])
+        for feature_name in feature_names:
+            winner_value = _safe_wan21_t2v_float(winner_row.get(feature_name, float("nan")))
+            loser_value = _safe_wan21_t2v_float(loser_row.get(feature_name, float("nan")))
+            gap_rows.append({
+                "step": int(step),
+                "layer": int(layer),
+                "observation_index": int(observation_index),
+                "frame": int(frame_index),
+                "feature": str(feature_name),
+                "winner_value": float(winner_value),
+                "loser_value": float(loser_value),
+                "gap": (
+                    float(winner_value - loser_value)
+                    if math.isfinite(winner_value) and math.isfinite(loser_value)
+                    else float("nan")
+                ),
+            })
+    return gap_rows
+
+
+def _build_wan21_t2v_self_attention_stepwise_gap_rows(
+    gap_rows: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """Average winner-minus-loser gaps over frames for each `(feature, layer, step)`."""
+    grouped: Dict[Tuple[str, int, int], List[float]] = defaultdict(list)
+    for row in gap_rows:
+        gap_value = _safe_wan21_t2v_float(row.get("gap", float("nan")))
+        if not math.isfinite(gap_value):
+            continue
+        grouped[(str(row["feature"]), int(row["layer"]), int(row["step"]))].append(float(gap_value))
+    out_rows: List[Dict[str, object]] = []
+    for (feature_name, layer, step), values in sorted(grouped.items()):
+        out_rows.append({
+            "feature": str(feature_name),
+            "layer": int(layer),
+            "step": int(step),
+            "mean_gap": float(_mean_wan21_t2v_finite(values)),
+        })
+    return out_rows
+
+
+def _build_wan21_t2v_self_attention_layerwise_gap_rows(
+    gap_rows: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """Average winner-minus-loser gaps over frames for each `(feature, step, layer)`."""
+    grouped: Dict[Tuple[str, int, int], List[float]] = defaultdict(list)
+    for row in gap_rows:
+        gap_value = _safe_wan21_t2v_float(row.get("gap", float("nan")))
+        if not math.isfinite(gap_value):
+            continue
+        grouped[(str(row["feature"]), int(row["step"]), int(row["layer"]))].append(float(gap_value))
+    out_rows: List[Dict[str, object]] = []
+    for (feature_name, step, layer), values in sorted(grouped.items()):
+        out_rows.append({
+            "feature": str(feature_name),
+            "step": int(step),
+            "layer": int(layer),
+            "mean_gap": float(_mean_wan21_t2v_finite(values)),
+        })
+    return out_rows
+
+
+def _sample_wan21_t2v_evenly_spaced_indices(total_count: int, max_count: int) -> List[int]:
+    """Sample up to `max_count` approximately evenly spaced indices."""
+    if total_count <= 0 or max_count <= 0:
+        return []
+    if total_count <= max_count:
+        return list(range(total_count))
+    samples = np.linspace(0, total_count - 1, num=max_count)
+    return sorted({int(round(float(x))) for x in samples})
+
+
+def _select_wan21_t2v_self_attention_representative_observation(
+    feature_summary_rows: Sequence[Dict[str, object]],
+    fallback_rows: Sequence[Dict[str, object]],
+    feature_name: str = "global_chainability",
+) -> Tuple[int, int]:
+    """Pick one representative observation for qualitative figures."""
+    target_rows = [
+        row for row in feature_summary_rows
+        if str(row.get("feature", "")) == str(feature_name)
+    ]
+    if target_rows:
+        ranked = sorted(
+            target_rows,
+            key=lambda row: (
+                -1e9 if not math.isfinite(_safe_wan21_t2v_float(row.get("auroc", float("nan"))))
+                else float(row["auroc"]),
+                -1e9 if not math.isfinite(_safe_wan21_t2v_float(row.get("winner_loser_gap", float("nan"))))
+                else float(row["winner_loser_gap"]),
+                int(row["step"]),
+                int(row["layer"]),
+            ),
+            reverse=True,
+        )
+        return int(ranked[0]["step"]), int(ranked[0]["layer"])
+    observation_order = _build_wan21_t2v_self_attention_observation_order(fallback_rows)
+    if not observation_order:
+        return (0, 0)
+    return observation_order[-1]
+
+
+def _trajectory_consensus_compute_candidate_feature_task(
+    task: Tuple,
+) -> Tuple[int, int, List[Dict[str, object]]]:
+    """Worker task that converts one `(step, layer)` pairwise coupling group into candidate-level feature rows."""
+    (
+        step,
+        layer,
+        pairwise_rows,
+        label_map_fhw_np,
+        anchor_union_fhw_np,
+        anchor_centers,
+        proposal_rows,
+        covered_mass_min,
+    ) = task
+
+    label_map_fhw = np.asarray(label_map_fhw_np, dtype=np.int64)
+    anchor_union_fhw = np.asarray(anchor_union_fhw_np, dtype=np.bool_)
+    frame_count = int(label_map_fhw.shape[0])
+    candidate_counts = [int(label_map_fhw[frame_index].max()) for frame_index in range(frame_count)]
+
+    proposal_weights: Dict[Tuple[int, int], float] = {}
+    proposal_mean_weight_by_frame: Dict[int, Dict[int, float]] = defaultdict(dict)
+    proposal_vote_share_by_frame: Dict[int, Dict[int, float]] = defaultdict(dict)
+    proposal_agreement_by_frame: Dict[int, float] = {}
+    if proposal_rows:
+        per_frame_head_weights: Dict[int, Dict[int, Dict[int, float]]] = defaultdict(lambda: defaultdict(dict))
+        for row in proposal_rows:
+            frame_index = int(row["frame"])
+            candidate_index = int(row["candidate_index"])
+            head_index = int(row["head"])
+            candidate_weight = _safe_wan21_t2v_float(row.get("candidate_weight", float("nan")))
+            per_frame_head_weights[frame_index][head_index][candidate_index] = candidate_weight
+
+        for frame_index, head_payload in per_frame_head_weights.items():
+            candidate_weight_lists: Dict[int, List[float]] = defaultdict(list)
+            vote_counts: Dict[int, int] = defaultdict(int)
+            for head_index, candidate_map in head_payload.items():
+                del head_index
+                if not candidate_map:
+                    continue
+                best_candidate = max(candidate_map.items(), key=lambda item: float(item[1]))[0]
+                vote_counts[int(best_candidate)] += 1
+                for candidate_index, weight_value in candidate_map.items():
+                    candidate_weight_lists[int(candidate_index)].append(float(weight_value))
+
+            candidate_mean_weights = {
+                int(candidate_index): float(sum(weight_values) / len(weight_values))
+                for candidate_index, weight_values in candidate_weight_lists.items()
+                if weight_values
+            }
+            total_mean_weight = float(sum(candidate_mean_weights.values()))
+            for candidate_index, mean_weight in candidate_mean_weights.items():
+                proposal_mean_weight_by_frame[int(frame_index)][int(candidate_index)] = float(mean_weight)
+                proposal_weights[(int(frame_index), int(candidate_index))] = float(
+                    mean_weight / max(1e-8, total_mean_weight)
+                )
+            total_votes = float(sum(vote_counts.values()))
+            if total_votes > 0.0:
+                for candidate_index, vote_count in vote_counts.items():
+                    proposal_vote_share_by_frame[int(frame_index)][int(candidate_index)] = float(vote_count / total_votes)
+                proposal_agreement_by_frame[int(frame_index)] = float(
+                    max(float(vote_count) / total_votes for vote_count in vote_counts.values())
+                )
+
+    pairwise_layer_vectors, pairwise_layer_metrics = _build_wan21_t2v_self_attention_pairwise_layer_stats(
+        pairwise_rows
+    )
+
+    candidate_feature_rows: List[Dict[str, object]] = []
+
+    def _aggregate_pairwise_metric(
+        query_frame: int,
+        query_candidate: int,
+        metric_name: str,
+        frame_indices: Sequence[int],
+        filtered_only: bool,
+    ) -> float:
+        values: List[float] = []
+        for key_frame in frame_indices:
+            layer_key = (int(query_frame), int(query_candidate), int(key_frame))
+            metrics = pairwise_layer_metrics.get(layer_key)
+            if metrics is None:
+                continue
+            if bool(filtered_only) and float(metrics.get("covered_mass", float("nan"))) < float(covered_mass_min):
+                continue
+            values.append(float(metrics.get(metric_name, float("nan"))))
+        return _mean_wan21_t2v_finite(values)
+
+    def _candidate_center(mask_hw: np.ndarray) -> Tuple[float, float]:
+        points = np.argwhere(mask_hw)
+        if int(points.size) <= 0:
+            return (float("nan"), float("nan"))
+        return (float(points[:, 0].mean()), float(points[:, 1].mean()))
+
+    for frame_index in range(frame_count):
+        frame_candidate_count = int(candidate_counts[frame_index])
+        if frame_candidate_count <= 0:
+            continue
+
+        anchor_center_y, anchor_center_x = anchor_centers[int(frame_index)]
+        candidate_iou_scores: Dict[int, float] = {}
+        candidate_rows_in_frame: List[Dict[str, object]] = []
+
+        global_in_frames = [int(g) for g in range(frame_count) if int(g) < int(frame_index)]
+        global_out_frames = [int(g) for g in range(frame_count) if int(g) > int(frame_index)]
+        local_frames = [int(g) for g in range(frame_count) if abs(int(g) - int(frame_index)) == 1]
+
+        for candidate_index in range(1, frame_candidate_count + 1):
+            candidate_mask = (label_map_fhw[frame_index] == int(candidate_index))
+            candidate_area = int(candidate_mask.sum())
+            centroid_y, centroid_x = _candidate_center(candidate_mask)
+            anchor_union_mask = anchor_union_fhw[frame_index]
+            intersection = float(np.logical_and(candidate_mask, anchor_union_mask).sum())
+            union = float(np.logical_or(candidate_mask, anchor_union_mask).sum())
+            anchor_iou = float(intersection / max(1.0, union))
+            candidate_iou_scores[int(candidate_index)] = float(anchor_iou)
+            if math.isfinite(anchor_center_y) and math.isfinite(anchor_center_x) and math.isfinite(centroid_y) and math.isfinite(centroid_x):
+                anchor_center_l2 = float(math.sqrt((centroid_y - anchor_center_y) ** 2 + (centroid_x - anchor_center_x) ** 2))
+            else:
+                anchor_center_l2 = float("nan")
+
+            local_avg_covered_mass = _aggregate_pairwise_metric(frame_index, candidate_index, "covered_mass", local_frames, False)
+            local_avg_covered_mass_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "covered_mass", local_frames, True)
+            global_avg_covered_mass = _aggregate_pairwise_metric(frame_index, candidate_index, "covered_mass", global_in_frames + global_out_frames, False)
+            global_avg_covered_mass_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "covered_mass", global_in_frames + global_out_frames, True)
+            local_entropy = _aggregate_pairwise_metric(frame_index, candidate_index, "entropy", local_frames, False)
+            local_entropy_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "entropy", local_frames, True)
+            global_entropy = _aggregate_pairwise_metric(frame_index, candidate_index, "entropy", global_in_frames + global_out_frames, False)
+            global_entropy_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "entropy", global_in_frames + global_out_frames, True)
+            local_dominant = _aggregate_pairwise_metric(frame_index, candidate_index, "dominant_link_ratio", local_frames, False)
+            local_dominant_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "dominant_link_ratio", local_frames, True)
+            global_dominant = _aggregate_pairwise_metric(frame_index, candidate_index, "dominant_link_ratio", global_in_frames + global_out_frames, False)
+            global_dominant_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "dominant_link_ratio", global_in_frames + global_out_frames, True)
+            local_link_margin = _aggregate_pairwise_metric(frame_index, candidate_index, "link_margin", local_frames, False)
+            local_link_margin_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "link_margin", local_frames, True)
+            global_link_margin = _aggregate_pairwise_metric(frame_index, candidate_index, "link_margin", global_in_frames + global_out_frames, False)
+            global_link_margin_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "link_margin", global_in_frames + global_out_frames, True)
+            local_head_agreement = _aggregate_pairwise_metric(frame_index, candidate_index, "head_agreement", local_frames, False)
+            local_head_agreement_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "head_agreement", local_frames, True)
+            global_head_agreement = _aggregate_pairwise_metric(frame_index, candidate_index, "head_agreement", global_in_frames + global_out_frames, False)
+            global_head_agreement_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "head_agreement", global_in_frames + global_out_frames, True)
+
+            local_in = float("nan")
+            local_out = float("nan")
+            if int(frame_index) - 1 >= 0:
+                prev_frame = int(frame_index) - 1
+                incoming_values = []
+                for prev_candidate in range(1, int(candidate_counts[prev_frame]) + 1):
+                    incoming_vector = pairwise_layer_vectors.get((int(prev_frame), int(prev_candidate), int(frame_index)))
+                    if incoming_vector is None or int(candidate_index - 1) >= int(incoming_vector.shape[0]):
+                        continue
+                    incoming_values.append(float(incoming_vector[int(candidate_index - 1)]))
+                local_in = float(sum(incoming_values)) if incoming_values else float("nan")
+            if int(frame_index) + 1 < frame_count:
+                next_frame = int(frame_index) + 1
+                outgoing_vector = pairwise_layer_vectors.get((int(frame_index), int(candidate_index), int(next_frame)))
+                if outgoing_vector is not None:
+                    local_out = float(outgoing_vector.sum())
+
+            def _global_direction(frames: Sequence[int], incoming: bool) -> float:
+                direction_values: List[float] = []
+                for other_frame in frames:
+                    if incoming:
+                        incoming_values = []
+                        for other_candidate in range(1, int(candidate_counts[int(other_frame)]) + 1):
+                            incoming_vector = pairwise_layer_vectors.get((int(other_frame), int(other_candidate), int(frame_index)))
+                            if incoming_vector is None or int(candidate_index - 1) >= int(incoming_vector.shape[0]):
+                                continue
+                            incoming_values.append(float(incoming_vector[int(candidate_index - 1)]))
+                        if incoming_values:
+                            direction_values.append(float(sum(incoming_values)))
+                    else:
+                        outgoing_vector = pairwise_layer_vectors.get((int(frame_index), int(candidate_index), int(other_frame)))
+                        if outgoing_vector is not None:
+                            direction_values.append(float(outgoing_vector.sum()))
+                return _mean_wan21_t2v_finite(direction_values)
+
+            global_in = _global_direction(global_in_frames, incoming=True)
+            global_out = _global_direction(global_out_frames, incoming=False)
+            local_compatibility = float(
+                sum(value for value in [local_in, local_out] if math.isfinite(value))
+            ) if any(math.isfinite(value) for value in [local_in, local_out]) else float("nan")
+            local_chainability = float(min(local_in, local_out)) if math.isfinite(local_in) and math.isfinite(local_out) else float("nan")
+            global_compatibility = float(
+                sum(value for value in [global_in, global_out] if math.isfinite(value))
+            ) if any(math.isfinite(value) for value in [global_in, global_out]) else float("nan")
+            global_chainability = float(min(global_in, global_out)) if math.isfinite(global_in) and math.isfinite(global_out) else float("nan")
+
+            def _mutual_consistency_max(key_frame: int) -> float:
+                forward_vector = pairwise_layer_vectors.get((int(frame_index), int(candidate_index), int(key_frame)))
+                if forward_vector is None:
+                    return float("nan")
+                reciprocal_values: List[float] = []
+                for key_candidate in range(1, int(candidate_counts[int(key_frame)]) + 1):
+                    reverse_vector = pairwise_layer_vectors.get((int(key_frame), int(key_candidate), int(frame_index)))
+                    if reverse_vector is None or int(candidate_index - 1) >= int(reverse_vector.shape[0]):
+                        continue
+                    if int(key_candidate - 1) >= int(forward_vector.shape[0]):
+                        continue
+                    reciprocal_values.append(
+                        float(forward_vector[int(key_candidate - 1)] * reverse_vector[int(candidate_index - 1)])
+                    )
+                return float(max(reciprocal_values)) if reciprocal_values else float("nan")
+
+            local_mc_max = _mean_wan21_t2v_finite([_mutual_consistency_max(key_frame) for key_frame in local_frames])
+            global_mc_max = _mean_wan21_t2v_finite([
+                _mutual_consistency_max(key_frame)
+                for key_frame in (global_in_frames + global_out_frames)
+            ])
+
+            candidate_rows_in_frame.append({
+                "step": int(step),
+                "layer": int(layer),
+                "frame": int(frame_index),
+                "candidate_index": int(candidate_index),
+                "candidate_count": int(frame_candidate_count),
+                "candidate_area": int(candidate_area),
+                "centroid_y": float(centroid_y),
+                "centroid_x": float(centroid_x),
+                "anchor_iou": float(anchor_iou),
+                "anchor_center_l2": float(anchor_center_l2),
+                "proposal_pi": float(proposal_weights.get((int(frame_index), int(candidate_index)), float("nan"))),
+                "proposal_vote_share": float(
+                    proposal_vote_share_by_frame.get(int(frame_index), {}).get(int(candidate_index), float("nan"))
+                ),
+                "proposal_agreement_frame": float(proposal_agreement_by_frame.get(int(frame_index), float("nan"))),
+                "local_avg_covered_mass": float(local_avg_covered_mass),
+                "local_avg_covered_mass_filtered": float(local_avg_covered_mass_filtered),
+                "global_avg_covered_mass": float(global_avg_covered_mass),
+                "global_avg_covered_mass_filtered": float(global_avg_covered_mass_filtered),
+                "local_entropy": float(local_entropy),
+                "local_entropy_filtered": float(local_entropy_filtered),
+                "global_entropy": float(global_entropy),
+                "global_entropy_filtered": float(global_entropy_filtered),
+                "local_dominant_link_ratio": float(local_dominant),
+                "local_dominant_link_ratio_filtered": float(local_dominant_filtered),
+                "global_dominant_link_ratio": float(global_dominant),
+                "global_dominant_link_ratio_filtered": float(global_dominant_filtered),
+                "local_link_margin": float(local_link_margin),
+                "local_link_margin_filtered": float(local_link_margin_filtered),
+                "global_link_margin": float(global_link_margin),
+                "global_link_margin_filtered": float(global_link_margin_filtered),
+                "local_head_agreement": float(local_head_agreement),
+                "local_head_agreement_filtered": float(local_head_agreement_filtered),
+                "global_head_agreement": float(global_head_agreement),
+                "global_head_agreement_filtered": float(global_head_agreement_filtered),
+                "local_compatibility": float(local_compatibility),
+                "local_chainability": float(local_chainability),
+                "global_compatibility": float(global_compatibility),
+                "global_chainability": float(global_chainability),
+                "local_mutual_consistency": float(local_mc_max),
+                "global_mutual_consistency": float(global_mc_max),
+            })
+
+        if candidate_rows_in_frame:
+            winner_candidate = max(candidate_rows_in_frame, key=lambda row: float(row["anchor_iou"]))["candidate_index"]
+            loser_candidates = [
+                row
+                for row in candidate_rows_in_frame
+                if int(row["candidate_index"]) != int(winner_candidate)
+            ]
+            strongest_loser = None
+            if loser_candidates:
+                strongest_loser = max(
+                    loser_candidates,
+                    key=lambda row: (
+                        -1e9 if not math.isfinite(_safe_wan21_t2v_float(row.get("proposal_pi", float("nan"))))
+                        else float(row["proposal_pi"])
+                    ),
+                )["candidate_index"]
+            for row in candidate_rows_in_frame:
+                row["is_winner_aligned"] = int(int(row["candidate_index"]) == int(winner_candidate))
+                row["is_strongest_loser"] = int(
+                    strongest_loser is not None and int(row["candidate_index"]) == int(strongest_loser)
+                )
+                candidate_feature_rows.append(row)
+
+    return int(step), int(layer), candidate_feature_rows
+
+
+def _summarize_wan21_t2v_self_attention_candidate_features(
+    candidate_feature_rows: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """Build per-step-layer feature-summary rows from candidate-level features."""
+    feature_names = [
+        "proposal_pi",
+        "proposal_vote_share",
+        "local_avg_covered_mass",
+        "local_avg_covered_mass_filtered",
+        "global_avg_covered_mass",
+        "global_avg_covered_mass_filtered",
+        "local_entropy",
+        "local_entropy_filtered",
+        "global_entropy",
+        "global_entropy_filtered",
+        "local_dominant_link_ratio",
+        "local_dominant_link_ratio_filtered",
+        "global_dominant_link_ratio",
+        "global_dominant_link_ratio_filtered",
+        "local_link_margin",
+        "local_link_margin_filtered",
+        "global_link_margin",
+        "global_link_margin_filtered",
+        "local_head_agreement",
+        "local_head_agreement_filtered",
+        "global_head_agreement",
+        "global_head_agreement_filtered",
+        "local_compatibility",
+        "global_compatibility",
+        "local_chainability",
+        "global_chainability",
+        "local_mutual_consistency",
+        "global_mutual_consistency",
+    ]
+    rows_by_step_layer: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+    for row in candidate_feature_rows:
+        rows_by_step_layer[(int(row["step"]), int(row["layer"]))].append(row)
+
+    summary_rows: List[Dict[str, object]] = []
+    for (step, layer), group_rows in sorted(rows_by_step_layer.items()):
+        for feature_name in feature_names:
+            labels = [int(row.get("is_winner_aligned", 0)) for row in group_rows]
+            scores = [_safe_wan21_t2v_float(row.get(feature_name, float("nan"))) for row in group_rows]
+            auroc_value = _compute_wan21_t2v_binary_auroc(labels, scores)
+            anchor_iou_values = [_safe_wan21_t2v_float(row.get("anchor_iou", float("nan"))) for row in group_rows]
+            anchor_iou_correlation = _compute_wan21_t2v_pearson_correlation(scores, anchor_iou_values)
+
+            rows_by_frame: Dict[int, List[Dict[str, object]]] = defaultdict(list)
+            for row in group_rows:
+                rows_by_frame[int(row["frame"])].append(row)
+            gap_values: List[float] = []
+            for frame_index, frame_rows in rows_by_frame.items():
+                del frame_index
+                winner_rows = [row for row in frame_rows if int(row.get("is_winner_aligned", 0)) == 1]
+                loser_rows = [row for row in frame_rows if int(row.get("is_strongest_loser", 0)) == 1]
+                if not winner_rows or not loser_rows:
+                    continue
+                winner_value = _safe_wan21_t2v_float(winner_rows[0].get(feature_name, float("nan")))
+                loser_value = _safe_wan21_t2v_float(loser_rows[0].get(feature_name, float("nan")))
+                if math.isfinite(winner_value) and math.isfinite(loser_value):
+                    gap_values.append(float(winner_value - loser_value))
+            summary_rows.append({
+                "step": int(step),
+                "layer": int(layer),
+                "feature": str(feature_name),
+                "winner_loser_gap": float(_mean_wan21_t2v_finite(gap_values)),
+                "auroc": float(auroc_value),
+                "anchor_iou_correlation": float(anchor_iou_correlation),
+            })
+    return summary_rows
+
+
+def _summarize_wan21_t2v_self_attention_temporal_precedence(
+    candidate_feature_rows: Sequence[Dict[str, object]],
+    persistence_window: int,
+) -> List[Dict[str, object]]:
+    """Summarize temporal precedence from winner-minus-loser feature gaps."""
+    feature_names = [
+        "proposal_pi",
+        "proposal_vote_share",
+        "local_chainability",
+        "global_chainability",
+        "local_mutual_consistency",
+        "global_mutual_consistency",
+        "local_head_agreement",
+        "global_head_agreement",
+    ]
+    observation_order = sorted(
+        {
+            (int(row["step"]), int(row["layer"]))
+            for row in candidate_feature_rows
+        }
+    )
+    observation_to_index = {
+        (int(step), int(layer)): int(index)
+        for index, (step, layer) in enumerate(observation_order)
+    }
+    rows_by_step_layer_frame: Dict[Tuple[int, int, int], List[Dict[str, object]]] = defaultdict(list)
+    for row in candidate_feature_rows:
+        rows_by_step_layer_frame[(int(row["step"]), int(row["layer"]), int(row["frame"]))].append(row)
+
+    temporal_rows: List[Dict[str, object]] = []
+    frame_ids = sorted({int(row["frame"]) for row in candidate_feature_rows})
+    for feature_name in feature_names:
+        for frame_index in frame_ids:
+            deltas: List[float] = []
+            observation_trace: List[Tuple[int, int]] = []
+            for step, layer in observation_order:
+                group_rows = rows_by_step_layer_frame.get((int(step), int(layer), int(frame_index)), [])
+                winner_rows = [row for row in group_rows if int(row.get("is_winner_aligned", 0)) == 1]
+                loser_rows = [row for row in group_rows if int(row.get("is_strongest_loser", 0)) == 1]
+                if not winner_rows or not loser_rows:
+                    deltas.append(float("nan"))
+                    observation_trace.append((int(step), int(layer)))
+                    continue
+                winner_value = _safe_wan21_t2v_float(winner_rows[0].get(feature_name, float("nan")))
+                loser_value = _safe_wan21_t2v_float(loser_rows[0].get(feature_name, float("nan")))
+                deltas.append(
+                    float(winner_value - loser_value)
+                    if math.isfinite(winner_value) and math.isfinite(loser_value)
+                    else float("nan")
+                )
+                observation_trace.append((int(step), int(layer)))
+
+            precedence_index = -1
+            precedence_step = -1
+            precedence_layer = -1
+            persistence = max(1, int(persistence_window))
+            for start_index in range(len(deltas)):
+                window = deltas[start_index:start_index + persistence]
+                if len(window) < persistence:
+                    continue
+                if all(math.isfinite(value) and value > 0.0 for value in window):
+                    precedence_index = int(start_index)
+                    precedence_step, precedence_layer = observation_trace[start_index]
+                    break
+            temporal_rows.append({
+                "feature": str(feature_name),
+                "frame": int(frame_index),
+                "precedence_observation_index": int(precedence_index),
+                "precedence_step": int(precedence_step),
+                "precedence_layer": int(precedence_layer),
+            })
+    return temporal_rows
+
+
+def _build_wan21_t2v_self_attention_signed_offset_rows(
+    pairwise_rows: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """Aggregate layer-mean pairwise metrics by signed frame offset."""
+    rows_by_step_layer: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+    for row in pairwise_rows:
+        rows_by_step_layer[(int(row["step"]), int(row["layer"]))].append(row)
+
+    aggregated_rows: List[Dict[str, object]] = []
+    for (step, layer), observation_rows in sorted(rows_by_step_layer.items()):
+        _, pairwise_layer_metrics = _build_wan21_t2v_self_attention_pairwise_layer_stats(observation_rows)
+        by_offset: Dict[int, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+        for (query_frame, query_candidate, key_frame), metric_map in pairwise_layer_metrics.items():
+            del query_candidate
+            signed_offset = int(key_frame) - int(query_frame)
+            for metric_name, metric_value in metric_map.items():
+                by_offset[int(signed_offset)][str(metric_name)].append(float(metric_value))
+        for signed_offset, metric_lists in sorted(by_offset.items()):
+            aggregated_rows.append({
+                "step": int(step),
+                "layer": int(layer),
+                "offset": int(signed_offset),
+                "covered_mass": float(_mean_wan21_t2v_finite(metric_lists.get("covered_mass", []))),
+                "entropy": float(_mean_wan21_t2v_finite(metric_lists.get("entropy", []))),
+                "dominant_link_ratio": float(
+                    _mean_wan21_t2v_finite(metric_lists.get("dominant_link_ratio", []))
+                ),
+                "link_margin": float(_mean_wan21_t2v_finite(metric_lists.get("link_margin", []))),
+                "head_agreement": float(_mean_wan21_t2v_finite(metric_lists.get("head_agreement", []))),
+            })
+    return aggregated_rows
+
+
+def _plot_wan21_t2v_self_attention_candidate_score_overlay(
+    label_map_fhw: torch.Tensor,
+    feature_rows: Sequence[Dict[str, object]],
+    feature_name: str,
+    save_file: str,
+    title: str,
+    frame_indices: Sequence[int],
+) -> str:
+    """Render candidate masks colored by one candidate-level scalar."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not frame_indices or not feature_rows:
+        return ""
+
+    label_map_fhw = torch.as_tensor(label_map_fhw).detach().cpu().to(torch.int64)
+    rows_by_frame: Dict[int, List[Dict[str, object]]] = defaultdict(list)
+    for row in feature_rows:
+        rows_by_frame[int(row["frame"])].append(row)
+    finite_values = [
+        _safe_wan21_t2v_float(row.get(feature_name, float("nan")))
+        for row in feature_rows
+        if math.isfinite(_safe_wan21_t2v_float(row.get(feature_name, float("nan"))))
+    ]
+    if not finite_values:
+        return ""
+    vmin = float(min(finite_values))
+    vmax = float(max(finite_values))
+    if abs(vmax - vmin) < 1e-8:
+        vmax = vmin + 1e-8
+
+    num_frames = len(frame_indices)
+    fig, axes = plt.subplots(
+        1,
+        num_frames,
+        figsize=(max(4.4 * num_frames, 12.0), 5.2),
+        gridspec_kw={"wspace": 0.03},
+    )
+    if num_frames == 1:
+        axes = [axes]
+    image = None
+    for axis, frame_index in zip(axes, frame_indices):
+        label_frame = label_map_fhw[int(frame_index)].numpy()
+        canvas = np.full(label_frame.shape, np.nan, dtype=np.float32)
+        winner_candidate = -1
+        loser_candidate = -1
+        for row in rows_by_frame.get(int(frame_index), []):
+            candidate_index = int(row["candidate_index"])
+            feature_value = _safe_wan21_t2v_float(row.get(feature_name, float("nan")))
+            if math.isfinite(feature_value):
+                canvas[label_frame == int(candidate_index)] = np.float32(feature_value)
+            if int(row.get("is_winner_aligned", 0)) == 1:
+                winner_candidate = int(candidate_index)
+            if int(row.get("is_strongest_loser", 0)) == 1:
+                loser_candidate = int(candidate_index)
+
+        axis.imshow(np.ones_like(label_frame, dtype=np.float32), cmap="gray", vmin=0.0, vmax=1.0, alpha=0.12)
+        image = axis.imshow(np.ma.masked_invalid(canvas), cmap="viridis", vmin=vmin, vmax=vmax)
+        candidate_count = int(label_frame.max())
+        for candidate_index in range(1, candidate_count + 1):
+            candidate_mask = (label_frame == int(candidate_index))
+            if not np.any(candidate_mask):
+                continue
+            axis.contour(candidate_mask.astype(np.float32), levels=[0.5], colors=["#ffffff"], linewidths=0.9)
+            points = np.argwhere(candidate_mask)
+            feature_value = _safe_wan21_t2v_float(
+                next(
+                    (
+                        row.get(feature_name, float("nan"))
+                        for row in rows_by_frame.get(int(frame_index), [])
+                        if int(row["candidate_index"]) == int(candidate_index)
+                    ),
+                    float("nan"),
+                )
+            )
+            if points.size > 0 and math.isfinite(feature_value):
+                x_anchor = float(points[:, 1].max()) + 0.5
+                y_anchor = float(points[:, 0].mean())
+                axis.text(
+                    x_anchor,
+                    y_anchor,
+                    f"K{candidate_index}:{feature_value:.2f}",
+                    fontsize=11,
+                    color="black",
+                    ha="left",
+                    va="center",
+                )
+        if winner_candidate > 0:
+            axis.contour((label_frame == int(winner_candidate)).astype(np.float32), levels=[0.5], colors=["#22c55e"], linewidths=2.0)
+        if loser_candidate > 0:
+            axis.contour((label_frame == int(loser_candidate)).astype(np.float32), levels=[0.5], colors=["#ef4444"], linewidths=2.0)
+        axis.set_title(f"frame={int(frame_index)}", fontsize=15)
+        axis.set_xticks([])
+        axis.set_yticks([])
+    if image is not None:
+        fig.subplots_adjust(left=0.02, right=0.94, top=0.84, bottom=0.06, wspace=0.03)
+        colorbar_axis = fig.add_axes([0.947, 0.14, 0.012, 0.62])
+        colorbar = fig.colorbar(image, cax=colorbar_axis)
+        colorbar.ax.tick_params(labelsize=12)
+    else:
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.84, bottom=0.06, wspace=0.03)
+    fig.suptitle(title, fontsize=17)
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _plot_wan21_t2v_self_attention_coupling_storyboard(
+    label_map_fhw: torch.Tensor,
+    pairwise_layer_vectors: Dict[Tuple[int, int, int], np.ndarray],
+    query_frame: int,
+    winner_candidate: int,
+    loser_candidate: int,
+    target_frames: Sequence[int],
+    save_file: str,
+    title: str,
+    value_name: str,
+) -> str:
+    """Render winner-versus-loser routing patterns across target frames."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if winner_candidate <= 0 or loser_candidate <= 0 or not target_frames:
+        return ""
+
+    label_map_fhw = torch.as_tensor(label_map_fhw).detach().cpu().to(torch.int64)
+    candidate_specs = [
+        ("winner-aligned", int(winner_candidate), "#22c55e"),
+        ("strongest loser", int(loser_candidate), "#ef4444"),
+    ]
+    vmax_candidates: List[float] = []
+    for _, candidate_index, _ in candidate_specs:
+        for target_frame in target_frames:
+            vector = pairwise_layer_vectors.get((int(query_frame), int(candidate_index), int(target_frame)))
+            if vector is not None:
+                vmax_candidates.extend([float(x) for x in vector if math.isfinite(float(x))])
+    vmax = float(max(vmax_candidates)) if vmax_candidates else 1.0
+    vmax = max(vmax, 1e-6)
+
+    fig, axes = plt.subplots(
+        len(candidate_specs),
+        1 + len(target_frames),
+        figsize=(max(4.3 * (1 + len(target_frames)), 12.0), 6.8),
+        gridspec_kw={"wspace": 0.03, "hspace": 0.06},
+    )
+    if len(candidate_specs) == 1:
+        axes = np.asarray([axes])
+
+    for row_index, (row_name, candidate_index, contour_color) in enumerate(candidate_specs):
+        query_label = label_map_fhw[int(query_frame)].numpy()
+        query_axis = axes[row_index, 0]
+        query_axis.imshow(np.ones_like(query_label, dtype=np.float32), cmap="gray", vmin=0.0, vmax=1.0, alpha=0.12)
+        query_axis.imshow((query_label == int(candidate_index)).astype(np.float32), cmap="YlOrBr", vmin=0.0, vmax=1.0)
+        for other_candidate in range(1, int(query_label.max()) + 1):
+            candidate_mask = (query_label == int(other_candidate))
+            if np.any(candidate_mask):
+                query_axis.contour(candidate_mask.astype(np.float32), levels=[0.5], colors=["#ffffff"], linewidths=0.8)
+        query_axis.contour((query_label == int(candidate_index)).astype(np.float32), levels=[0.5], colors=[contour_color], linewidths=2.2)
+        query_axis.set_title(f"query frame={int(query_frame)}\n{row_name} K{int(candidate_index)}", fontsize=14)
+        query_axis.set_xticks([])
+        query_axis.set_yticks([])
+
+        for col_index, target_frame in enumerate(target_frames, start=1):
+            axis = axes[row_index, col_index]
+            label_frame = label_map_fhw[int(target_frame)].numpy()
+            vector = pairwise_layer_vectors.get((int(query_frame), int(candidate_index), int(target_frame)))
+            canvas = np.full(label_frame.shape, np.nan, dtype=np.float32)
+            if vector is not None:
+                for key_candidate in range(1, int(label_frame.max()) + 1):
+                    if int(key_candidate - 1) < int(vector.shape[0]):
+                        canvas[label_frame == int(key_candidate)] = np.float32(vector[int(key_candidate - 1)])
+            axis.imshow(np.ones_like(label_frame, dtype=np.float32), cmap="gray", vmin=0.0, vmax=1.0, alpha=0.12)
+            axis.imshow(np.ma.masked_invalid(canvas), cmap="viridis", vmin=0.0, vmax=vmax)
+            for key_candidate in range(1, int(label_frame.max()) + 1):
+                candidate_mask = (label_frame == int(key_candidate))
+                if not np.any(candidate_mask):
+                    continue
+                axis.contour(candidate_mask.astype(np.float32), levels=[0.5], colors=["#ffffff"], linewidths=0.8)
+                points = np.argwhere(candidate_mask)
+                metric_value = (
+                    float(vector[int(key_candidate - 1)])
+                    if vector is not None and int(key_candidate - 1) < int(vector.shape[0])
+                    else float("nan")
+                )
+                if points.size > 0 and math.isfinite(metric_value):
+                    center_y = float(points[:, 0].mean())
+                    x_anchor = float(points[:, 1].max()) + 0.5
+                    axis.text(
+                        x_anchor,
+                        center_y,
+                        f"K{key_candidate}:{metric_value:.2f}",
+                        fontsize=10,
+                        color="black",
+                        ha="left",
+                        va="center",
+                    )
+            axis.set_title(f"key frame={int(target_frame)}", fontsize=14)
+            axis.set_xticks([])
+            axis.set_yticks([])
+    fig.suptitle(f"{title} ({value_name})", fontsize=17)
+    fig.subplots_adjust(left=0.02, right=0.99, top=0.86, bottom=0.05, wspace=0.03, hspace=0.06)
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _plot_wan21_t2v_self_attention_feature_evolution_panel(
+    rows: Sequence[Dict[str, object]],
+    feature_names: Sequence[str],
+    axis_mode: str,
+    fixed_value: int,
+    save_file: str,
+    title: str,
+) -> str:
+    """Render winner-minus-loser evolution curves either step-wise or layer-wise."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    feature_names = [str(feature_name) for feature_name in feature_names]
+    if not feature_names:
+        return ""
+    num_cols = min(3, max(1, len(feature_names)))
+    num_rows = int(math.ceil(len(feature_names) / float(num_cols)))
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(5.0 * num_cols, 3.6 * num_rows))
+    axes = np.atleast_1d(axes).reshape(num_rows, num_cols)
+    axis_mode = str(axis_mode).strip().lower()
+    if axis_mode not in {"step", "layer"}:
+        raise ValueError(f"Unsupported axis_mode: {axis_mode}")
+
+    for panel_index, feature_name in enumerate(feature_names):
+        axis = axes[panel_index // num_cols, panel_index % num_cols]
+        if axis_mode == "step":
+            feature_rows = [
+                row for row in rows
+                if str(row["feature"]) == str(feature_name) and int(row["layer"]) == int(fixed_value)
+            ]
+            feature_rows = sorted(feature_rows, key=lambda row: int(row["step"]))
+            xs = [int(row["step"]) for row in feature_rows]
+            ys = [_safe_wan21_t2v_float(row.get("mean_gap", float("nan"))) for row in feature_rows]
+            x_label = "step"
+        else:
+            feature_rows = [
+                row for row in rows
+                if str(row["feature"]) == str(feature_name) and int(row["step"]) == int(fixed_value)
+            ]
+            feature_rows = sorted(feature_rows, key=lambda row: int(row["layer"]))
+            xs = [int(row["layer"]) for row in feature_rows]
+            ys = [_safe_wan21_t2v_float(row.get("mean_gap", float("nan"))) for row in feature_rows]
+            x_label = "layer"
+        if not feature_rows:
+            axis.set_axis_off()
+            continue
+        axis.plot(xs, ys, marker="o", linewidth=1.4, color="#2563eb", alpha=0.55, label="raw gap")
+        smooth_xs, smooth_ys = _smooth_wan21_t2v_curve_values(xs, ys, window_radius=2)
+        if smooth_xs.size > 0:
+            axis.plot(smooth_xs, smooth_ys, linewidth=2.4, color="#dc2626", alpha=0.95, label="smoothed gap")
+        axis.axhline(0.0, color="#64748b", linewidth=1.0, linestyle="--", alpha=0.75)
+        axis.set_title(feature_name, fontsize=10)
+        axis.set_xlabel(x_label)
+        axis.set_ylabel("winner-minus-loser gap")
+        axis.grid(alpha=0.22, linestyle="--")
+        axis.legend(fontsize=8)
+
+    for panel_index in range(len(feature_names), num_rows * num_cols):
+        axes[panel_index // num_cols, panel_index % num_cols].set_axis_off()
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _plot_wan21_t2v_self_attention_signed_offset_panel(
+    signed_offset_rows: Sequence[Dict[str, object]],
+    selected_observations: Sequence[Tuple[int, int]],
+    save_file: str,
+    title: str,
+) -> str:
+    """Render signed-offset trend curves for representative observations."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    metrics = [
+        ("entropy", "entropy"),
+        ("dominant_link_ratio", "dominant-link ratio"),
+        ("link_margin", "link margin"),
+        ("head_agreement", "head agreement"),
+    ]
+    if not signed_offset_rows or not selected_observations:
+        return ""
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.8))
+    axes = axes.reshape(2, 2)
+    color_map = plt.get_cmap("tab10")
+    for metric_index, (metric_key, metric_label) in enumerate(metrics):
+        axis = axes[metric_index // 2, metric_index % 2]
+        for obs_index, (step, layer) in enumerate(selected_observations):
+            observation_rows = [
+                row for row in signed_offset_rows
+                if int(row["step"]) == int(step) and int(row["layer"]) == int(layer)
+            ]
+            observation_rows = sorted(observation_rows, key=lambda row: int(row["offset"]))
+            xs = [int(row["offset"]) for row in observation_rows if math.isfinite(_safe_wan21_t2v_float(row.get(metric_key, float("nan"))))]
+            ys = [_safe_wan21_t2v_float(row.get(metric_key, float("nan"))) for row in observation_rows if math.isfinite(_safe_wan21_t2v_float(row.get(metric_key, float("nan"))))]
+            if not xs:
+                continue
+            axis.plot(
+                xs,
+                ys,
+                marker="o",
+                linewidth=1.6,
+                color=color_map(obs_index % 10),
+                label=f"step={int(step)}, layer={int(layer)}",
+            )
+        axis.set_title(metric_label, fontsize=10)
+        axis.set_xlabel("signed offset d = g - f")
+        axis.set_ylabel(metric_label)
+        axis.grid(alpha=0.22, linestyle="--")
+        axis.legend(fontsize=8)
+    fig.suptitle(title, fontsize=11)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.92, bottom=0.08, wspace=0.24, hspace=0.28)
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _plot_wan21_t2v_self_attention_competition_curves(
+    rows: Sequence[Dict[str, object]],
+    axis_mode: str,
+    fixed_value: int,
+    normalized: bool,
+    save_file: str,
+    title: str,
+) -> str:
+    """Render CA-vs-SA competition curves on step-wise or layer-wise axes."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    selected_features = [
+        "proposal_pi",
+        "proposal_vote_share",
+        "local_chainability",
+        "global_chainability",
+        "global_mutual_consistency",
+        "global_head_agreement",
+    ]
+    feature_labels = {
+        "proposal_pi": "CA proposal strength",
+        "proposal_vote_share": "CA vote share",
+        "local_chainability": "SA local chainability",
+        "global_chainability": "SA global chainability",
+        "global_mutual_consistency": "SA global mutual consistency",
+        "global_head_agreement": "SA global head agreement",
+    }
+    feature_colors = {
+        "proposal_pi": "#1d4ed8",
+        "proposal_vote_share": "#38bdf8",
+        "local_chainability": "#f59e0b",
+        "global_chainability": "#dc2626",
+        "global_mutual_consistency": "#7c3aed",
+        "global_head_agreement": "#059669",
+    }
+    axis_mode = str(axis_mode).strip().lower()
+    if axis_mode not in {"step", "layer"}:
+        raise ValueError(f"Unsupported axis_mode for competition curves: {axis_mode}")
+    if axis_mode == "step":
+        x_key = "step"
+        filter_key = "layer"
+        x_label = "step"
+    else:
+        x_key = "layer"
+        filter_key = "step"
+        x_label = "layer"
+
+    series_rows_by_feature: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        if int(row[filter_key]) != int(fixed_value):
+            continue
+        feature_name = str(row["feature"])
+        if feature_name not in selected_features:
+            continue
+        gap_value = _safe_wan21_t2v_float(row.get("mean_gap", float("nan")))
+        if not math.isfinite(gap_value):
+            continue
+        series_rows_by_feature[feature_name].append(row)
+    if not series_rows_by_feature:
+        return ""
+
+    fig, axis = plt.subplots(1, 1, figsize=(10.0, 5.4))
+    for feature_name in selected_features:
+        feature_rows = sorted(
+            series_rows_by_feature.get(feature_name, []),
+            key=lambda row: int(row[x_key]),
+        )
+        if not feature_rows:
+            continue
+        xs = [int(row[x_key]) for row in feature_rows]
+        ys = [_safe_wan21_t2v_float(row.get("mean_gap", float("nan"))) for row in feature_rows]
+        if bool(normalized):
+            finite_abs = [abs(float(value)) for value in ys if math.isfinite(float(value))]
+            robust_scale = float(np.quantile(np.asarray(finite_abs, dtype=np.float64), 0.95)) if finite_abs else 1.0
+            robust_scale = max(robust_scale, 1e-8)
+            ys = [float(value) / robust_scale for value in ys]
+        axis.plot(
+            xs,
+            ys,
+            marker="o",
+            linewidth=1.0,
+            color=feature_colors.get(feature_name, "#0f766e"),
+            alpha=0.22,
+            label=feature_labels.get(feature_name, feature_name),
+        )
+        smooth_xs, smooth_ys = _smooth_wan21_t2v_curve_values(xs, ys, window_radius=4)
+        if smooth_xs.size > 0:
+            axis.plot(
+                smooth_xs,
+                smooth_ys,
+                linewidth=3.2,
+                color=feature_colors.get(feature_name, "#0f766e"),
+                alpha=0.98,
+            )
+    axis.axhline(0.0, color="#64748b", linewidth=1.0, linestyle="--", alpha=0.75)
+    axis.set_title(title)
+    axis.set_xlabel(x_label)
+    axis.set_ylabel("normalized winner-minus-loser gap" if bool(normalized) else "winner-minus-loser gap")
+    axis.grid(alpha=0.22, linestyle="--")
+    axis.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _plot_wan21_t2v_self_attention_overlap_scatter(
+    candidate_feature_rows: Sequence[Dict[str, object]],
+    feature_name: str,
+    save_file: str,
+    title: str,
+    selected_step: Optional[int] = None,
+) -> str:
+    """Scatter one feature against anchor overlap for diagnostic inspection."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_rows = []
+    for row in candidate_feature_rows:
+        if selected_step is not None and int(row["step"]) != int(selected_step):
+            continue
+        feature_value = _safe_wan21_t2v_float(row.get(feature_name, float("nan")))
+        anchor_iou = _safe_wan21_t2v_float(row.get("anchor_iou", float("nan")))
+        if not math.isfinite(feature_value) or not math.isfinite(anchor_iou):
+            continue
+        if int(row.get("is_winner_aligned", 0)) == 1:
+            role = "winner"
+            color = "#16a34a"
+        elif int(row.get("is_strongest_loser", 0)) == 1:
+            role = "strongest loser"
+            color = "#dc2626"
+        else:
+            role = "other"
+            color = "#94a3b8"
+        plot_rows.append((feature_value, anchor_iou, role, color))
+    if not plot_rows:
+        return ""
+
+    fig, axis = plt.subplots(1, 1, figsize=(6.9, 5.4))
+    for role_name in ["other", "strongest loser", "winner"]:
+        role_points = [(x, y, c) for x, y, role, c in plot_rows if role == role_name]
+        if not role_points:
+            continue
+        xs = [x for x, _, _ in role_points]
+        ys = [y for _, y, _ in role_points]
+        color = role_points[0][2]
+        axis.scatter(xs, ys, s=18 if role_name == "other" else 24, alpha=0.72, color=color, edgecolors="none", label=role_name)
+    all_xs = np.asarray([x for x, _, _, _ in plot_rows], dtype=np.float64)
+    all_ys = np.asarray([y for _, y, _, _ in plot_rows], dtype=np.float64)
+    if all_xs.size >= 2 and np.unique(all_xs).size >= 2:
+        slope, intercept = np.polyfit(all_xs, all_ys, deg=1)
+        fit_xs = np.linspace(float(all_xs.min()), float(all_xs.max()), num=200)
+        fit_ys = slope * fit_xs + intercept
+        axis.plot(
+            fit_xs,
+            fit_ys,
+            color="black",
+            linewidth=2.0,
+            alpha=0.9,
+            label="linear fit",
+        )
+    axis.set_title(title)
+    axis.set_xlabel(feature_name)
+    axis.set_ylabel("anchor IoU")
+    axis.grid(alpha=0.22, linestyle="--")
+    axis.legend(fontsize=8)
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _trajectory_consensus_render_self_attention_observation_plots_task(
+    task: Tuple,
+) -> List[str]:
+    """Render all per-observation self-attention plots for one `(step, layer)`."""
+    (
+        step,
+        layer,
+        label_map_fhw_np,
+        feature_rows_for_obs,
+        pairwise_rows_for_obs,
+        overlay_features,
+        overlay_frame_indices,
+        layer1_overlay_dir,
+        layer1_storyboard_dir,
+        skip_existing_plots,
+    ) = task
+
+    plot_paths: List[str] = []
+    label_map_fhw = torch.from_numpy(np.asarray(label_map_fhw_np)).to(torch.int64)
+    step = int(step)
+    layer = int(layer)
+    frame_count = int(label_map_fhw.shape[0])
+
+    for feature_name in overlay_features:
+        save_file = os.path.join(
+            str(layer1_overlay_dir),
+            f"step_{int(step):03d}",
+            f"layer_{int(layer):02d}",
+            f"candidate_score_overlay_{str(feature_name)}.pdf",
+        )
+        if _maybe_skip_wan21_t2v_existing_plot(save_file, bool(skip_existing_plots)):
+            plot_paths.append(save_file)
+        else:
+            plot_path = _plot_wan21_t2v_self_attention_candidate_score_overlay(
+                label_map_fhw=label_map_fhw,
+                feature_rows=feature_rows_for_obs,
+                feature_name=str(feature_name),
+                save_file=save_file,
+                title=f"Candidate score overlay at step={int(step)}, layer={int(layer)} ({str(feature_name)})",
+                frame_indices=overlay_frame_indices,
+            )
+            if plot_path:
+                plot_paths.append(plot_path)
+
+    if pairwise_rows_for_obs:
+        raw_coupling_vectors = _build_wan21_t2v_self_attention_pairwise_layer_value_vectors(
+            pairwise_rows_for_obs,
+            value_key="raw_coupling",
+        )
+        normalized_coupling_vectors = _build_wan21_t2v_self_attention_pairwise_layer_value_vectors(
+            pairwise_rows_for_obs,
+            value_key="normalized_coupling",
+        )
+        frame_rows_by_frame: Dict[int, List[Dict[str, object]]] = defaultdict(list)
+        for row in feature_rows_for_obs:
+            frame_rows_by_frame[int(row["frame"])].append(row)
+        for frame_index, frame_rows in sorted(frame_rows_by_frame.items()):
+            winner_rows = [row for row in frame_rows if int(row.get("is_winner_aligned", 0)) == 1]
+            loser_rows = [row for row in frame_rows if int(row.get("is_strongest_loser", 0)) == 1]
+            if not winner_rows or not loser_rows:
+                continue
+            winner_candidate = int(winner_rows[0]["candidate_index"])
+            loser_candidate = int(loser_rows[0]["candidate_index"])
+            candidate_target_frames = sorted(
+                {
+                    int(candidate_frame)
+                    for candidate_frame in (
+                        [0, int(frame_count // 2), int(frame_count - 1), int(frame_index - 1), int(frame_index + 1)]
+                    )
+                    if 0 <= int(candidate_frame) < int(frame_count)
+                    and int(candidate_frame) != int(frame_index)
+                }
+            )
+            if not candidate_target_frames:
+                candidate_target_frames = [
+                    int(candidate_frame)
+                    for candidate_frame in range(frame_count)
+                    if int(candidate_frame) != int(frame_index)
+                ][:4]
+            for value_name, value_vectors in [
+                ("raw_coupling", raw_coupling_vectors),
+                ("normalized_coupling", normalized_coupling_vectors),
+            ]:
+                storyboard_save = os.path.join(
+                    str(layer1_storyboard_dir),
+                    f"step_{int(step):03d}",
+                    f"layer_{int(layer):02d}",
+                    f"frame_{int(frame_index):02d}",
+                    f"winner_loser_coupling_storyboard_{str(value_name)}.pdf",
+                )
+                if _maybe_skip_wan21_t2v_existing_plot(storyboard_save, bool(skip_existing_plots)):
+                    plot_paths.append(storyboard_save)
+                else:
+                    plot_path = _plot_wan21_t2v_self_attention_coupling_storyboard(
+                        label_map_fhw=label_map_fhw,
+                        pairwise_layer_vectors=value_vectors,
+                        query_frame=int(frame_index),
+                        winner_candidate=int(winner_candidate),
+                        loser_candidate=int(loser_candidate),
+                        target_frames=candidate_target_frames,
+                        save_file=storyboard_save,
+                        title=(
+                            f"Winner-versus-loser coupling storyboard at step={int(step)}, "
+                            f"layer={int(layer)}, query frame={int(frame_index)}"
+                        ),
+                        value_name=str(value_name),
+                    )
+                    if plot_path:
+                        plot_paths.append(plot_path)
+    return plot_paths
+
+
+def _trajectory_consensus_render_self_attention_plot_task(task: Tuple) -> str:
+    """Render one non-observation self-attention plot task."""
+    plot_kind = str(task[0])
+    if plot_kind == "evolution":
+        _, rows, feature_names, axis_mode, fixed_value, save_file, title = task
+        return _plot_wan21_t2v_self_attention_feature_evolution_panel(
+            rows=rows,
+            feature_names=feature_names,
+            axis_mode=str(axis_mode),
+            fixed_value=int(fixed_value),
+            save_file=str(save_file),
+            title=str(title),
+        )
+    if plot_kind == "signed_offset":
+        _, signed_offset_rows, selected_observations, save_file, title = task
+        return _plot_wan21_t2v_self_attention_signed_offset_panel(
+            signed_offset_rows=signed_offset_rows,
+            selected_observations=selected_observations,
+            save_file=str(save_file),
+            title=str(title),
+        )
+    if plot_kind == "competition":
+        _, rows, axis_mode, fixed_value, normalized, save_file, title = task
+        return _plot_wan21_t2v_self_attention_competition_curves(
+            rows=rows,
+            axis_mode=str(axis_mode),
+            fixed_value=int(fixed_value),
+            normalized=bool(normalized),
+            save_file=str(save_file),
+            title=str(title),
+        )
+    if plot_kind == "precedence_bar":
+        _, rows, save_file, title, x_key, y_key, x_label, y_label = task
+        return _plot_wan21_t2v_trajectory_consensus_bar(
+            rows=rows,
+            save_file=str(save_file),
+            x_key=str(x_key),
+            y_key=str(y_key),
+            title=str(title),
+            x_label=str(x_label),
+            y_label=str(y_label),
+        )
+    if plot_kind == "heatmap":
+        (
+            _,
+            matrix_rows,
+            save_file,
+            title,
+            row_key,
+            col_key,
+            value_key,
+            row_label,
+            col_label,
+        ) = task
+        return _plot_wan21_t2v_trajectory_consensus_heatmap(
+            matrix_rows=matrix_rows,
+            save_file=str(save_file),
+            title=str(title),
+            row_key=str(row_key),
+            col_key=str(col_key),
+            value_key=str(value_key),
+            row_label=str(row_label),
+            col_label=str(col_label),
+        )
+    if plot_kind == "scatter":
+        _, candidate_feature_rows, feature_name, save_file, title, selected_step = task
+        return _plot_wan21_t2v_self_attention_overlap_scatter(
+            candidate_feature_rows=candidate_feature_rows,
+            feature_name=str(feature_name),
+            save_file=str(save_file),
+            title=str(title),
+            selected_step=(None if selected_step is None else int(selected_step)),
+        )
+    raise ValueError(f"Unsupported self-attention plot task kind: {plot_kind}")
+
+
+def _render_wan21_t2v_self_attention_coupling_plots(
+    output_dir: str,
+    pairwise_rows: Sequence[Dict[str, object]],
+    candidate_feature_rows: Sequence[Dict[str, object]],
+    feature_summary_rows: Sequence[Dict[str, object]],
+    temporal_precedence_rows: Sequence[Dict[str, object]],
+    candidate_region_cache: Dict[Tuple[int, int], Dict[str, object]],
+    skip_existing_plots: bool,
+    num_workers: int = 0,
+) -> List[str]:
+    """Render the three-layer plot set for the self-attention coupling stage."""
+    plot_paths: List[str] = []
+    plots_root_dir = os.path.join(output_dir, "trajectory_consensus_self_attention_plots")
+    layer1_dir = os.path.join(plots_root_dir, "layer1_mechanistic")
+    layer2_dir = os.path.join(plots_root_dir, "layer2_trends")
+    layer3_dir = os.path.join(plots_root_dir, "layer3_navigation")
+    layer1_overlay_dir = os.path.join(layer1_dir, "candidate_score_overlays")
+    layer1_storyboard_dir = os.path.join(layer1_dir, "coupling_storyboard")
+    layer1_evolution_dir = os.path.join(layer1_dir, "feature_evolution")
+    layer2_signed_offset_dir = os.path.join(layer2_dir, "signed_offset")
+    layer2_competition_dir = os.path.join(layer2_dir, "competition")
+    layer2_precedence_dir = os.path.join(layer2_dir, "temporal_precedence")
+    heatmaps_dir = os.path.join(layer3_dir, "heatmaps")
+    heatmap_gap_dir = os.path.join(heatmaps_dir, "winner_loser_gap")
+    heatmap_auroc_dir = os.path.join(heatmaps_dir, "auroc")
+    scatter_dir = os.path.join(layer3_dir, "scatter")
+    scatter_anchor_dir = os.path.join(scatter_dir, "feature_vs_anchor_iou")
+    for directory in [
+        layer1_dir,
+        layer2_dir,
+        layer3_dir,
+        layer1_overlay_dir,
+        layer1_storyboard_dir,
+        layer1_evolution_dir,
+        layer2_signed_offset_dir,
+        layer2_competition_dir,
+        layer2_precedence_dir,
+        heatmaps_dir,
+        heatmap_gap_dir,
+        heatmap_auroc_dir,
+        scatter_dir,
+        scatter_anchor_dir,
+    ]:
+        _ensure_dir(directory)
+
+    features = sorted({str(row["feature"]) for row in feature_summary_rows})
+    gap_rows = _build_wan21_t2v_self_attention_feature_gap_rows(
+        candidate_feature_rows,
+        feature_names=features,
+    )
+    step_layer_feature_rows: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+    for row in candidate_feature_rows:
+        step_layer_feature_rows[(int(row["step"]), int(row["layer"]))].append(row)
+    step_layer_pairwise_rows: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+    for row in pairwise_rows:
+        step_layer_pairwise_rows[(int(row["step"]), int(row["layer"]))].append(row)
+    step_layer_gap_rows: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+    for row in gap_rows:
+        step_layer_gap_rows[(int(row["step"]), int(row["layer"]))].append(row)
+
+    overlay_features = [
+        "proposal_pi",
+        "proposal_vote_share",
+        "local_compatibility",
+        "global_compatibility",
+        "local_chainability",
+        "global_chainability",
+        "local_mutual_consistency",
+        "global_mutual_consistency",
+    ]
+    sorted_step_layer_keys = sorted(step_layer_feature_rows.keys())
+    observation_plot_tasks: List[Tuple] = []
+    for step, layer in sorted_step_layer_keys:
+        label_payload = candidate_region_cache.get((int(step), int(layer)))
+        feature_rows_for_obs = step_layer_feature_rows.get((int(step), int(layer)), [])
+        pairwise_rows_for_obs = step_layer_pairwise_rows.get((int(step), int(layer)), [])
+        if label_payload is None or not feature_rows_for_obs:
+            continue
+        label_map_fhw = label_payload["label_map_fhw"]
+        frame_count = int(label_map_fhw.shape[0])
+        overlay_frame_indices = _sample_wan21_t2v_evenly_spaced_indices(frame_count, max_count=10)
+        label_map_np = np.ascontiguousarray(
+            label_map_fhw.detach().cpu().numpy().astype(np.int16, copy=False)
+        )
+        observation_plot_tasks.append(
+            (
+                int(step),
+                int(layer),
+                label_map_np,
+                feature_rows_for_obs,
+                pairwise_rows_for_obs,
+                tuple(str(feature_name) for feature_name in overlay_features),
+                tuple(int(frame_index) for frame_index in overlay_frame_indices),
+                str(layer1_overlay_dir),
+                str(layer1_storyboard_dir),
+                bool(skip_existing_plots),
+            )
+        )
+
+    observation_progress_bar = None
+    if observation_plot_tasks:
+        try:
+            from tqdm import tqdm
+            observation_progress_bar = tqdm(
+                total=int(len(observation_plot_tasks)),
+                desc="trajectory consensus self-attention observation plots",
+                unit="obs",
+                leave=True,
+            )
+        except Exception:
+            observation_progress_bar = None
+    try:
+        effective_num_workers = _resolve_wan21_t2v_num_workers(
+            requested_num_workers=int(num_workers),
+            task_count=int(len(observation_plot_tasks)),
+        )
+        for task_plot_paths in _iter_wan21_t2v_parallel_results(
+            tasks=observation_plot_tasks,
+            worker_fn=_trajectory_consensus_render_self_attention_observation_plots_task,
+            num_workers=int(effective_num_workers),
+        ):
+            plot_paths.extend([path for path in task_plot_paths if path])
+            if observation_progress_bar is not None:
+                observation_progress_bar.update(1)
+    finally:
+        if observation_progress_bar is not None:
+            observation_progress_bar.close()
+
+    evolution_features = [
+        "proposal_pi",
+        "proposal_vote_share",
+        "local_chainability",
+        "global_chainability",
+        "global_mutual_consistency",
+        "global_head_agreement",
+    ]
+    stepwise_gap_rows = _build_wan21_t2v_self_attention_stepwise_gap_rows(gap_rows)
+    layerwise_gap_rows = _build_wan21_t2v_self_attention_layerwise_gap_rows(gap_rows)
+    all_layers = sorted({int(row["layer"]) for row in stepwise_gap_rows})
+    all_steps = sorted({int(row["step"]) for row in layerwise_gap_rows})
+    misc_plot_tasks: List[Tuple] = []
+    for layer in all_layers:
+        evolution_save = os.path.join(
+            layer1_evolution_dir,
+            "by_layer",
+            f"layer_{int(layer):02d}",
+            "winner_loser_gap_vs_step.pdf",
+        )
+        if _maybe_skip_wan21_t2v_existing_plot(evolution_save, skip_existing_plots):
+            plot_paths.append(evolution_save)
+        else:
+            misc_plot_tasks.append(
+                (
+                    "evolution",
+                    stepwise_gap_rows,
+                    tuple(evolution_features),
+                    "step",
+                    int(layer),
+                    evolution_save,
+                    f"Winner-minus-loser gaps versus step at layer={int(layer)}",
+                )
+            )
+    for step in all_steps:
+        evolution_save = os.path.join(
+            layer1_evolution_dir,
+            "by_step",
+            f"step_{int(step):03d}",
+            "winner_loser_gap_vs_layer.pdf",
+        )
+        if _maybe_skip_wan21_t2v_existing_plot(evolution_save, skip_existing_plots):
+            plot_paths.append(evolution_save)
+        else:
+            misc_plot_tasks.append(
+                (
+                    "evolution",
+                    layerwise_gap_rows,
+                    tuple(evolution_features),
+                    "layer",
+                    int(step),
+                    evolution_save,
+                    f"Winner-minus-loser gaps versus layer at step={int(step)}",
+                )
+            )
+
+    signed_offset_rows = _build_wan21_t2v_self_attention_signed_offset_rows(pairwise_rows)
+    rows_by_step: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    rows_by_layer: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    for step, layer in sorted_step_layer_keys:
+        rows_by_step[int(step)].append((int(step), int(layer)))
+        rows_by_layer[int(layer)].append((int(step), int(layer)))
+    for step, observations in sorted(rows_by_step.items()):
+        signed_offset_save = os.path.join(
+            layer2_signed_offset_dir,
+            "by_step",
+            f"step_{int(step):03d}",
+            "signed_offset_planning_curves.pdf",
+        )
+        if _maybe_skip_wan21_t2v_existing_plot(signed_offset_save, skip_existing_plots):
+            plot_paths.append(signed_offset_save)
+        else:
+            misc_plot_tasks.append(
+                (
+                    "signed_offset",
+                    signed_offset_rows,
+                    tuple(sorted(observations, key=lambda item: int(item[1]))),
+                    signed_offset_save,
+                    f"Signed-offset self-attention planning curves at step={int(step)}",
+                )
+            )
+    for layer, observations in sorted(rows_by_layer.items()):
+        signed_offset_save = os.path.join(
+            layer2_signed_offset_dir,
+            "by_layer",
+            f"layer_{int(layer):02d}",
+            "signed_offset_planning_curves.pdf",
+        )
+        if _maybe_skip_wan21_t2v_existing_plot(signed_offset_save, skip_existing_plots):
+            plot_paths.append(signed_offset_save)
+        else:
+            misc_plot_tasks.append(
+                (
+                    "signed_offset",
+                    signed_offset_rows,
+                    tuple(sorted(observations, key=lambda item: int(item[0]))),
+                    signed_offset_save,
+                    f"Signed-offset self-attention planning curves at layer={int(layer)}",
+                )
+            )
+
+    for layer in all_layers:
+        for normalized, value_tag in [(False, "raw"), (True, "normalized")]:
+            competition_save = os.path.join(
+                layer2_competition_dir,
+                "by_layer",
+                f"layer_{int(layer):02d}",
+                value_tag,
+                "cross_attention_vs_self_attention_competition.pdf",
+            )
+            if _maybe_skip_wan21_t2v_existing_plot(competition_save, skip_existing_plots):
+                plot_paths.append(competition_save)
+            else:
+                misc_plot_tasks.append(
+                    (
+                        "competition",
+                        stepwise_gap_rows,
+                        "step",
+                        int(layer),
+                        bool(normalized),
+                        competition_save,
+                        (
+                            f"Cross-attention proposal versus self-attention coordination "
+                            f"at layer={int(layer)} ({value_tag})"
+                        ),
+                    )
+                )
+    for step in all_steps:
+        for normalized, value_tag in [(False, "raw"), (True, "normalized")]:
+            competition_save = os.path.join(
+                layer2_competition_dir,
+                "by_step",
+                f"step_{int(step):03d}",
+                value_tag,
+                "cross_attention_vs_self_attention_competition.pdf",
+            )
+            if _maybe_skip_wan21_t2v_existing_plot(competition_save, skip_existing_plots):
+                plot_paths.append(competition_save)
+            else:
+                misc_plot_tasks.append(
+                    (
+                        "competition",
+                        layerwise_gap_rows,
+                        "layer",
+                        int(step),
+                        bool(normalized),
+                        competition_save,
+                        (
+                            f"Cross-attention proposal versus self-attention coordination "
+                            f"at step={int(step)} ({value_tag})"
+                        ),
+                    )
+                )
+
+    precedence_summary_rows: List[Dict[str, object]] = []
+    rows_by_feature: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    for row in temporal_precedence_rows:
+        rows_by_feature[str(row["feature"])].append(row)
+    for feature_name, rows in sorted(rows_by_feature.items()):
+        precedence_values = [
+            float(row["precedence_observation_index"])
+            for row in rows
+            if int(row["precedence_observation_index"]) >= 0
+        ]
+        precedence_summary_rows.append({
+            "feature": str(feature_name),
+            "mean_precedence_index": float(_mean_wan21_t2v_finite(precedence_values)),
+        })
+    precedence_save = os.path.join(layer2_precedence_dir, "temporal_precedence_summary.pdf")
+    if precedence_summary_rows:
+        if _maybe_skip_wan21_t2v_existing_plot(precedence_save, skip_existing_plots):
+            plot_paths.append(precedence_save)
+        else:
+            misc_plot_tasks.append(
+                (
+                    "precedence_bar",
+                    precedence_summary_rows,
+                    precedence_save,
+                    "Temporal precedence summary",
+                    "feature",
+                    "mean_precedence_index",
+                    "feature",
+                    "mean first stable separation index",
+                )
+            )
+
+    for feature_name in features:
+        feature_rows = [row for row in feature_summary_rows if str(row["feature"]) == str(feature_name)]
+        if not feature_rows:
+            continue
+        gap_save = os.path.join(heatmap_gap_dir, f"{feature_name}_winner_loser_gap.pdf")
+        if _maybe_skip_wan21_t2v_existing_plot(gap_save, skip_existing_plots):
+            plot_paths.append(gap_save)
+        else:
+            misc_plot_tasks.append(
+                (
+                    "heatmap",
+                    feature_rows,
+                    gap_save,
+                    f"{feature_name} winner-minus-loser gap",
+                    "step",
+                    "layer",
+                    "winner_loser_gap",
+                    "step",
+                    "layer",
+                )
+            )
+        auroc_save = os.path.join(heatmap_auroc_dir, f"{feature_name}_auroc.pdf")
+        if _maybe_skip_wan21_t2v_existing_plot(auroc_save, skip_existing_plots):
+            plot_paths.append(auroc_save)
+        else:
+            misc_plot_tasks.append(
+                (
+                    "heatmap",
+                    feature_rows,
+                    auroc_save,
+                    f"{feature_name} AUROC",
+                    "step",
+                    "layer",
+                    "auroc",
+                    "step",
+                    "layer",
+                )
+            )
+
+    scatter_features = [
+        "proposal_pi",
+        "global_chainability",
+        "global_mutual_consistency",
+    ]
+    all_scatter_steps = sorted({int(row["step"]) for row in candidate_feature_rows})
+    for feature_name in scatter_features:
+        feature_scatter_dir = os.path.join(scatter_anchor_dir, str(feature_name))
+        overall_dir = os.path.join(feature_scatter_dir, "overall")
+        by_step_dir = os.path.join(feature_scatter_dir, "by_step")
+        _ensure_dir(overall_dir)
+        _ensure_dir(by_step_dir)
+        scatter_save = os.path.join(overall_dir, f"{feature_name}_vs_anchor_iou.pdf")
+        if _maybe_skip_wan21_t2v_existing_plot(scatter_save, skip_existing_plots):
+            plot_paths.append(scatter_save)
+        else:
+            misc_plot_tasks.append(
+                (
+                    "scatter",
+                    candidate_feature_rows,
+                    feature_name,
+                    scatter_save,
+                    f"{feature_name} versus anchor overlap",
+                    None,
+                )
+            )
+        for step in all_scatter_steps:
+            scatter_save = os.path.join(
+                by_step_dir,
+                f"step_{int(step):03d}",
+                f"{feature_name}_vs_anchor_iou_step_{int(step):03d}.pdf",
+            )
+            if _maybe_skip_wan21_t2v_existing_plot(scatter_save, skip_existing_plots):
+                plot_paths.append(scatter_save)
+            else:
+                misc_plot_tasks.append(
+                    (
+                        "scatter",
+                        candidate_feature_rows,
+                        feature_name,
+                        scatter_save,
+                        f"{feature_name} versus anchor overlap at step={int(step)}",
+                        int(step),
+                    )
+                )
+
+    misc_progress_bar = None
+    if misc_plot_tasks:
+        try:
+            from tqdm import tqdm
+            misc_progress_bar = tqdm(
+                total=int(len(misc_plot_tasks)),
+                desc="trajectory consensus self-attention summary plots",
+                unit="plot",
+                leave=True,
+            )
+        except Exception:
+            misc_progress_bar = None
+    try:
+        effective_num_workers = _resolve_wan21_t2v_num_workers(
+            requested_num_workers=int(num_workers),
+            task_count=int(len(misc_plot_tasks)),
+        )
+        for plot_path in _iter_wan21_t2v_parallel_results(
+            tasks=misc_plot_tasks,
+            worker_fn=_trajectory_consensus_render_self_attention_plot_task,
+            num_workers=int(effective_num_workers),
+        ):
+            if plot_path:
+                plot_paths.append(plot_path)
+            if misc_progress_bar is not None:
+                misc_progress_bar.update(1)
+    finally:
+        if misc_progress_bar is not None:
+            misc_progress_bar.close()
+    return [path for path in plot_paths if path]
+
+
 def run_wan21_t2v_trajectory_consensus_dynamics(
     wan21_root: str,
     ckpt_dir: str,
@@ -3957,6 +5995,10 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     trajectory_consensus_taylor_num_latent_frames: int = 10,
     trajectory_consensus_taylor_metric_scope: str = "obj",
     trajectory_consensus_taylor_use_gradient_checkpointing: bool = True,
+    trajectory_consensus_sa_anchor_step: int = 49,
+    trajectory_consensus_sa_anchor_layer: int = 27,
+    trajectory_consensus_sa_covered_mass_min: float = 0.0,
+    trajectory_consensus_sa_precedence_persistence: int = 2,
     trajectory_consensus_plot_only_from_csv: bool = False,
     trajectory_consensus_skip_existing_plots: bool = True,
     trajectory_consensus_num_workers: int = 0,
@@ -3965,7 +6007,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     _ensure_dir(output_dir)
     stages = [str(stage).strip().lower() for stage in trajectory_consensus_stages if str(stage).strip()]
     stages = list(dict.fromkeys(stages))
-    allowed_stages = {"candidate_consensus", "head_contribution"}
+    allowed_stages = {"candidate_consensus", "head_contribution", "self_attention_coupling"}
     bad_stages = [stage for stage in stages if stage not in allowed_stages]
     if bad_stages:
         raise ValueError(f"Unsupported trajectory_consensus stages: {bad_stages}")
@@ -4007,6 +6049,8 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
         raise ValueError("trajectory_consensus_taylor_num_latent_frames must be positive or -1.")
     if taylor_metric_scope not in {"obj", "global"}:
         raise ValueError("trajectory_consensus_taylor_metric_scope must be `obj` or `global`.")
+    if int(trajectory_consensus_sa_precedence_persistence) <= 0:
+        raise ValueError("trajectory_consensus_sa_precedence_persistence must be positive.")
 
     head_contribution_base_dir = os.path.join(output_dir, "trajectory_consensus_head_contribution")
     head_contribution_output_dirs: Dict[str, str] = {}
@@ -4111,6 +6155,10 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
         "trajectory_consensus_taylor_num_latent_frames": int(taylor_num_latent_frames),
         "trajectory_consensus_taylor_metric_scope": str(taylor_metric_scope),
         "trajectory_consensus_taylor_use_gradient_checkpointing": bool(taylor_use_gradient_checkpointing),
+        "trajectory_consensus_sa_anchor_step": int(trajectory_consensus_sa_anchor_step),
+        "trajectory_consensus_sa_anchor_layer": int(trajectory_consensus_sa_anchor_layer),
+        "trajectory_consensus_sa_covered_mass_min": float(trajectory_consensus_sa_covered_mass_min),
+        "trajectory_consensus_sa_precedence_persistence": int(trajectory_consensus_sa_precedence_persistence),
         "trajectory_consensus_plot_only_from_csv": bool(trajectory_consensus_plot_only_from_csv),
         "trajectory_consensus_skip_existing_plots": bool(trajectory_consensus_skip_existing_plots),
         "trajectory_consensus_num_workers": int(trajectory_consensus_num_workers),
@@ -4122,6 +6170,10 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     candidate_region_cache: Dict[Tuple[int, int], Dict[str, object]] = {}
     per_head_candidate_region_rows: List[Dict[str, object]] = []
     per_head_candidate_region_cache: Dict[Tuple[int, int, int], Dict[str, object]] = {}
+    self_attention_coupling_pairwise_rows: List[Dict[str, object]] = []
+    self_attention_coupling_candidate_feature_rows: List[Dict[str, object]] = []
+    self_attention_coupling_feature_summary_rows: List[Dict[str, object]] = []
+    self_attention_coupling_temporal_precedence_rows: List[Dict[str, object]] = []
     plot_paths: List[str] = []
 
     if "candidate_consensus" in stages:
@@ -4729,6 +6781,253 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     head_contribution_rows_by_method: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     scatter_rows_by_method: Dict[str, List[Dict[str, object]]] = defaultdict(list)
 
+    if "self_attention_coupling" in stages:
+        pairwise_csv_path = os.path.join(output_dir, "trajectory_consensus_self_attention_coupling_pairwise.csv")
+        candidate_feature_csv_path = os.path.join(
+            output_dir,
+            "trajectory_consensus_self_attention_coupling_candidate_features.csv",
+        )
+        feature_summary_csv_path = os.path.join(
+            output_dir,
+            "trajectory_consensus_self_attention_coupling_feature_summary.csv",
+        )
+        temporal_precedence_csv_path = os.path.join(
+            output_dir,
+            "trajectory_consensus_self_attention_coupling_temporal_precedence.csv",
+        )
+
+        if not candidate_region_cache:
+            (
+                candidate_region_cache,
+                candidate_region_rows,
+                candidate_weight_rows,
+                winner_gap_rows,
+            ) = _load_wan21_t2v_trajectory_consensus_candidate_cache(output_dir)
+
+        if bool(trajectory_consensus_plot_only_from_csv):
+            if not os.path.exists(candidate_feature_csv_path):
+                raise FileNotFoundError(
+                    "trajectory_consensus_plot_only_from_csv=True but missing cached self-attention "
+                    f"candidate features CSV: {candidate_feature_csv_path}"
+                )
+            self_attention_coupling_pairwise_rows = (
+                _load_wan21_t2v_csv_rows(pairwise_csv_path) if os.path.exists(pairwise_csv_path) else []
+            )
+            self_attention_coupling_candidate_feature_rows = _load_wan21_t2v_csv_rows(candidate_feature_csv_path)
+            self_attention_coupling_feature_summary_rows = _summarize_wan21_t2v_self_attention_candidate_features(
+                self_attention_coupling_candidate_feature_rows
+            )
+            self_attention_coupling_temporal_precedence_rows = _summarize_wan21_t2v_self_attention_temporal_precedence(
+                self_attention_coupling_candidate_feature_rows,
+                persistence_window=int(trajectory_consensus_sa_precedence_persistence),
+            )
+            plot_paths.extend(
+                _render_wan21_t2v_self_attention_coupling_plots(
+                    output_dir=output_dir,
+                    pairwise_rows=self_attention_coupling_pairwise_rows,
+                    candidate_feature_rows=self_attention_coupling_candidate_feature_rows,
+                    feature_summary_rows=self_attention_coupling_feature_summary_rows,
+                    temporal_precedence_rows=self_attention_coupling_temporal_precedence_rows,
+                    candidate_region_cache=candidate_region_cache,
+                    skip_existing_plots=bool(trajectory_consensus_skip_existing_plots),
+                    num_workers=int(trajectory_consensus_num_workers),
+                )
+            )
+        else:
+            parallel_cfg = parallel_cfg or Wan21T2VParallelConfig()
+            runtime = _init_wan21_t2v_runtime(parallel_cfg, explicit_device_id=device_id)
+            seed = _broadcast_seed_if_needed(seed, runtime)
+            pipeline, cfg = _build_wan21_t2v_pipeline(
+                wan21_root=wan21_root,
+                ckpt_dir=ckpt_dir,
+                task=task,
+                runtime=runtime,
+                parallel_cfg=parallel_cfg,
+            )
+            del cfg
+            offload_model = _resolve_wan21_t2v_offload_model(runtime, offload_model)
+            target_model = _unwrap_wan21_t2v_dit_model_for_runtime_patch(pipeline.model)
+            num_self_heads_per_layer = {
+                int(layer): int(target_model.blocks[int(layer)].self_attn.num_heads)
+                for layer in selected_layers
+            }
+            selected_self_head_specs = _resolve_wan21_t2v_selected_head_specs_from_layer_counts(
+                explicit_head_specs=trajectory_consensus_self_heads,
+                num_heads_per_layer=num_self_heads_per_layer,
+            )
+            if not selected_self_head_specs:
+                raise ValueError(
+                    "self_attention_coupling requires at least one self-attention head. "
+                    "Use `trajectory_consensus_self_heads=\"\"` for all heads in selected layers."
+                )
+            summary["selected_self_head_specs"] = [f"L{layer}H{head}" for layer, head in selected_self_head_specs]
+            head_indices_by_layer: Dict[int, Tuple[int, ...]] = {}
+            for layer_index in sorted(set(int(layer) for layer, _ in selected_self_head_specs)):
+                head_indices_by_layer[int(layer_index)] = tuple(
+                    sorted(
+                        int(head)
+                        for layer, head in selected_self_head_specs
+                        if int(layer) == int(layer_index)
+                    )
+                )
+
+            selected_label_maps_by_step_layer = {
+                (int(step), int(layer)): candidate_payload["label_map_fhw"].detach().cpu().to(torch.int64)
+                for (step, layer), candidate_payload in candidate_region_cache.items()
+                if int(step) in selected_steps and int(layer) in selected_layers
+            }
+            if not selected_label_maps_by_step_layer:
+                raise ValueError(
+                    "No candidate-region caches are available for the selected steps/layers. "
+                    "Run candidate_consensus first or adjust trajectory_consensus_steps/layers."
+                )
+
+            coupling_branch = str(trajectory_consensus_branch).strip().lower()
+            if coupling_branch not in {"cond", "uncond"}:
+                raise ValueError(
+                    "trajectory_consensus_branch must be `cond` or `uncond` for self_attention_coupling."
+                )
+
+            patch_cfg = Wan21T2VPatchBundleConfig(
+                rope=Wan21T2VRopePatchConfig(enabled=True, mode="full"),
+                probe=Wan21T2VAttentionProbeConfig(
+                    enabled=True,
+                    probe_steps=tuple(int(step) for step in selected_steps),
+                    probe_branch=str(coupling_branch),
+                    collect_dt_histograms=False,
+                    collect_maas_maps=False,
+                    collect_distribution=False,
+                    collect_candidate_coupling=True,
+                    candidate_coupling_layers=tuple(int(layer) for layer in selected_layers),
+                    candidate_coupling_label_maps_by_step_layer=selected_label_maps_by_step_layer,
+                    candidate_coupling_head_indices_by_layer=head_indices_by_layer,
+                    stop_after_last_probe_step=True,
+                ),
+                causal=Wan21T2VCausalAttentionConfig(enabled=False),
+            )
+
+            _, state = _run_wan21_t2v_once_with_patch(
+                pipeline=pipeline,
+                patch_cfg=patch_cfg,
+                prompt=prompt,
+                size=size,
+                frame_num=frame_num,
+                shift=shift,
+                sample_solver=sample_solver,
+                sampling_steps=sampling_steps,
+                guide_scale=guide_scale,
+                seed=seed,
+                offload_model=offload_model,
+            )
+            if dist.is_initialized():
+                dist.barrier()
+            if runtime.rank != 0:
+                return None
+
+            self_attention_coupling_pairwise_rows = state.export_candidate_coupling_rows()
+            _save_csv(pairwise_csv_path, self_attention_coupling_pairwise_rows)
+
+            anchor_payload = _build_wan21_t2v_anchor_union_payload(
+                candidate_region_cache=candidate_region_cache,
+                anchor_step=int(trajectory_consensus_sa_anchor_step),
+                anchor_layer=int(trajectory_consensus_sa_anchor_layer),
+            )
+            pairwise_rows_by_step_layer: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+            for row in self_attention_coupling_pairwise_rows:
+                pairwise_rows_by_step_layer[(int(row["step"]), int(row["layer"]))].append(row)
+
+            proposal_rows_by_step_layer: Dict[Tuple[int, int], List[Dict[str, object]]] = defaultdict(list)
+            for row in candidate_weight_rows:
+                proposal_rows_by_step_layer[(int(row["step"]), int(row["layer"]))].append(row)
+
+            feature_tasks = []
+            for step_layer_key, pairwise_group_rows in sorted(pairwise_rows_by_step_layer.items()):
+                if not pairwise_group_rows:
+                    continue
+                label_payload = candidate_region_cache.get(step_layer_key)
+                if label_payload is None:
+                    continue
+                feature_tasks.append(
+                    (
+                        int(step_layer_key[0]),
+                        int(step_layer_key[1]),
+                        pairwise_group_rows,
+                        np.ascontiguousarray(
+                            label_payload["label_map_fhw"].detach().cpu().numpy().astype(np.int16, copy=False)
+                        ),
+                        np.ascontiguousarray(
+                            anchor_payload["mask_fhw"].detach().cpu().numpy().astype(np.bool_, copy=False)
+                        ),
+                        tuple(anchor_payload["centers"]),
+                        proposal_rows_by_step_layer.get(step_layer_key, []),
+                        float(trajectory_consensus_sa_covered_mass_min),
+                    )
+                )
+
+            feature_progress_bar = None
+            if feature_tasks:
+                try:
+                    from tqdm import tqdm
+                    feature_progress_bar = tqdm(
+                        total=int(len(feature_tasks)),
+                        desc="trajectory consensus self-attention features",
+                        unit="item",
+                        leave=True,
+                    )
+                except Exception:
+                    feature_progress_bar = None
+            try:
+                effective_num_workers = _resolve_wan21_t2v_num_workers(
+                    requested_num_workers=int(trajectory_consensus_num_workers),
+                    task_count=int(len(feature_tasks)),
+                )
+                for _, _, feature_rows in _iter_wan21_t2v_parallel_results(
+                    tasks=feature_tasks,
+                    worker_fn=_trajectory_consensus_compute_candidate_feature_task,
+                    num_workers=int(effective_num_workers),
+                ):
+                    self_attention_coupling_candidate_feature_rows.extend(feature_rows)
+                    if feature_progress_bar is not None:
+                        feature_progress_bar.update(1)
+            finally:
+                if feature_progress_bar is not None:
+                    feature_progress_bar.close()
+
+            self_attention_coupling_candidate_feature_rows = sorted(
+                self_attention_coupling_candidate_feature_rows,
+                key=lambda row: (
+                    int(row["step"]),
+                    int(row["layer"]),
+                    int(row["frame"]),
+                    int(row["candidate_index"]),
+                ),
+            )
+            _save_csv(candidate_feature_csv_path, self_attention_coupling_candidate_feature_rows)
+
+            self_attention_coupling_feature_summary_rows = _summarize_wan21_t2v_self_attention_candidate_features(
+                self_attention_coupling_candidate_feature_rows
+            )
+            _save_csv(feature_summary_csv_path, self_attention_coupling_feature_summary_rows)
+
+            self_attention_coupling_temporal_precedence_rows = _summarize_wan21_t2v_self_attention_temporal_precedence(
+                self_attention_coupling_candidate_feature_rows,
+                persistence_window=int(trajectory_consensus_sa_precedence_persistence),
+            )
+            _save_csv(temporal_precedence_csv_path, self_attention_coupling_temporal_precedence_rows)
+
+            plot_paths.extend(
+                _render_wan21_t2v_self_attention_coupling_plots(
+                    output_dir=output_dir,
+                    pairwise_rows=self_attention_coupling_pairwise_rows,
+                    candidate_feature_rows=self_attention_coupling_candidate_feature_rows,
+                    feature_summary_rows=self_attention_coupling_feature_summary_rows,
+                    temporal_precedence_rows=self_attention_coupling_temporal_precedence_rows,
+                    candidate_region_cache=candidate_region_cache,
+                    skip_existing_plots=bool(trajectory_consensus_skip_existing_plots),
+                    num_workers=int(trajectory_consensus_num_workers),
+                )
+            )
+
     if "head_contribution" in stages:
         contribution_branch = str(trajectory_consensus_branch).strip().lower()
         if contribution_branch not in {"cond", "uncond"}:
@@ -5265,6 +7564,10 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
         "num_candidate_weight_rows": int(len(candidate_weight_rows)),
         "num_winner_gap_rows": int(len(winner_gap_rows)),
         "num_head_contribution_rows": int(sum(len(rows) for rows in head_contribution_rows_by_method.values())),
+        "num_self_attention_coupling_pairwise_rows": int(len(self_attention_coupling_pairwise_rows)),
+        "num_self_attention_coupling_candidate_feature_rows": int(len(self_attention_coupling_candidate_feature_rows)),
+        "num_self_attention_coupling_feature_summary_rows": int(len(self_attention_coupling_feature_summary_rows)),
+        "num_self_attention_coupling_temporal_precedence_rows": int(len(self_attention_coupling_temporal_precedence_rows)),
         "plot_paths": list(plot_paths),
     })
 

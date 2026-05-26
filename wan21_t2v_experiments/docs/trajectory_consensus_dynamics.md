@@ -42,8 +42,12 @@ Its useful intervention logic is absorbed into the broader `shared-latent coordi
      - downstream winner-gap drop, entropy increase, clean-winner support drop, and winner-flip statistics.
 
 3. `self-attention candidate coupling`
-   - Question: does self-attention convert many-to-many candidate coupling into sparse and selective candidate-to-candidate coupling?
-   - Main readout: region-to-region coupling matrices, coupling entropy, dominant-link ratio, and candidate compatibility scores.
+   - Question: does self-attention drive candidate convergence, and can its coupling pattern predict which candidate will later win or be eliminated?
+   - Main readout:
+     - local and global region-to-region coupling matrices;
+     - coupling entropy, dominant-link ratio, link margin, mutual consistency, and head agreement;
+     - candidate-level compatibility and chainability scores;
+     - winner-versus-loser early-feature gaps and temporal-precedence analysis against cross-attention proposal strength.
 
 4. `phase-specialization`
    - Question: do different heads specialize into proposal, pruning, commitment, or later grounding?
@@ -81,8 +85,8 @@ One scientific question may rely on several engineering stages, and one engineer
    - Will ablate one selected cross-attention or self-attention head, rerun the downstream denoising trajectory, and measure downstream candidate-competition changes on the clean candidate partition.
 
 4. `self_attention_coupling`
-   - Status: planned, not yet implemented in the current code.
-   - Will cover candidate-to-candidate coupling collapse and compatibility scores.
+   - Status: implemented.
+   - Covers candidate-to-candidate coupling collapse, winner-versus-loser early predictors, and temporal-precedence analysis.
 
 5. `phase_specialization`
    - Status: planned as a secondary analysis.
@@ -119,6 +123,7 @@ This allows later stages to read the cached CSV or tensor files produced by earl
 - `self_attention_coupling`
   - Planned dependency: should reuse candidate-region caches from `candidate_consensus`.
   - Planned dependency: should collect self-attention probabilities for selected heads and selected frame pairs.
+  - Planned dependency: should reuse `trajectory_consensus_candidate_weights.csv` from `candidate_consensus` as the cross-attention proposal baseline, so cross-attention early bias and self-attention early bias can be compared on the same candidate partition.
 
 - `trajectory_graph`
   - Optional appendix dependency: should reuse candidate weights from `candidate_consensus` and coupling scores from `self_attention_coupling`.
@@ -720,75 +725,574 @@ The real question is not merely whether information can propagate forward, but *
 ## 9. Self-Attention Candidate Coupling
 
 This is one of the central planned analyses in the experiment.
-It aims to explain why some candidates survive while others are eliminated.
+It aims to explain why some candidates survive while others are eliminated, and whether self-attention is the module that actually drives this convergence.
 
-### 9.1 Region-to-region coupling
+The central working view is:
 
-For one self-attention head at diffusion step \(s\), layer \(\ell\), query-frame candidate \(R_{f,a}\), and key-frame candidate \(R_{g,b}\), define
+- cross-attention proposes candidate object locations inside each frame;
+- self-attention coordinates those candidate locations across frames;
+- winner selection is not read off from one frame alone, but from whether one candidate is more compatible with a coherent cross-frame trajectory than its competitors.
 
-\[ C_{s,\ell,h}(f,a \to g,b) = \frac{1}{|R_{f,a}|}\sum_{i \in R_{f,a}}\sum_{j \in R_{g,b}} \alpha_{s,\ell,h}(i,j). \]
+### 9.1 Analysis unit and candidate partition
+
+The basic analysis unit is one observation point \((s, \ell)\), where \(s\) is the diffusion step and \(\ell\) is the transformer layer.
+
+At that observation point, for each latent frame \(f\), let
+
+\[ R_{s,\ell,f,1}, \dots, R_{s,\ell,f,K_{s,\ell,f}} \]
+
+be the candidate regions extracted by `candidate_consensus` from the cross-attention `head-mean` map at the same step and layer.
+
+This means the stage is fundamentally layer-wise:
+
+- for fixed step \(s\), it compares how the metrics change across layers \(\ell\);
+- for fixed layer \(\ell\), it compares how the metrics change across diffusion steps \(s\);
+- for selected candidates, it can also follow one ordered observation trace through denoising time.
+
+All self-attention heads inside the same layer are evaluated on the same candidate partition.
+This is important because the scientific goal is not to let each self-attention head define its own regions, but to ask how different self-attention heads treat the same set of motion-planning candidates.
+
+When a layer-level aggregation is needed, let
+
+\[ \mathcal{H}^{\mathrm{sa}}_{\ell} \]
+
+be the selected self-attention head set for layer \(\ell\).
+By default, this set should contain all self-attention heads in that layer.
+An explicit subset is optional and should be used only for focused follow-up analysis.
+
+### 9.2 Eventual-winner anchor and candidate labels
+
+To study why one early candidate later wins, every early candidate needs a later reference target.
+
+Use the cross-attention `head-mean` candidate extraction at step `49`, layer `27` as the anchor observation.
+For each frame \(f\), let the anchor candidate regions be
+
+\[ A_{f,1}, \dots, A_{f,M_f}. \]
+
+Because the final object location can sometimes be split into two or more adjacent candidate regions, define the anchor winner region as the union
+
+\[ W_f = \bigcup_{m=1}^{M_f} A_{f,m}. \]
+
+For one earlier candidate \(R_{s,\ell,f,k}\), define its anchor-overlap score
+
+\[ \Omega_{s,\ell,f,k} = \operatorname{IoU}(R_{s,\ell,f,k}, W_f). \]
+
+Also define its anchor-distance score
+
+\[ d^{\mathrm{anchor}}_{s,\ell,f,k} = \left\| \mu(R_{s,\ell,f,k}) - \mu(W_f) \right\|_2, \]
+
+where \(\mu(\cdot)\) denotes the geometric center of a region.
+
+The primary winner-aligned candidate at observation \((s,\ell,f)\) is
+
+\[ k^{+}_{s,\ell,f} = \arg\max_k \Omega_{s,\ell,f,k}. \]
+
+This definition avoids having to set a hard overlap threshold in the main analysis and ensures that each frame contributes exactly one later-winner reference candidate.
+
+For threshold-based pooled analysis, an optional binary survivor label can also be defined by
+
+\[ y_{s,\ell,f,k} = \mathbf{1}[k = k^{+}_{s,\ell,f}], \]
+
+with optional sensitivity checks based on \(\Omega_{s,\ell,f,k}\) or \(d^{\mathrm{anchor}}_{s,\ell,f,k}\).
+
+For winner-versus-loser comparison, define the strongest loser as the non-winner candidate with the largest cross-attention proposal strength:
+
+\[ k^{-}_{s,\ell,f} = \arg\max_{k \ne k^{+}_{s,\ell,f}} \pi_{s,\ell,f,k}. \]
+
+Here \(\pi_{s,\ell,f,k}\) is the normalized layer-mean candidate weight from Section 7.
+
+### 9.3 Frame-pair protocols: local and global
+
+The stage must cover both local frame consistency and global motion-planning consistency.
+
+For a query frame \(f\), define:
+
+\[ \mathcal{G}_{\mathrm{local}}(f) = \{ g : |g-f| = 1 \}, \]
+
+\[ \mathcal{G}_{\mathrm{all}}(f) = \{ g : g \ne f \}. \]
+
+The stage should report two complementary views:
+
+1. local view
+   - uses only \(g \in \mathcal{G}_{\mathrm{local}}(f)\);
+   - tests whether candidates are coordinated coherently with adjacent frames.
+
+2. global view
+   - uses all \(g \in \mathcal{G}_{\mathrm{all}}(f)\);
+   - summarizes the overall degree to which one candidate is compatible with the rest of the sequence.
+
+For global diagnostics, it is also useful to group frame pairs by signed temporal offset
+
+\[ d = g - f, \qquad d \ne 0, \]
+
+and visualize metrics as functions of \(d\).
+This makes it possible to see whether planning is only local or whether stable links already exist to distant future or past frames.
+
+### 9.4 Region-to-region coupling and candidate-covered mass
+
+For one self-attention head at step \(s\), layer \(\ell\), query-frame candidate \(R_{s,\ell,f,a}\), and key-frame candidate \(R_{s,\ell,g,b}\), define the raw candidate-to-candidate coupling
+
+\[ C_{s,\ell,h}(f,a \to g,b) = \frac{1}{|R_{s,\ell,f,a}|}\sum_{i \in R_{s,\ell,f,a}}\sum_{j \in R_{s,\ell,g,b}} \alpha_{s,\ell,h}(i,j). \]
 
 Here:
 
-- \(i\) is a query token index inside candidate region \(R_{f,a}\);
-- \(j\) is a key token index inside candidate region \(R_{g,b}\);
+- \(i\) is a query token index inside the query candidate;
+- \(j\) is a key token index inside the target candidate;
 - \(\alpha_{s,\ell,h}(i,j)\) is the self-attention probability from query token \(i\) to key token \(j\).
 
-Normalize over all candidate regions in the target frame:
+Let the union of all candidates in frame \(g\) be
 
-\[ \widetilde C_{s,\ell,h}(f,a \to g,b) = \frac{C_{s,\ell,h}(f,a \to g,b)}{\sum_{b'} C_{s,\ell,h}(f,a \to g,b') + \varepsilon}. \]
+\[ \mathcal{R}_{s,\ell,g} = \bigcup_{b=1}^{K_{s,\ell,g}} R_{s,\ell,g,b}. \]
 
-### 9.2 Candidate-coupling entropy
+Define the candidate-covered mass
 
-For one query candidate \(R_{f,a}\), define
+\[ M_{s,\ell,h}(f,a \to g) = \frac{1}{|R_{s,\ell,f,a}|}\sum_{i \in R_{s,\ell,f,a}}\sum_{j \in \mathcal{R}_{s,\ell,g}} \alpha_{s,\ell,h}(i,j). \]
 
-\[ H_{s,\ell,h}^{\mathrm{sa}}(f,a \to g) = -\sum_b \widetilde C_{s,\ell,h}(f,a \to g,b)\log(\widetilde C_{s,\ell,h}(f,a \to g,b) + \varepsilon). \]
+This quantity measures how much of the query candidate's attention to frame \(g\) actually falls inside the extracted candidate support, rather than leaking into background tokens.
 
-If one query candidate spreads attention across many future candidates, this entropy is high.
-If it becomes concentrated on one future candidate, this entropy is low.
+Then define the candidate-normalized coupling
 
-### 9.3 Dominant-link ratio
+\[ \widetilde C_{s,\ell,h}(f,a \to g,b) = \frac{C_{s,\ell,h}(f,a \to g,b)}{M_{s,\ell,h}(f,a \to g) + \varepsilon}. \]
 
-\[ D_{s,\ell,h}^{\mathrm{sa}}(f,a \to g) = \max_b \widetilde C_{s,\ell,h}(f,a \to g,b). \]
+This normalization answers a conditional question:
+given that the attention mass falls on candidate support in frame \(g\), how is that mass distributed across the candidates in that frame?
 
-This directly measures whether candidate-to-candidate interaction becomes close to one-to-one.
+Both versions are needed:
 
-### 9.4 Candidate compatibility score
+- raw metrics computed directly from \(C_{s,\ell,h}\) or \(M_{s,\ell,h}\);
+- filtered or weighted metrics that use \(M_{s,\ell,h}\) as an optional reliability gate.
 
-For one layer-level summary, first average normalized coupling over a selected self-attention head set \(\mathcal{H}_{\ell}^{\mathrm{sa}}\):
+The filtered version is optional because the extracted candidate support already covers most of the meaningful cross-attention mass in many cases.
+Nevertheless, it is important to keep it as a controlled comparison, since some self-attention heads may still place substantial mass outside the candidate support.
 
-\[ \overline C_{s,\ell}(f,a \to g,b) = \frac{1}{|\mathcal{H}_{\ell}^{\mathrm{sa}}|}\sum_{h \in \mathcal{H}_{\ell}^{\mathrm{sa}}} \widetilde C_{s,\ell,h}(f,a \to g,b). \]
+### 9.5 Pairwise sharpness metrics
 
-Then define the candidate compatibility score
+For one query candidate \(R_{s,\ell,f,a}\) and one target frame \(g\), define the following metrics on the candidate-normalized coupling.
 
-\[ \Lambda_{s,\ell}(f,k) = \sum_{k'} \overline C_{s,\ell}(f-1,k' \to f,k) + \sum_{k'} \overline C_{s,\ell}(f,k \to f+1,k'). \]
+1. coupling entropy
 
-This score asks whether candidate \(R_{f,k}\) is well connected to plausible candidates in neighboring frames.
+\[ H^{\mathrm{sa}}_{s,\ell,h}(f,a \to g) = -\sum_b \widetilde C_{s,\ell,h}(f,a \to g,b)\log(\widetilde C_{s,\ell,h}(f,a \to g,b) + \varepsilon). \]
 
-The working hypothesis is:
+This measures how diffusely the query candidate spreads its support across candidates in the target frame.
+High entropy means unresolved many-to-many coupling.
+Low entropy means the head is concentrating on one or a few specific target candidates.
 
-- candidates with weak compatibility are more likely to be suppressed later;
-- candidates that survive into the final trajectory should form a high-compatibility chain across frames.
+2. dominant-link ratio
 
-### 9.5 Planned implementation protocol
+\[ D^{\mathrm{sa}}_{s,\ell,h}(f,a \to g) = \max_b \widetilde C_{s,\ell,h}(f,a \to g,b). \]
+
+This directly measures whether one target candidate dominates the link.
+
+3. link margin
+
+Let \(\widetilde C^{(1)}_{s,\ell,h}(f,a \to g)\) and \(\widetilde C^{(2)}_{s,\ell,h}(f,a \to g)\) be the largest and second-largest values of \(\widetilde C_{s,\ell,h}(f,a \to g,b)\) over \(b\).
+Define
+
+\[ \Delta^{\mathrm{link}}_{s,\ell,h}(f,a \to g) = \widetilde C^{(1)}_{s,\ell,h}(f,a \to g) - \widetilde C^{(2)}_{s,\ell,h}(f,a \to g). \]
+
+This margin is more sensitive than the dominant-link ratio when two target candidates are still in a close competition.
+If the top two links are nearly tied, the system has not yet clearly committed.
+If the margin becomes large, the system is selecting one target candidate over its nearest competitor.
+
+### 9.6 Layer-mean coupling, mutual consistency, and head agreement
+
+When a layer-level summary is needed, average the candidate-normalized coupling over the selected self-attention heads:
+
+\[ \overline C_{s,\ell}(f,a \to g,b) = \frac{1}{|\mathcal{H}^{\mathrm{sa}}_{\ell}|}\sum_{h \in \mathcal{H}^{\mathrm{sa}}_{\ell}} \widetilde C_{s,\ell,h}(f,a \to g,b). \]
+
+This layer-mean coupling is the default object for candidate-level compatibility analysis.
+
+Also define the layer-mean candidate-covered mass
+
+\[ \overline M_{s,\ell}(f,a \to g) = \frac{1}{|\mathcal{H}^{\mathrm{sa}}_{\ell}|}\sum_{h \in \mathcal{H}^{\mathrm{sa}}_{\ell}} M_{s,\ell,h}(f,a \to g). \]
+
+From the layer-mean coupling, define the layer-level versions of the sharpness metrics:
+
+\[ \overline H^{\mathrm{sa}}_{s,\ell}(f,a \to g) = -\sum_b \overline C_{s,\ell}(f,a \to g,b)\log(\overline C_{s,\ell}(f,a \to g,b) + \varepsilon), \]
+
+\[ \overline D^{\mathrm{sa}}_{s,\ell}(f,a \to g) = \max_b \overline C_{s,\ell}(f,a \to g,b). \]
+
+Let \(\overline C^{(1)}_{s,\ell}(f,a \to g)\) and \(\overline C^{(2)}_{s,\ell}(f,a \to g)\) be the largest and second-largest values of \(\overline C_{s,\ell}(f,a \to g,b)\) over \(b\).
+Define the layer-level link margin
+
+\[ \overline{\Delta}^{\mathrm{link}}_{s,\ell}(f,a \to g) = \overline C^{(1)}_{s,\ell}(f,a \to g) - \overline C^{(2)}_{s,\ell}(f,a \to g). \]
+
+Define mutual consistency between two candidates in different frames by
+
+\[ \mathrm{MC}_{s,\ell}(f,a; g,b) = \overline C_{s,\ell}(f,a \to g,b)\,\overline C_{s,\ell}(g,b \to f,a). \]
+
+This score is high only when the pair supports each other in both directions.
+It is intended as one early sign that two candidates belong to the same stable trajectory chain.
+
+Next define head agreement.
+For one head \(h\), let the winning target candidate in frame \(g\) be
+
+\[ b^{\star}_{s,\ell,h}(f,a \to g) = \arg\max_b \widetilde C_{s,\ell,h}(f,a \to g,b). \]
+
+Here \(b\) always refers to the shared `head-mean` candidate partition in key frame \(g\).
+It is **not** a head-specific candidate index from a per-head region extraction.
+Therefore the vote comparison across heads is well defined.
+
+Then define the head-vote distribution over target candidates
+
+\[ V_{s,\ell}(f,a \to g,b) = \frac{1}{|\mathcal{H}^{\mathrm{sa}}_{\ell}|}\sum_{h \in \mathcal{H}^{\mathrm{sa}}_{\ell}} \mathbf{1}[b^{\star}_{s,\ell,h}(f,a \to g) = b]. \]
+
+The head-agreement score is
+
+\[ A^{\mathrm{head}}_{s,\ell}(f,a \to g) = \max_b V_{s,\ell}(f,a \to g,b). \]
+
+If different self-attention heads vote for very different target candidates, agreement is low.
+If many heads vote for the same target candidate, agreement is high.
+This is a direct measure of whether the layer is internally converging toward one trajectory continuation.
+
+### 9.7 Candidate compatibility and chainability
+
+The metrics above are defined for one query candidate and one target frame.
+To explain winner selection, we also need candidate-level summaries that aggregate over target frames.
+
+For any pairwise metric \(\Psi_{s,\ell}(f,k \to g)\), define the local and global candidate-level averages
+
+\[ \Psi_{s,\ell,\mathrm{local}}(f,k) = \frac{1}{|\mathcal{G}_{\mathrm{local}}(f)|}\sum_{g \in \mathcal{G}_{\mathrm{local}}(f)} \Psi_{s,\ell}(f,k \to g), \]
+
+\[ \Psi_{s,\ell,\mathrm{global}}(f,k) = \frac{1}{|\mathcal{G}_{\mathrm{all}}(f)|}\sum_{g \in \mathcal{G}_{\mathrm{all}}(f)} \Psi_{s,\ell}(f,k \to g). \]
+
+In implementation, boundary frames should use only valid frame pairs in the denominator.
+This rule applies to all local and global averages below.
+
+First define local compatibility.
+For one candidate \(R_{s,\ell,f,k}\), let
+
+\[ \Lambda^{\mathrm{in}}_{s,\ell,\mathrm{local}}(f,k) = \sum_{k'} \overline C_{s,\ell}(f-1,k' \to f,k), \]
+
+\[ \Lambda^{\mathrm{out}}_{s,\ell,\mathrm{local}}(f,k) = \sum_{k'} \overline C_{s,\ell}(f,k \to f+1,k'). \]
+
+Then define the local compatibility score
+
+\[ \Lambda_{s,\ell,\mathrm{local}}(f,k) = \Lambda^{\mathrm{in}}_{s,\ell,\mathrm{local}}(f,k) + \Lambda^{\mathrm{out}}_{s,\ell,\mathrm{local}}(f,k). \]
+
+This asks whether the candidate is well connected to neighboring frames on both sides.
+
+Now define the local chainability score
+
+\[ \Gamma_{s,\ell,\mathrm{local}}(f,k) = \min\!\left( \Lambda^{\mathrm{in}}_{s,\ell,\mathrm{local}}(f,k),\ \Lambda^{\mathrm{out}}_{s,\ell,\mathrm{local}}(f,k) \right). \]
+
+The minimum is important.
+A candidate should not be considered a strong trajectory node if it only receives support from the previous frame but does not link onward, or vice versa.
+
+For global motion-planning analysis, define
+
+\[ \Lambda^{\mathrm{in}}_{s,\ell,\mathrm{global}}(f,k) = \frac{1}{|\{g : g < f\}|}\sum_{g < f}\sum_b \overline C_{s,\ell}(g,b \to f,k), \]
+
+\[ \Lambda^{\mathrm{out}}_{s,\ell,\mathrm{global}}(f,k) = \frac{1}{|\{g : g > f\}|}\sum_{g > f}\sum_b \overline C_{s,\ell}(f,k \to g,b). \]
+
+Then define
+
+\[ \Lambda_{s,\ell,\mathrm{global}}(f,k) = \Lambda^{\mathrm{in}}_{s,\ell,\mathrm{global}}(f,k) + \Lambda^{\mathrm{out}}_{s,\ell,\mathrm{global}}(f,k), \]
+
+\[ \Gamma_{s,\ell,\mathrm{global}}(f,k) = \min\!\left( \Lambda^{\mathrm{in}}_{s,\ell,\mathrm{global}}(f,k),\ \Lambda^{\mathrm{out}}_{s,\ell,\mathrm{global}}(f,k) \right). \]
+
+The local scores emphasize adjacent-frame continuity.
+The global scores emphasize whether one candidate is compatible with the broader motion state of the whole video.
+
+At the first or last frame, some directions are missing.
+In implementation, missing local or global directions should be treated as unavailable measurements rather than forced zeros, and the downstream aggregation should average only over valid terms.
+
+For mutual consistency, the candidate-level summary should first take the best reciprocal partner in each target frame:
+
+\[ \mathrm{MC}^{\max}_{s,\ell}(f,k \to g) = \max_b \mathrm{MC}_{s,\ell}(f,k; g,b). \]
+
+Then use \(\mathrm{MC}^{\max}_{s,\ell,\mathrm{local}}(f,k)\) and \(\mathrm{MC}^{\max}_{s,\ell,\mathrm{global}}(f,k)\) through the averaging rule above.
+
+### 9.8 Cross-attention proposal baseline reused from `candidate_consensus`
+
+The self-attention coupling stage must not be interpreted in isolation.
+To answer whether self-attention is truly selecting the winner, it must be compared against what cross-attention already preferred.
+
+The good news is that `candidate_consensus` already saves the quantities needed for this baseline:
+
+- `trajectory_consensus_candidate_weights.csv` stores per-head candidate weights \(a_{s,\ell,h,f,k}\);
+- `trajectory_consensus_winner_gap.csv` stores layer-level winner gap and candidate entropy;
+- from those weights we can recover the normalized layer-mean proposal strength \(\pi_{s,\ell,f,k}\) from Section 7.
+
+These cached values should be reused directly.
+No new candidate extraction is needed.
+
+One implementation rule must be stated explicitly:
+all cross-head comparisons in this subsection are performed on the shared `head-mean` candidate partition \(R_{s,\ell,f,k}\) from Section 9.1.
+They do **not** compare candidate indices from different heads' own region extractions.
+Instead, every head is asked how much mass it assigns to the same reference candidates.
+
+To measure whether cross-attention heads already lean toward one candidate, define the per-head proposal winner
+
+\[ k^{\star}_{s,\ell,h,f} = \arg\max_k a_{s,\ell,h,f,k}. \]
+
+Here \(a_{s,\ell,h,f,k}\) is the mass that cross-attention head \(h\) assigns to the shared candidate region \(R_{s,\ell,f,k}\).
+So the index \(k\) is comparable across heads because the partition is fixed before the per-head mass is measured.
+
+Then define the cross-attention head-vote share for candidate \(k\):
+
+\[ S^{\mathrm{ca}}_{s,\ell,f,k} = \frac{1}{H_{\ell}}\sum_{h=1}^{H_{\ell}} \mathbf{1}[k^{\star}_{s,\ell,h,f} = k]. \]
+
+The overall cross-attention proposal agreement is
+
+\[ A^{\mathrm{ca}}_{s,\ell,f} = \max_k S^{\mathrm{ca}}_{s,\ell,f,k}. \]
+
+This baseline is important because one possible outcome is that the later winner already had a weak cross-attention advantage.
+Another possible outcome is that cross-attention is still nearly tied while self-attention already shows a clear chainability or agreement advantage.
+The second case would be much stronger evidence that self-attention is actively driving convergence.
+
+### 9.9 Winner-versus-loser feature analysis
+
+This subsection is the most directly tied to the scientific goal:
+which properties make one early candidate survive while another candidate is later eliminated?
+
+For every observation triple \((s,\ell,f)\), compare the winner-aligned candidate \(k^{+}_{s,\ell,f}\) with the strongest loser \(k^{-}_{s,\ell,f}\).
+
+For any candidate-level metric \(\phi\), define the winner-minus-loser gap
+
+\[ \Delta \phi_{s,\ell,f} = \phi(s,\ell,f,k^{+}_{s,\ell,f}) - \phi(s,\ell,f,k^{-}_{s,\ell,f}). \]
+
+The primary feature list should include at least:
+
+- cross-attention proposal strength \(\pi_{s,\ell,f,k}\);
+- cross-attention vote share \(S^{\mathrm{ca}}_{s,\ell,f,k}\);
+- local and global averages of layer-mean candidate-covered mass \(\overline M\), in both raw and filtered variants;
+- local and global averages of layer-mean coupling entropy \(\overline H^{\mathrm{sa}}\);
+- local and global averages of layer-mean dominant-link ratio \(\overline D^{\mathrm{sa}}\);
+- local and global averages of layer-mean link margin \(\overline{\Delta}^{\mathrm{link}}\);
+- local and global averages of mutual consistency \(\mathrm{MC}^{\max}\);
+- local and global averages of self-attention head agreement \(A^{\mathrm{head}}\);
+- local compatibility \(\Lambda_{\mathrm{local}}\);
+- local chainability \(\Gamma_{\mathrm{local}}\);
+- global compatibility \(\Lambda_{\mathrm{global}}\);
+- global chainability \(\Gamma_{\mathrm{global}}\).
+
+For pooled statistics across many candidates, the stage should provide three analyses.
+
+1. continuous overlap correlation
+   - correlate each feature with the anchor-overlap score \(\Omega_{s,\ell,f,k}\);
+   - this tests whether the feature changes smoothly with how close the early candidate is to the eventual anchor region.
+   - In implementation, the per-\((s,\ell)\) feature summary stores one scalar overlap-correlation field `anchor_iou_correlation`, while the visualization layer additionally exposes selected feature-versus-\(\Omega\) scatter plots for direct inspection.
+
+2. winner-versus-loser gap analysis
+   - use \(\Delta \phi_{s,\ell,f}\) to measure whether the winner already has a systematic early advantage over the strongest loser;
+   - large positive values indicate an early winner-specific signal.
+
+3. ranking power analysis
+   - treat \(y_{s,\ell,f,k} = \mathbf{1}[k = k^{+}_{s,\ell,f}]\) as the binary label;
+   - evaluate how well each feature ranks winner-aligned candidates above non-winners, for example by AUROC or average precision.
+
+The interpretation is:
+
+- if a feature has high ranking power very early, it is an informative early signature of survival;
+- if a feature only becomes discriminative late, it is more likely a consequence of convergence than a cause or precursor;
+- if self-attention features become predictive before cross-attention proposal strength does, that is direct evidence that self-attention is not merely following the winner but helping to determine it.
+
+### 9.10 Temporal-precedence analysis
+
+The previous subsection measures whether a feature distinguishes winners from losers.
+Temporal-precedence asks a stronger question:
+which feature family separates winner from loser first?
+
+Let the selected observation points be ordered by actual denoising execution order:
+
+\[ t = 1, \dots, T, \qquad (s_t, \ell_t). \]
+
+For one frame \(f\) and one candidate-level feature \(\phi\), define
+
+\[ \Delta \phi_t(f) = \phi(s_t,\ell_t,f,k^{+}_{s_t,\ell_t,f}) - \phi(s_t,\ell_t,f,k^{-}_{s_t,\ell_t,f}). \]
+
+The first stable separation time of feature \(\phi\) on frame \(f\) is
+
+\[ \tau_{\phi}(f) = \min \left\{ t : \Delta \phi_{t'}(f) > 0 \text{ for all } t' \in \{t, \dots, t+r-1\} \right\}, \]
+
+where \(r\) is a small persistence window.
+
+This definition intentionally avoids declaring a precedence event from a one-step fluctuation.
+It asks when the winner's advantage becomes consistently positive.
+
+The main comparison should be:
+
+- cross-attention proposal features such as \(\pi\) or \(S^{\mathrm{ca}}\);
+- self-attention coupling features such as \(\Gamma_{\mathrm{local}}\), \(\Gamma_{\mathrm{global}}\), \(\mathrm{MC}\), and \(A^{\mathrm{head}}\).
+
+If self-attention features achieve stable winner-versus-loser separation earlier than cross-attention proposal features, that strongly supports the hypothesis that self-attention is actively driving candidate convergence.
+
+### 9.11 Planned implementation protocol
 
 The planned `self_attention_coupling` stage should:
 
-1. reuse clean candidate regions from `candidate_consensus`;
-2. collect self-attention probabilities for selected heads, selected steps, and selected frame pairs;
-3. compute \(C_{s,\ell,h}(f,a \to g,b)\), \(\widetilde C_{s,\ell,h}(f,a \to g,b)\), \(H_{s,\ell,h}^{\mathrm{sa}}(f,a \to g)\), \(D_{s,\ell,h}^{\mathrm{sa}}(f,a \to g)\), and \(\Lambda_{s,\ell}(f,k)\);
-4. compare whether low-compatibility candidates are precisely the ones later losing winner-gap competition;
-5. later combine with `candidate_intervention` to test whether removing one self-attention head weakens the compatibility chain of the clean winner.
+1. reuse clean candidate-region caches from `candidate_consensus`;
+2. reuse `trajectory_consensus_candidate_weights.csv` to recover the cross-attention proposal baseline;
+3. collect self-attention probabilities for selected heads, selected steps, selected layers, and selected frame pairs;
+4. compute pairwise coupling statistics \(C\), \(M\), \(\widetilde C\), \(H^{\mathrm{sa}}\), \(D^{\mathrm{sa}}\), and \(\Delta^{\mathrm{link}}\);
+5. compute layer-level summaries \(\overline C\), \(\mathrm{MC}\), and \(A^{\mathrm{head}}\);
+6. aggregate them into candidate-level local and global scores such as \(\Lambda\) and \(\Gamma\);
+7. construct the anchor-overlap score \(\Omega\), the winner-aligned candidate \(k^{+}\), and the strongest loser \(k^{-}\);
+8. compare winner-aligned candidates and losers by overlap correlation, winner-minus-loser gaps, and ranking power;
+9. run temporal-precedence analysis to compare self-attention features against the cross-attention proposal baseline;
+10. later combine with `candidate_intervention` so that heads selected by this stage can be tested causally.
 
-### 9.6 Planned visualizations
+### 9.12 Planned visualizations
 
-The stage should generate:
+Because this stage simultaneously contains step, layer, head, frame, and candidate dimensions, one single figure type is never sufficient.
+The visualization design should therefore be explicitly split into three layers:
 
-- candidate-to-candidate coupling heatmaps;
-- coupling-entropy curves over diffusion steps;
-- dominant-link curves over diffusion steps;
-- compatibility overlays on candidate masks;
-- selected qualitative panels showing many-to-many coupling changing into sparse one-to-one coupling.
+- Layer I: mechanistic qualitative figures
+  - answer: what exactly is the model attending to, and how does one candidate defeat another?
+- Layer II: mesoscopic trend figures
+  - answer: how do the important quantities evolve across time offsets and observation order?
+- Layer III: global scan figures
+  - answer: where in the step-layer plane should we look first?
+
+The following figure families are the recommended default set.
+
+#### Layer I. Mechanistic qualitative figures
+
+1. candidate score overlay panel
+   - Purpose:
+     - directly show which candidate regions are already favored inside one frame.
+   - Content:
+     - for one selected observation \((s,\ell)\), draw the candidate masks on selected frames;
+     - color each candidate region by one selected scalar, such as \(\pi\), \(\Gamma_{\mathrm{local}}\), \(\Gamma_{\mathrm{global}}\), or \(\mathrm{MC}^{\max}_{\mathrm{global}}\);
+     - mark the winner-aligned candidate and the strongest loser with different contour colors.
+   - Drawing method:
+     - each subplot corresponds to one frame;
+     - candidate regions are filled with a continuous color scale according to the selected metric;
+     - annotate the candidate index and the scalar value near the candidate centroid.
+   - Interpretation:
+     - if the winner region is already visually more intense than its competitors, that metric is an early winner signature;
+     - if the loser still looks equally strong, then convergence has not yet occurred under that metric.
+   - Current default implementation:
+     - render one panel for each of `proposal_pi`, `global_chainability`, and `global_mutual_consistency`;
+     - choose one representative observation \((s,\ell)\), then draw several evenly spaced frames and always include the most informative representative frame used by the evolution analysis.
+
+2. winner-versus-loser coupling storyboard
+   - Purpose:
+     - show the actual candidate-to-candidate routing pattern, instead of only showing aggregated statistics.
+   - Content:
+     - choose one observation \((s,\ell)\), one query frame \(f\), and compare two query candidates:
+       - the winner-aligned candidate \(k^{+}\),
+       - the strongest loser \(k^{-}\);
+     - for each query candidate, show how it couples to candidates in several target frames.
+   - Drawing method:
+     - the first panel highlights the chosen query candidate in its own frame;
+     - the following panels show the target-frame candidate masks, with each target candidate colored by either raw coupling \(C\) or normalized coupling \(\widetilde C\);
+     - the panel title should also report candidate-covered mass \(M\), so the reader can judge whether the coupling is reliable.
+   - Interpretation:
+     - a winner candidate should gradually show more selective and coherent cross-frame routing;
+     - a loser candidate often remains diffuse, fragmented, or inconsistent across target frames.
+   - Current default implementation:
+     - choose one representative observation \((s,\ell)\) and one representative query frame \(f\);
+     - compare the winner-aligned candidate and the strongest loser on the same query frame;
+     - the target-frame set always contains both local neighbors when available and representative global frames such as the beginning, middle, and end of the sequence.
+
+3. winner-loser feature evolution panel
+   - Purpose:
+     - show when the winner starts separating from the loser along the denoising trajectory.
+   - Content:
+     - for one selected feature, plot the winner value and strongest-loser value across ordered observation index \(t\).
+   - Drawing method:
+     - x-axis is observation index \(t\), ordered by actual denoising execution order;
+     - y-axis is one selected feature, such as \(\pi\), \(\Gamma_{\mathrm{global}}\), or \(\mathrm{MC}^{\max}_{\mathrm{global}}\);
+     - optionally add a vertical marker for the first stable separation time \(\tau_{\phi}\).
+   - Interpretation:
+     - if the winner curve consistently rises above the loser curve early, the feature is a plausible early selection signal;
+     - if the two curves remain entangled until late, the feature is more likely a consequence of convergence than a precursor.
+   - Current default implementation:
+     - use one representative frame and render a multi-panel figure rather than only one scalar feature;
+     - the default feature set is `proposal_pi`, `proposal_vote_share`, `local_chainability`, `global_chainability`, `global_mutual_consistency`, and `global_head_agreement`;
+     - the stable-separation marker \(\tau_{\phi}\) is overlaid when it exists.
+
+#### Layer II. Mesoscopic trend figures
+
+4. signed-offset planning curve
+   - Purpose:
+     - measure whether self-attention only enforces local continuity or already coordinates long-range motion structure.
+   - Content:
+     - summarize one pairwise metric as a function of signed frame offset \(d = g-f\), for example entropy, dominant-link ratio, link margin, or head agreement.
+   - Drawing method:
+     - x-axis is signed offset \(d\);
+     - y-axis is the selected metric averaged over candidates at one observation \((s,\ell)\);
+     - plot several representative observations on the same figure as separate curves.
+   - Interpretation:
+     - if later or stronger planning observations show lower entropy and larger link margin even at large \(|d|\), the model is not only doing local smoothing but also organizing global motion.
+   - Current default implementation:
+     - render a four-panel figure for entropy, dominant-link ratio, link margin, and head agreement;
+     - compare a small set of representative observations sampled from early, middle, and late parts of the observation order.
+
+5. cross-attention versus self-attention competition curve
+   - Purpose:
+     - directly compare whether early winner bias first appears in cross-attention proposal or in self-attention coordination.
+   - Content:
+     - place winner-minus-loser gap curves of selected CA features and selected SA features on the same observation-order axis.
+   - Drawing method:
+     - x-axis is observation index \(t\);
+     - y-axis is the frame-averaged winner-minus-loser gap;
+     - recommended CA features are \(\pi\) and \(S^{\mathrm{ca}}\);
+     - recommended SA features are \(\Gamma_{\mathrm{local}}\), \(\Gamma_{\mathrm{global}}\), \(\mathrm{MC}^{\max}_{\mathrm{global}}\), and \(A^{\mathrm{head}}_{\mathrm{global}}\).
+   - Interpretation:
+     - if SA curves pull away from zero earlier than CA curves, that supports the hypothesis that self-attention actively drives convergence;
+     - if CA already shows a clear gap first, then SA may be amplifying an existing proposal bias rather than creating it.
+   - Current default implementation:
+     - draw one shared plot whose CA curves are `proposal_pi` and `proposal_vote_share`;
+     - the default SA curves are `local_chainability`, `global_chainability`, `global_mutual_consistency`, and `global_head_agreement`.
+
+6. temporal-precedence summary panel
+   - Purpose:
+     - compress many winner-loser evolution curves into one ranking of which feature family separates first.
+   - Content:
+     - compare \(\tau_{\phi}\) across features.
+   - Drawing method:
+     - the detailed figure should still be the observation-order curve from item 3;
+     - the summary figure can be a bar chart or small table of mean precedence index across frames.
+   - Interpretation:
+     - this panel is not the primary evidence by itself;
+     - it is a compact summary of the richer temporal curves.
+   - Current default implementation:
+     - output one bar chart of mean first-stable-separation index across frames.
+
+#### Layer III. Global scan figures
+
+7. winner-loser gap heatmap
+   - Purpose:
+     - quickly locate where one feature most strongly distinguishes winners from losers.
+   - Content:
+     - one heatmap per feature.
+   - Drawing method:
+     - x-axis is layer, y-axis is step;
+     - the value is the frame-averaged winner-minus-loser gap \(\Delta \phi_{s,\ell,f}\).
+   - Interpretation:
+     - use this as a navigation map, not as the final mechanistic evidence;
+     - the role of this figure is to tell us which observations deserve closer qualitative inspection.
+   - Current default implementation:
+     - save these heatmaps under the Layer III navigation directory, separate from the qualitative and trend figures, so they are visually de-emphasized.
+
+8. ranking-power heatmap
+   - Purpose:
+     - identify which features are genuinely predictive of survival, rather than only large in magnitude.
+   - Content:
+     - one heatmap per feature.
+   - Drawing method:
+     - x-axis is layer, y-axis is step;
+     - the value is AUROC or average precision for predicting \(y_{s,\ell,f,k}\).
+   - Interpretation:
+     - high ranking power early in diffusion is strong evidence that the feature contains useful selection information.
+
+9. optional diagnostic scatter plot
+   - Purpose:
+     - check whether one feature changes smoothly with the anchor-overlap score \(\Omega\), or whether its apparent usefulness is driven by a few outliers.
+   - Content:
+     - scatter one selected feature against \(\Omega\).
+   - Drawing method:
+     - x-axis is the feature value, y-axis is \(\Omega\);
+     - color points by winner versus loser when possible.
+   - Interpretation:
+     - this is a diagnostic tool, not a primary result figure.
+   - Current default implementation:
+     - render selected diagnostic scatters for `proposal_pi`, `global_chainability`, and `global_mutual_consistency`.
+
+In summary, Layer I figures should be treated as the primary mechanistic evidence, Layer II figures as the main temporal-trend analysis, and Layer III figures only as large-scale navigation maps.
 
 ## 10. Optional Appendix: Trajectory Graph and Dynamic Programming
 
@@ -842,7 +1346,7 @@ For top-\(K\) paths, beam search is the recommended first implementation.
 The intended mechanistic interpretation is now centered on Sections 8 and 9.
 
 - seeds perturb early candidate weights \(a_{s,\ell,h,f,k}\) and therefore also perturb the clean winner gap \(G_{s,\ell,f}\);
-- seeds also perturb candidate-to-candidate compatibility scores \(C_{s,\ell,h}(f,a \to g,b)\) and \(\Lambda_{s,\ell}(f,k)\);
+- seeds also perturb candidate-to-candidate compatibility scores \(C_{s,\ell,h}(f,a \to g,b)\), chainability scores \(\Gamma_{s,\ell,\mathrm{local}}(f,k)\) and \(\Gamma_{s,\ell,\mathrm{global}}(f,k)\), mutual consistency \(\mathrm{MC}_{s,\ell}(f,a;g,b)\), and head agreement \(A^{\mathrm{head}}_{s,\ell}(f,a \to g)\);
 - when several candidates are close in score, a small perturbation can change the clean winner identity;
 - later layers and later diffusion steps then amplify that early difference through residual accumulation and self-attention coordination.
 
@@ -851,6 +1355,7 @@ The main tools for testing it are therefore:
 
 - head intervention on candidate competition;
 - self-attention candidate coupling;
+- cross-attention proposal baseline versus self-attention precedence comparison;
 - phase-specialization analysis on top of those two.
 
 ## 12. Phase Specialization
@@ -965,7 +1470,9 @@ Planned later outputs include:
 
 - `trajectory_consensus_intervention.csv`
 - `trajectory_consensus_intervention_plots/`
-- `trajectory_consensus_self_attention_coupling.csv`
+- `trajectory_consensus_self_attention_coupling_pairwise.csv`
+- `trajectory_consensus_self_attention_coupling_candidate_features.csv`
+- `trajectory_consensus_self_attention_coupling_temporal_precedence.csv`
 - `trajectory_consensus_self_attention_plots/`
 - `trajectory_consensus_phase_scores.csv`
 - optional `trajectory_consensus_trajectory_graph.csv`
@@ -978,9 +1485,9 @@ The recommended workflow is:
 1. run `cross_attention_token_viz` and save reusable cross-attention maps;
 2. optionally run `head_trajectory_dynamics` if early-alignment scatter plots are needed;
 3. run `trajectory_consensus_dynamics` with `trajectory_consensus_stages=candidate_consensus`;
-4. run `trajectory_consensus_dynamics` with `trajectory_consensus_stages=head_contribution`;
-5. later run the planned `candidate_intervention` stage on a smaller set of selected source heads;
-6. later run the planned `self_attention_coupling` stage;
+4. run the planned `self_attention_coupling` stage, because it reuses the cached candidate partition and helps identify the most interesting self-attention heads and candidate features;
+5. run `trajectory_consensus_dynamics` with `trajectory_consensus_stages=head_contribution`;
+6. later run the planned `candidate_intervention` stage on a smaller set of selected source heads selected from the earlier analyses;
 7. run `phase_specialization` only after the earlier caches exist.
 
 Rerun any completed stage with `trajectory_consensus_plot_only_from_csv=True` whenever only visualization updates are needed.
