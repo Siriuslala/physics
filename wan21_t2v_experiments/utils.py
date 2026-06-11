@@ -21,11 +21,12 @@ import csv
 import gc
 import json
 import math
+import multiprocessing as mp
 import os
 import random
 import re
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -127,10 +128,32 @@ def _iter_wan21_t2v_parallel_results(
             yield worker_fn(task)
         return
 
-    with ProcessPoolExecutor(max_workers=int(effective_num_workers)) as executor:
-        futures = [executor.submit(worker_fn, task) for task in tasks]
-        for future in as_completed(futures):
-            yield future.result()
+    max_in_flight = int(effective_num_workers)
+    task_iter = iter(tasks)
+    pending_futures = set()
+
+    spawn_context = mp.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=int(effective_num_workers),
+        mp_context=spawn_context,
+    ) as executor:
+        for _ in range(max_in_flight):
+            try:
+                pending_futures.add(executor.submit(worker_fn, next(task_iter)))
+            except StopIteration:
+                break
+
+        while pending_futures:
+            completed_futures, pending_futures = wait(
+                pending_futures,
+                return_when=FIRST_COMPLETED,
+            )
+            for future in completed_futures:
+                yield future.result()
+                try:
+                    pending_futures.add(executor.submit(worker_fn, next(task_iter)))
+                except StopIteration:
+                    continue
 
 def _save_json(path: str, obj):
     with open(path, "w", encoding="utf-8") as f:

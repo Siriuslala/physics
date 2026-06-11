@@ -319,8 +319,8 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - `target_object_words`
   - `reuse_cross_attention_dir`
 - Main controls:
-  - `trajectory_consensus_stages`: CSV stage list. Supported values are `candidate_consensus` and `head_contribution`.
-  - `trajectory_consensus_steps`: optional diffusion-step list. Empty means all available steps in the reused maps.
+  - `trajectory_consensus_stages`: CSV stage list. Supported values are `candidate_consensus`, `head_contribution`, and `self_attention_coupling`.
+  - `trajectory_consensus_steps`: underlying CLI diffusion-step list. In the provided bash script, this is selected automatically from three stage-specific shell knobs: `TRAJECTORY_CONSENSUS_CANDIDATE_STEPS`, `TRAJECTORY_CONSENSUS_HEAD_CONTRIBUTION_STEPS`, and `TRAJECTORY_CONSENSUS_SELF_ATTENTION_COUPLING_STEPS`.
   - `trajectory_consensus_layers`: optional layer list. Empty means all available layers in the reused maps.
   - `trajectory_consensus_cross_heads`: optional cross-attention head list such as `L4H1,L7H8`. It is used by candidate visualization and by `head_contribution` when module `cross` is enabled. Empty string means all cross-attention heads in the selected layers; `None` means no cross-attention head.
   - `trajectory_consensus_self_heads`: optional self-attention head list such as `L4H1,L7H8`. It is used by `head_contribution` when module `self` is enabled. Empty string means all self-attention heads in the selected layers; `None` means no self-attention head.
@@ -429,14 +429,24 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - `self_attention_modulation_stop_after_last_probe_step`: if true, stop diffusion immediately after the last requested probe step
 - Output:
   - `self_attention_modulation_rows.csv`
+  - `self_attention_modulation_head_rows.csv`
+  - `self_attention_modulation_decomposition_rows.csv`
+  - `self_attention_modulation_channel_profiles.pt`
+  - `self_attention_modulation_weight_norms.csv`
   - `self_attention_modulation_summary.json`
   - `self_attention_modulation_plots/e0/<metric>/`: `heatmap.pdf`, `step_curves_bucketed.pdf`, `step_curves_per_layer.pdf`, and `per_layer/layer_xx.pdf` for `gate_mean`, `gate_abs_mean`, `gate_rms`, `gate_positive_fraction`, `gate_negative_fraction`, and `gate_max_abs`; the bucketed plot splits the selected layers into three count-balanced contiguous layer-index ranges and prints those ranges in the legend, while the per-layer overview includes a layer color bar
   - `self_attention_modulation_plots/e1/<metric>/`: same metric set and plot types as `e0`
   - `self_attention_modulation_plots/e2/<metric>/`: same gate metrics as `e0/e1`, plus `sa_output_rms`, `gated_sa_output_rms`, and `gated_to_raw_rms_ratio`
+  - `self_attention_modulation_per_head_plots/<metric>/`: per-layer step x head heatmaps and per-head step-curve overlays for `sa_head_write_rms`, `gated_sa_head_write_rms`, and `gated_to_raw_sa_head_write_rms_ratio`
+  - `self_attention_modulation_decomposition_plots/`: heatmaps for `x_hat_rms`, `v_rms`, and `attn_out_pre_o_rms`
+  - `self_attention_modulation_weight_norms.pdf`: layer-wise comparison of self-attention `W_V` and `W_O` matrix norms
+  - `self_attention_modulation_channel_profiles/`: per-channel bar plots for all collected `step-layer` pairs by default; the CLI can optionally restrict the rendered subset; full profile tensors are always saved in `.pt`
 - Key readout:
   - whether `e0/e1/e2` are primarily step-driven or layer-driven
   - which layers consistently use stronger modulation magnitude
   - whether the effective `e2`-gated SA write tracks the raw SA output RMS or selectively attenuates it
+  - whether a layer's large or small effective write is driven by uniformly strong gating or by selective amplification of only a few heads
+  - whether the SA branch amplitude is already large at `x_hat`, grows mainly in `W_V`, or grows mainly after attention aggregation / `W_O`
   - see detailed note: `docs/self_attention_modulation.md`
 
 ### 16) `seed_to_trajectory_predictability`

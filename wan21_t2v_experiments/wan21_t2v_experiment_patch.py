@@ -306,6 +306,12 @@ class Wan21T2VProbeState:
         self.self_attention_viz_grid_size: Optional[Tuple[int, int, int]] = None
         self.self_attn_modulation_sum: Dict[Tuple[str, int, int], torch.Tensor] = {}
         self.self_attn_modulation_count: Dict[Tuple[str, int, int], int] = {}
+        self.self_attn_modulation_head_sum: Dict[Tuple[int, int, int], torch.Tensor] = {}
+        self.self_attn_modulation_head_count: Dict[Tuple[int, int, int], int] = {}
+        self.self_attn_modulation_decomposition_sum: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.self_attn_modulation_decomposition_count: Dict[Tuple[int, int], int] = {}
+        self.self_attn_modulation_channel_profile_sum: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.self_attn_modulation_channel_profile_count: Dict[Tuple[int, int], int] = {}
         self.last_requested_probe_step = max(config.probe.probe_steps) if config.probe.probe_steps else 0
         self.early_stop_triggered = False
         self.early_stop_completed_step = 0
@@ -680,6 +686,110 @@ class Wan21T2VProbeState:
             self.self_attn_modulation_count[key] = 0
         self.self_attn_modulation_sum[key] += stats
         self.self_attn_modulation_count[key] += 1
+
+    def collect_self_attn_modulation_per_head(
+        self,
+        layer_idx: int,
+        per_head_sa_write: torch.Tensor,
+        modulation_tensor: torch.Tensor,
+    ):
+        """Collect per-head self-attention write statistics for the `e2` branch.
+
+        `per_head_sa_write` must follow the same per-head write definition used by
+        `trajectory_consensus_dynamics`, namely the head-specific contribution after
+        the output-projection slice and before the residual gate `e2`.
+        """
+        if not self.should_collect_layer(layer_idx):
+            return
+        if not bool(self.config.probe.collect_self_attn_modulation):
+            return
+        if self.config.probe.modulation_layers and int(layer_idx) not in self.config.probe.modulation_layers:
+            return
+
+        if per_head_sa_write.dim() != 4:
+            raise ValueError(
+                "per_head_sa_write must have shape [B, L, H, C], "
+                f"got {tuple(per_head_sa_write.shape)}."
+            )
+        if modulation_tensor.dim() != 3:
+            raise ValueError(
+                "modulation_tensor must have shape [B, 1, C], "
+                f"got {tuple(modulation_tensor.shape)}."
+            )
+
+        gated_per_head_write = per_head_sa_write * modulation_tensor.unsqueeze(2)
+        raw_rms = torch.sqrt(per_head_sa_write.detach().float().square().mean(dim=(0, 1, 3)))
+        gated_rms = torch.sqrt(gated_per_head_write.detach().float().square().mean(dim=(0, 1, 3)))
+        ratio = gated_rms / raw_rms.clamp_min(1e-8)
+
+        for head_idx in range(int(per_head_sa_write.size(2))):
+            key = (int(self.current_step), int(layer_idx), int(head_idx))
+            if key not in self.self_attn_modulation_head_sum:
+                self.self_attn_modulation_head_sum[key] = torch.zeros((3,), dtype=torch.float64)
+                self.self_attn_modulation_head_count[key] = 0
+            self.self_attn_modulation_head_sum[key][0] += float(raw_rms[head_idx].item())
+            self.self_attn_modulation_head_sum[key][1] += float(gated_rms[head_idx].item())
+            self.self_attn_modulation_head_sum[key][2] += float(ratio[head_idx].item())
+            self.self_attn_modulation_head_count[key] += 1
+
+    def collect_self_attn_modulation_decomposition(
+        self,
+        layer_idx: int,
+        x_hat: torch.Tensor,
+        v: torch.Tensor,
+        attn_out_pre_o: torch.Tensor,
+    ):
+        """Collect step/layer RMS statistics for SA decomposition terms."""
+        if not self.should_collect_layer(layer_idx):
+            return
+        if not bool(self.config.probe.collect_self_attn_modulation):
+            return
+        if self.config.probe.modulation_layers and int(layer_idx) not in self.config.probe.modulation_layers:
+            return
+
+        stats = torch.zeros((3,), dtype=torch.float64)
+        stats[0] = float(torch.sqrt(x_hat.detach().float().square().mean()).item())
+        stats[1] = float(torch.sqrt(v.detach().float().square().mean()).item())
+        stats[2] = float(torch.sqrt(attn_out_pre_o.detach().float().square().mean()).item())
+
+        key = (int(self.current_step), int(layer_idx))
+        if key not in self.self_attn_modulation_decomposition_sum:
+            self.self_attn_modulation_decomposition_sum[key] = torch.zeros((3,), dtype=torch.float64)
+            self.self_attn_modulation_decomposition_count[key] = 0
+        self.self_attn_modulation_decomposition_sum[key] += stats
+        self.self_attn_modulation_decomposition_count[key] += 1
+
+    def collect_self_attn_modulation_channel_profile(
+        self,
+        layer_idx: int,
+        sa_output: torch.Tensor,
+        modulation_tensor: torch.Tensor,
+    ):
+        """Collect per-channel SA/gate profiles for one `(step, layer)` pair.
+
+        Stored channels:
+        - index 0: `sa_channel_energy = mean_{B,L}(y^2)` per hidden channel
+        - index 1: `gate_channel_rms = sqrt(mean_B(e2^2))` per hidden channel
+        - index 2: `gated_channel_energy = mean_{B,L}((y * e2)^2)` per hidden channel
+        """
+        if not self.should_collect_layer(layer_idx):
+            return
+        if not bool(self.config.probe.collect_self_attn_modulation):
+            return
+        if self.config.probe.modulation_layers and int(layer_idx) not in self.config.probe.modulation_layers:
+            return
+
+        sa_channel_energy = sa_output.detach().float().square().mean(dim=(0, 1))
+        gate_channel_rms = torch.sqrt(modulation_tensor.detach().float().square().mean(dim=0).squeeze(0))
+        gated_channel_energy = (sa_output.detach().float() * modulation_tensor.detach().float()).square().mean(dim=(0, 1))
+        stacked = torch.stack([sa_channel_energy, gate_channel_rms, gated_channel_energy], dim=0).double().cpu()
+
+        key = (int(self.current_step), int(layer_idx))
+        if key not in self.self_attn_modulation_channel_profile_sum:
+            self.self_attn_modulation_channel_profile_sum[key] = torch.zeros_like(stacked)
+            self.self_attn_modulation_channel_profile_count[key] = 0
+        self.self_attn_modulation_channel_profile_sum[key] += stacked
+        self.self_attn_modulation_channel_profile_count[key] += 1
 
     def collect(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, seq_lens: torch.Tensor, grid_sizes: torch.Tensor):
         """Collect P(|dt|) and optional MAAS maps from q/k tensors."""
@@ -1224,6 +1334,51 @@ class Wan21T2VProbeState:
                 }
             )
         return rows
+
+    def export_self_attn_modulation_head_rows(self) -> List[Dict[str, float]]:
+        """Export step/layer/head summaries for per-head self-attention writes."""
+        rows: List[Dict[str, float]] = []
+        for (step, layer, head), stats_sum in sorted(self.self_attn_modulation_head_sum.items()):
+            count = max(1, int(self.self_attn_modulation_head_count[(step, layer, head)]))
+            mean_stats = (stats_sum / float(count)).tolist()
+            rows.append(
+                {
+                    "step": int(step),
+                    "layer": int(layer),
+                    "head": int(head),
+                    "sa_head_write_rms": float(mean_stats[0]),
+                    "gated_sa_head_write_rms": float(mean_stats[1]),
+                    "gated_to_raw_sa_head_write_rms_ratio": float(mean_stats[2]),
+                    "num_forward_samples": int(count),
+                }
+            )
+        return rows
+
+    def export_self_attn_modulation_decomposition_rows(self) -> List[Dict[str, float]]:
+        """Export step/layer RMS summaries for SA decomposition terms."""
+        rows: List[Dict[str, float]] = []
+        for (step, layer), stats_sum in sorted(self.self_attn_modulation_decomposition_sum.items()):
+            count = max(1, int(self.self_attn_modulation_decomposition_count[(step, layer)]))
+            mean_stats = (stats_sum / float(count)).tolist()
+            rows.append(
+                {
+                    "step": int(step),
+                    "layer": int(layer),
+                    "x_hat_rms": float(mean_stats[0]),
+                    "v_rms": float(mean_stats[1]),
+                    "attn_out_pre_o_rms": float(mean_stats[2]),
+                    "num_forward_samples": int(count),
+                }
+            )
+        return rows
+
+    def export_self_attn_modulation_channel_profiles(self) -> Dict[Tuple[int, int], torch.Tensor]:
+        """Export averaged per-channel SA/gate profiles keyed by `(step, layer)`."""
+        out: Dict[Tuple[int, int], torch.Tensor] = {}
+        for key, tensor_sum in sorted(self.self_attn_modulation_channel_profile_sum.items()):
+            count = max(1, int(self.self_attn_modulation_channel_profile_count[key]))
+            out[key] = (tensor_sum / float(count)).float()
+        return out
 
     def compute_maas(self, token_trajectory: Dict[int, Tuple[int, int]], radius: Optional[int] = None):
         """Compute MAAS rows and summary given token-space trajectory targets."""
@@ -2148,6 +2303,16 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
                     backend=patch_cfg.causal.backend,
                 )
 
+            if bool(patch_cfg.probe.collect_self_attn_modulation):
+                self._wan21_last_v_tensor = v.detach()
+                self._wan21_last_attn_out_pre_o = out.detach()
+                out_proj_weight_by_head = self.o.weight.view(self.dim, n, d).permute(1, 2, 0).contiguous()
+                self._wan21_last_per_head_sa_write = torch.einsum(
+                    "bsnd,ndc->bsnc",
+                    out,
+                    out_proj_weight_by_head.to(device=out.device, dtype=out.dtype),
+                )
+
             out = out.flatten(2)
             out = self.o(out)
             return out
@@ -2172,12 +2337,16 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
                 e = (self.modulation + e).chunk(6, dim=1)
             assert e[0].dtype == torch.float32
 
+            x_hat = self.norm1(x).float() * (1 + e[1]) + e[0]
             y = self.self_attn(
-                self.norm1(x).float() * (1 + e[1]) + e[0],
+                x_hat,
                 seq_lens,
                 grid_sizes,
                 freqs,
             )
+            per_head_sa_write = getattr(self.self_attn, "_wan21_last_per_head_sa_write", None)
+            v_tensor = getattr(self.self_attn, "_wan21_last_v_tensor", None)
+            attn_out_pre_o = getattr(self.self_attn, "_wan21_last_attn_out_pre_o", None)
             with torch.cuda.amp.autocast(dtype=torch.float32):
                 gated_y = y * e[2]
             state.collect_self_attn_modulation(
@@ -2197,8 +2366,34 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
                 sa_output=y,
                 gated_sa_output=gated_y,
             )
+            if v_tensor is not None and attn_out_pre_o is not None:
+                state.collect_self_attn_modulation_decomposition(
+                    layer_idx=layer_idx,
+                    x_hat=x_hat,
+                    v=v_tensor,
+                    attn_out_pre_o=attn_out_pre_o,
+                )
+            state.collect_self_attn_modulation_channel_profile(
+                layer_idx=layer_idx,
+                sa_output=y,
+                modulation_tensor=e[2],
+            )
+            if per_head_sa_write is not None:
+                state.collect_self_attn_modulation_per_head(
+                    layer_idx=layer_idx,
+                    per_head_sa_write=per_head_sa_write,
+                    modulation_tensor=e[2],
+                )
+            for cache_attr_name in (
+                "_wan21_last_per_head_sa_write",
+                "_wan21_last_v_tensor",
+                "_wan21_last_attn_out_pre_o",
+            ):
+                if hasattr(self.self_attn, cache_attr_name):
+                    delattr(self.self_attn, cache_attr_name)
             with torch.cuda.amp.autocast(dtype=torch.float32):
                 x = x + gated_y
+            del per_head_sa_write, v_tensor, attn_out_pre_o, gated_y, y, x_hat
 
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])

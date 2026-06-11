@@ -29,3 +29,4 @@ from .head_evolution import *  # noqa: F401,F403
 from .rope_decay_curve import *  # noqa: F401,F403
 from .rope_modification import *  # noqa: F401,F403
 from .trajectory_consensus_dynamics import *  # noqa: F401,F403
+from .trajectory_consensus_seed_influence import *  # noqa: F401,F403

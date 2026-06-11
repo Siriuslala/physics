@@ -46,6 +46,9 @@ SELF_ATTENTION_MODULATION_STEPS=""
 SELF_ATTENTION_MODULATION_LAYERS=""
 SELF_ATTENTION_MODULATION_BRANCH="cond"
 SELF_ATTENTION_MODULATION_STOP_AFTER_LAST_PROBE_STEP=True
+SELF_ATTENTION_MODULATION_CHANNEL_PROFILE_TARGETS=""  # for channel visualization
+SELF_ATTENTION_MODULATION_CHANNEL_PROFILE_TOPK=5
+SELF_ATTENTION_MODULATION_PLOT_ONLY_FROM_SAVED=True
 SAVE_VIDEO=False
 
 for PROMPT in "${PROMPTS[@]}"; do
@@ -77,6 +80,9 @@ for SEED in "${SEEDS[@]}"; do
         --self_attention_modulation_layers "$SELF_ATTENTION_MODULATION_LAYERS" \
         --self_attention_modulation_branch "$SELF_ATTENTION_MODULATION_BRANCH" \
         --self_attention_modulation_stop_after_last_probe_step $SELF_ATTENTION_MODULATION_STOP_AFTER_LAST_PROBE_STEP \
+        --self_attention_modulation_channel_profile_targets "$SELF_ATTENTION_MODULATION_CHANNEL_PROFILE_TARGETS" \
+        --self_attention_modulation_channel_profile_topk $SELF_ATTENTION_MODULATION_CHANNEL_PROFILE_TOPK \
+        --self_attention_modulation_plot_only_from_saved $SELF_ATTENTION_MODULATION_PLOT_ONLY_FROM_SAVED \
         --save_video $SAVE_VIDEO
 
     echo "Finished self_attention_modulation | prompt: $PROMPT | seed: $SEED"

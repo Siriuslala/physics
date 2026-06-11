@@ -499,13 +499,41 @@ For one frame \(f\), the current algorithm is:
    - The minimum-area threshold is intentionally raised from the old value of \(2\) to \(4\), because two- or three-patch speckles are not treated as meaningful candidates.
    - The asymmetric width bound is the most important geometry prior here, because floor-like false positives are usually too wide horizontally even when their height is modest.
 
+8. `Reference-object-box merge`
+   - The previous steps may still split one visually coherent object blob into two or more vertically or diagonally touching subregions.
+   - To suppress this failure mode, the current code adds one final post-processing stage after the frame-wise partition has already been extracted.
+   - First construct a frame-wise reference object box from the cross-attention head-mean map at the reference observation \((s_{\mathrm{ref}}, \ell_{\mathrm{ref}}) = (50, 27)\).
+   - Let the preprocessed reference head-mean map be \(M_f^{\mathrm{ref}}(y,x)\).
+   - Reuse the same reference-center extraction rule as in the current `head_evolution` run configuration: threshold the frame around its peak-connected component, then compute the geometric-center trajectory
+     \[ c_f^{\mathrm{ref}} = (y_f^{\mathrm{ref}}, x_f^{\mathrm{ref}}). \]
+   - Let \(A_f^{\mathrm{ref}}\) be the connected-component area of that reference object support. Define the adaptive reference radius
+     \[ r_f^{\mathrm{ref}} = \operatorname{clip}\!\left(\alpha \sqrt{\frac{A_f^{\mathrm{ref}}}{\pi}},\ r_{\min},\ r_{\max}\right), \]
+     with the same shell-level settings currently used in `head_evolution`:
+     \[ \alpha = 1.0,\qquad r_{\min}=1,\qquad r_{\max}=0.25\min(H,W). \]
+   - The reference-trajectory extraction also reuses `traj_power = 1.5` and `traj_quantile = 0.95`.
+   - The reference object box is then the axis-aligned square
+     \[ B_f^{\mathrm{ref}} = [y_f^{\mathrm{ref}}-r_f^{\mathrm{ref}},\ y_f^{\mathrm{ref}}+r_f^{\mathrm{ref}}] \times [x_f^{\mathrm{ref}}-r_f^{\mathrm{ref}},\ x_f^{\mathrm{ref}}+r_f^{\mathrm{ref}}], \]
+     clipped to the token-grid boundaries.
+   - For every extracted candidate region \(R_{f,j}\), compute the box-overlap ratio
+     \[ \rho_{f,j} = \frac{|R_{f,j} \cap B_f^{\mathrm{ref}}|}{|R_{f,j}|}. \]
+   - A candidate is eligible for merging only if a sufficiently large fraction of its own area lies inside the reference box:
+     \[ \rho_{f,j} \ge \tau_{\mathrm{merge}}, \]
+     where the current implementation uses \(\tau_{\mathrm{merge}} = 0.75\).
+   - Let
+     \[ \mathcal{E}_f = \{j : \rho_{f,j} \ge \tau_{\mathrm{merge}}\}. \]
+   - If \(|\mathcal{E}_f| \ge 2\), merge all eligible regions directly:
+     \[ \widetilde R_f^{\mathrm{obj}} = \bigcup_{j \in \mathcal{E}_f} R_{f,j}. \]
+   - The merged support then replaces the original labels for those regions, and the frame-wise candidate index set is renumbered.
+   - No additional center-distance, adjacency, or ranking heuristics are applied in this post-processing step.
+
 If no seed survives the full process, the extractor falls back to the global argmax as a one-pixel candidate.
-The current code therefore implements a peak-seeded weighted clustering algorithm rather than the previous threshold-ladder split heuristic.
+The current code therefore implements a peak-seeded weighted clustering algorithm followed by a reference-object-guided merge stage, rather than the previous threshold-ladder split heuristic.
 
 The default values are intentionally conservative:
 \[ q_{\mathrm{base}} = 0.85,\quad q_{\mathrm{bg}} = 0.75,\quad (q_{\mathrm{seed},r}) = (0.92, 0.95, 0.97),\quad n_{\mathrm{stable}} = 2,\quad d_{\mathrm{merge}} = 2,\quad K_{\max} = 5,\quad \gamma = 2,\quad \eta = 0.8. \]
 The final geometry filter uses \(\min\)-area \(=4\), maximum width ratio \(=0.40\), and maximum height ratio \(=0.95\).
 These defaults are chosen to keep the compact object-centered bright nuclei while suppressing two failure modes seen in the qualitative examples: small multi-patch speckles and wide floor-like background bands.
+The final merge stage then repairs the remaining case where one compact object patch is still fragmented into two or more subregions that each lie mostly inside the same reference object neighborhood.
 
 ### 6.3 Candidate weights
 
@@ -517,11 +545,13 @@ These weights are computed after candidate extraction, using the per-head normal
 
 ### 6.4 Candidate visualization
 
-For each selected step \(s\) and selected layer \(\ell\), the current code renders one visualization for the shared head-mean map and optionally additional visualizations for selected individual cross-attention heads.
+For each selected step \(s\) and selected layer \(\ell\), the current code renders one visualization for the shared head-mean map and, when `trajectory_consensus_candidate_enable_per_head=True`, optionally additional visualizations for selected individual cross-attention heads.
 Every visualization has two rows:
 
 - row 1: raw attention maps, with one color scale per frame and no per-frame color bar;
 - row 2: binary candidate support masks.
+
+The frame subset is not chosen directly in token-frame space. Instead, the code reuses the same video-frame-to-token-frame projection rule as `cross_attention_token_viz`, so the displayed frame labels and the actual selected token frames stay aligned with the existing cross-attention visualization outputs.
 
 This visualization is mandatory for validating whether candidate extraction is scientifically reasonable.
 
@@ -945,10 +975,46 @@ If different self-attention heads vote for very different target candidates, agr
 If many heads vote for the same target candidate, agreement is high.
 This is a direct measure of whether the layer is internally converging toward one trajectory continuation.
 
+The hard-vote statistic above is intentionally strict: it discards the non-argmax probability mass of each head.
+For that reason the stage also tracks two soft variants.
+
+First define the hard-vote winner candidate
+
+\[ b^{\mathrm{vote}}_{s,\ell}(f,a \to g) = \arg\max_b V_{s,\ell}(f,a \to g,b). \]
+
+Then define the soft head-vote share
+
+\[ S^{\mathrm{soft}}_{s,\ell}(f,a \to g) = \frac{1}{|\mathcal{H}^{\mathrm{sa}}_{\ell}|}\sum_{h \in \mathcal{H}^{\mathrm{sa}}_{\ell}} \widetilde C_{s,\ell,h}(f,a \to g,b^{\mathrm{vote}}_{s,\ell}(f,a \to g)). \]
+
+This score asks a softer question than hard voting:
+even if some heads do not place their argmax on the consensus target, how much probability mass do they still assign to that target?
+
+Next define the soft head agreement as the mean pairwise cosine similarity of head-wise coupling distributions:
+
+\[ A^{\mathrm{soft}}_{s,\ell}(f,a \to g) = \frac{1}{|\mathcal{P}_{\ell}|}\sum_{(h,h') \in \mathcal{P}_{\ell}} \frac{\left\langle \widetilde C_{s,\ell,h}(f,a \to g,\cdot),\ \widetilde C_{s,\ell,h'}(f,a \to g,\cdot) \right\rangle}{\left\| \widetilde C_{s,\ell,h}(f,a \to g,\cdot) \right\|_2 \left\| \widetilde C_{s,\ell,h'}(f,a \to g,\cdot) \right\|_2 + \varepsilon}, \]
+
+where \(\mathcal{P}_{\ell} = \{(h,h') : h,h' \in \mathcal{H}^{\mathrm{sa}}_{\ell},\ h < h'\}\).
+
+This metric keeps the full probability vector of each head rather than only its argmax.
+So it is useful when different heads are not yet making the exact same discrete vote, but their distributions are already becoming similar.
+
 ### 9.7 Candidate compatibility and chainability
 
 The metrics above are defined for one query candidate and one target frame.
 To explain winner selection, we also need candidate-level summaries that aggregate over target frames.
+
+One implementation detail is important here.
+The sharpness-style metrics in Sections 9.5 and 9.6, such as entropy, dominant-link ratio, link margin, hard head agreement, soft head-vote share, and soft head agreement, are intentionally defined on the candidate-normalized coupling \(\widetilde C\), because they are meant to describe how the candidate-covered mass is distributed **within** a target frame.
+
+Compatibility and chainability serve a different purpose.
+They should measure how much actual cross-frame support a candidate receives or sends, not only how selectively it distributes the mass after conditioning on candidate support.
+Therefore the current implementation uses the layer-mean **raw** coupling
+
+\[ \overline C^{\mathrm{raw}}_{s,\ell}(f,a \to g,b) = \frac{1}{|\mathcal{H}^{\mathrm{sa}}_{\ell}|}\sum_{h \in \mathcal{H}^{\mathrm{sa}}_{\ell}} C_{s,\ell,h}(f,a \to g,b). \]
+
+This distinction matters in practice.
+If one uses \(\widetilde C\) for outgoing support, then whenever a target frame contains only one candidate, the normalized outgoing sum can collapse to \(1\) almost by construction, which would artificially saturate chainability and create degenerate vertical stacks in the scatter plots.
+Using \(\overline C^{\mathrm{raw}}\) avoids that failure mode.
 
 For any pairwise metric \(\Psi_{s,\ell}(f,k \to g)\), define the local and global candidate-level averages
 
@@ -962,9 +1028,9 @@ This rule applies to all local and global averages below.
 First define local compatibility.
 For one candidate \(R_{s,\ell,f,k}\), let
 
-\[ \Lambda^{\mathrm{in}}_{s,\ell,\mathrm{local}}(f,k) = \sum_{k'} \overline C_{s,\ell}(f-1,k' \to f,k), \]
+\[ \Lambda^{\mathrm{in}}_{s,\ell,\mathrm{local}}(f,k) = \sum_{k'} \overline C^{\mathrm{raw}}_{s,\ell}(f-1,k' \to f,k), \]
 
-\[ \Lambda^{\mathrm{out}}_{s,\ell,\mathrm{local}}(f,k) = \sum_{k'} \overline C_{s,\ell}(f,k \to f+1,k'). \]
+\[ \Lambda^{\mathrm{out}}_{s,\ell,\mathrm{local}}(f,k) = \sum_{k'} \overline C^{\mathrm{raw}}_{s,\ell}(f,k \to f+1,k'). \]
 
 Then define the local compatibility score
 
@@ -981,9 +1047,9 @@ A candidate should not be considered a strong trajectory node if it only receive
 
 For global motion-planning analysis, define
 
-\[ \Lambda^{\mathrm{in}}_{s,\ell,\mathrm{global}}(f,k) = \frac{1}{|\{g : g < f\}|}\sum_{g < f}\sum_b \overline C_{s,\ell}(g,b \to f,k), \]
+\[ \Lambda^{\mathrm{in}}_{s,\ell,\mathrm{global}}(f,k) = \frac{1}{|\{g : g < f\}|}\sum_{g < f}\sum_b \overline C^{\mathrm{raw}}_{s,\ell}(g,b \to f,k), \]
 
-\[ \Lambda^{\mathrm{out}}_{s,\ell,\mathrm{global}}(f,k) = \frac{1}{|\{g : g > f\}|}\sum_{g > f}\sum_b \overline C_{s,\ell}(f,k \to g,b). \]
+\[ \Lambda^{\mathrm{out}}_{s,\ell,\mathrm{global}}(f,k) = \frac{1}{|\{g : g > f\}|}\sum_{g > f}\sum_b \overline C^{\mathrm{raw}}_{s,\ell}(f,k \to g,b). \]
 
 Then define
 
@@ -994,8 +1060,56 @@ Then define
 The local scores emphasize adjacent-frame continuity.
 The global scores emphasize whether one candidate is compatible with the broader motion state of the whole video.
 
+At the current stage, these two global scores are the primary global-planning summaries.
+The implementation does **not** add a separate geometry-specific `global smoothness` score yet.
+The reason is methodological:
+the present stage is designed to measure whether self-attention prefers one candidate because it is more cross-frame compatible on the shared candidate partition.
+Introducing an additional hand-crafted trajectory-shape prior too early would mix candidate selection analysis with a stronger external physical prior.
+If later results show that global compatibility is still too weak to reveal the local-versus-global failure mode, then a separate smoothness metric can be added in a follow-up revision.
+
 At the first or last frame, some directions are missing.
 In implementation, missing local or global directions should be treated as unavailable measurements rather than forced zeros, and the downstream aggregation should average only over valid terms.
+
+The current code also exposes three incoming-only indicator families, each with local and global variants.
+These metrics isolate the question:
+how strongly do other frames treat the current candidate as a plausible target?
+
+1. incoming support
+
+\[ I^{\mathrm{support}}_{s,\ell,\mathrm{local}}(f,k) = \frac{1}{|\mathcal{G}_{\mathrm{local}}(f)|}\sum_{g \in \mathcal{G}_{\mathrm{local}}(f)} \sum_b \overline C^{\mathrm{raw}}_{s,\ell}(g,b \to f,k), \]
+
+\[ I^{\mathrm{support}}_{s,\ell,\mathrm{global}}(f,k) = \frac{1}{|\mathcal{G}_{\mathrm{all}}(f)|}\sum_{g \in \mathcal{G}_{\mathrm{all}}(f)} \sum_b \overline C^{\mathrm{raw}}_{s,\ell}(g,b \to f,k). \]
+
+This is the mean incoming raw support from other frames.
+
+2. incoming preference share
+
+For one source frame \(g\), first define the incoming preference distribution over candidates in target frame \(f\):
+
+\[ P^{\mathrm{in}}_{s,\ell}(g \to f,k) = \frac{\sum_b \overline C^{\mathrm{raw}}_{s,\ell}(g,b \to f,k)}{\sum_{k'}\sum_b \overline C^{\mathrm{raw}}_{s,\ell}(g,b \to f,k') + \varepsilon}. \]
+
+Then define the local and global averages
+
+\[ I^{\mathrm{pref}}_{s,\ell,\mathrm{local}}(f,k) = \frac{1}{|\mathcal{G}_{\mathrm{local}}(f)|}\sum_{g \in \mathcal{G}_{\mathrm{local}}(f)} P^{\mathrm{in}}_{s,\ell}(g \to f,k), \]
+
+\[ I^{\mathrm{pref}}_{s,\ell,\mathrm{global}}(f,k) = \frac{1}{|\mathcal{G}_{\mathrm{all}}(f)|}\sum_{g \in \mathcal{G}_{\mathrm{all}}(f)} P^{\mathrm{in}}_{s,\ell}(g \to f,k). \]
+
+This score asks:
+when other frames look at frame \(f\), what fraction of their candidate-directed support lands on candidate \(k\)?
+
+3. incoming vote share
+
+For one source frame \(g\), let the preferred target candidate be
+
+\[ k^{\star}_{s,\ell}(g \to f) = \arg\max_k P^{\mathrm{in}}_{s,\ell}(g \to f,k). \]
+
+Then define
+
+\[ I^{\mathrm{vote}}_{s,\ell,\mathrm{local}}(f,k) = \frac{1}{|\mathcal{G}_{\mathrm{local}}(f)|}\sum_{g \in \mathcal{G}_{\mathrm{local}}(f)} \mathbf{1}[k^{\star}_{s,\ell}(g \to f)=k], \]
+
+\[ I^{\mathrm{vote}}_{s,\ell,\mathrm{global}}(f,k) = \frac{1}{|\mathcal{G}_{\mathrm{all}}(f)|}\sum_{g \in \mathcal{G}_{\mathrm{all}}(f)} \mathbf{1}[k^{\star}_{s,\ell}(g \to f)=k]. \]
+
+This metric counts how often other frames choose candidate \(k\) as their strongest target in frame \(f\).
 
 For mutual consistency, the candidate-level summary should first take the best reciprocal partner in each target frame:
 
@@ -1062,23 +1176,33 @@ The primary feature list should include at least:
 - local and global averages of layer-mean link margin \(\overline{\Delta}^{\mathrm{link}}\);
 - local and global averages of mutual consistency \(\mathrm{MC}^{\max}\);
 - local and global averages of self-attention head agreement \(A^{\mathrm{head}}\);
+- local and global averages of soft head-vote share \(S^{\mathrm{soft}}\);
+- local and global averages of soft head agreement \(A^{\mathrm{soft}}\);
 - local compatibility \(\Lambda_{\mathrm{local}}\);
 - local chainability \(\Gamma_{\mathrm{local}}\);
 - global compatibility \(\Lambda_{\mathrm{global}}\);
 - global chainability \(\Gamma_{\mathrm{global}}\).
+- local and global incoming support \(I^{\mathrm{support}}\);
+- local and global incoming preference share \(I^{\mathrm{pref}}\);
+- local and global incoming vote share \(I^{\mathrm{vote}}\).
 
 For pooled statistics across many candidates, the stage should provide three analyses.
 
 1. continuous overlap correlation
    - correlate each feature with the anchor-overlap score \(\Omega_{s,\ell,f,k}\);
    - this tests whether the feature changes smoothly with how close the early candidate is to the eventual anchor region.
-   - In implementation, the per-\((s,\ell)\) feature summary stores one scalar overlap-correlation field `anchor_iou_correlation`, while the visualization layer additionally exposes selected feature-versus-\(\Omega\) scatter plots for direct inspection.
+   - In implementation, the per-\((s,\ell)\) feature summary stores one scalar overlap-correlation field `anchor_iou_correlation`, while the visualization layer additionally exposes feature-versus-\(\Omega\) scatter plots for direct inspection.
 
-2. winner-versus-loser gap analysis
+2. continuous anchor-distance correlation
+   - correlate each feature with the anchor-distance score \(d^{\mathrm{anchor}}_{s,\ell,f,k}\);
+   - this tests whether a feature changes smoothly with geometric distance to the eventual anchor region, even when IoU is still small or zero.
+   - In implementation, the per-\((s,\ell)\) feature summary stores one scalar distance-correlation field `anchor_distance_correlation`, while the visualization layer additionally exposes feature-versus-\(d^{\mathrm{anchor}}\) scatter plots.
+
+3. winner-versus-loser gap analysis
    - use \(\Delta \phi_{s,\ell,f}\) to measure whether the winner already has a systematic early advantage over the strongest loser;
    - large positive values indicate an early winner-specific signal.
 
-3. ranking power analysis
+4. ranking power analysis
    - treat \(y_{s,\ell,f,k} = \mathbf{1}[k = k^{+}_{s,\ell,f}]\) as the binary label;
    - evaluate how well each feature ranks winner-aligned candidates above non-winners, for example by AUROC or average precision.
 
@@ -1164,8 +1288,15 @@ The following figure families are the recommended default set.
      - if the winner region is already visually more intense than its competitors, that metric is an early winner signature;
      - if the loser still looks equally strong, then convergence has not yet occurred under that metric.
    - Current default implementation:
-     - render one panel for each of `proposal_pi`, `global_chainability`, and `global_mutual_consistency`;
-     - choose one representative observation \((s,\ell)\), then draw several evenly spaced frames and always include the most informative representative frame used by the evolution analysis.
+     - render one panel for **every selected** observation \((s,\ell)\), not only one example;
+     - for each observation, draw up to ten evenly spaced frames;
+     - the default metric set is `proposal_pi`, `proposal_vote_share`, `local_compatibility`, `global_compatibility`, `local_chainability`, `global_chainability`, `local_mutual_consistency`, `global_mutual_consistency`, `local_head_agreement`, `global_head_agreement`, `local_soft_head_vote_share`, `global_soft_head_vote_share`, `local_soft_head_agreement`, and `global_soft_head_agreement`;
+     - render two parallel overlay families:
+       - `anchor_iou`: `W` is the candidate with the largest anchor IoU and `L` is the second-ranked candidate under the same IoU ranking;
+       - `anchor_distance`: `W` is the candidate with the smallest anchor center distance and `L` is the second-ranked candidate under the same distance ranking;
+     - candidate labels are drawn to the right of each region with a small horizontal gap, so the text does not cover the region;
+     - the contour color is derived from the fill color by a hue-rotated complementary scheme, so the border remains visually separable from the interior fill;
+     - the output directory separates these two families explicitly, so IoU-based overlays and center-distance-based overlays are not mixed together.
 
 2. winner-versus-loser coupling storyboard
    - Purpose:
@@ -1183,26 +1314,29 @@ The following figure families are the recommended default set.
      - a winner candidate should gradually show more selective and coherent cross-frame routing;
      - a loser candidate often remains diffuse, fragmented, or inconsistent across target frames.
    - Current default implementation:
-     - choose one representative observation \((s,\ell)\) and one representative query frame \(f\);
+     - render one storyboard for every selected observation \((s,\ell)\) and every query frame \(f\) that has both a winner-aligned candidate and a strongest loser;
      - compare the winner-aligned candidate and the strongest loser on the same query frame;
-     - the target-frame set always contains both local neighbors when available and representative global frames such as the beginning, middle, and end of the sequence.
+     - the target-frame set always contains both local neighbors when available and representative global frames such as the beginning, middle, and end of the sequence;
+     - the output directory name and file name explicitly state whether the plotted value is `raw_coupling` or `normalized_coupling`.
 
 3. winner-loser feature evolution panel
    - Purpose:
      - show when the winner starts separating from the loser along the denoising trajectory.
    - Content:
-     - for one selected feature, plot the winner value and strongest-loser value across ordered observation index \(t\).
+     - for one selected feature, plot the winner-minus-loser gap across step or across layer.
    - Drawing method:
-     - x-axis is observation index \(t\), ordered by actual denoising execution order;
-     - y-axis is one selected feature, such as \(\pi\), \(\Gamma_{\mathrm{global}}\), or \(\mathrm{MC}^{\max}_{\mathrm{global}}\);
-     - optionally add a vertical marker for the first stable separation time \(\tau_{\phi}\).
+     - one mode fixes the layer and uses diffusion step as the x-axis;
+     - the other mode fixes the diffusion step and uses transformer layer as the x-axis;
+     - y-axis is the winner-minus-loser gap of one selected feature;
+     - draw the raw gap together with a smoothed trend curve.
    - Interpretation:
-     - if the winner curve consistently rises above the loser curve early, the feature is a plausible early selection signal;
-     - if the two curves remain entangled until late, the feature is more likely a consequence of convergence than a precursor.
+     - if the gap becomes positive and stays positive early, the feature is a plausible early selection signal;
+     - if the gap remains near zero until late, the feature is more likely a consequence of convergence than a precursor.
    - Current default implementation:
-     - use one representative frame and render a multi-panel figure rather than only one scalar feature;
-     - the default feature set is `proposal_pi`, `proposal_vote_share`, `local_chainability`, `global_chainability`, `global_mutual_consistency`, and `global_head_agreement`;
-     - the stable-separation marker \(\tau_{\phi}\) is overlaid when it exists.
+     - render step-wise panels at fixed layer and layer-wise panels at fixed step;
+     - use the axis variable itself as the horizontal coordinate, not an abstract observation index;
+     - draw both the raw winner-minus-loser gap curve and a smoothed trend curve;
+     - the default feature set emphasizes proposal, compatibility, chainability, mutual consistency, and agreement features.
 
 #### Layer II. Mesoscopic trend figures
 
@@ -1218,25 +1352,30 @@ The following figure families are the recommended default set.
    - Interpretation:
      - if later or stronger planning observations show lower entropy and larger link margin even at large \(|d|\), the model is not only doing local smoothing but also organizing global motion.
    - Current default implementation:
-     - render a four-panel figure for entropy, dominant-link ratio, link margin, and head agreement;
+     - render a six-panel figure for entropy, dominant-link ratio, link margin, head agreement, soft head-vote share, and soft head agreement;
      - compare a small set of representative observations sampled from early, middle, and late parts of the observation order.
 
 5. cross-attention versus self-attention competition curve
    - Purpose:
      - directly compare whether early winner bias first appears in cross-attention proposal or in self-attention coordination.
    - Content:
-     - place winner-minus-loser gap curves of selected CA features and selected SA features on the same observation-order axis.
+     - place winner-minus-loser gap curves of selected CA features and selected SA features on the same step axis or on the same layer axis.
    - Drawing method:
-     - x-axis is observation index \(t\);
+     - one mode fixes the layer and uses step as the x-axis;
+     - the other mode fixes the step and uses layer as the x-axis;
      - y-axis is the frame-averaged winner-minus-loser gap;
      - recommended CA features are \(\pi\) and \(S^{\mathrm{ca}}\);
-     - recommended SA features are \(\Gamma_{\mathrm{local}}\), \(\Gamma_{\mathrm{global}}\), \(\mathrm{MC}^{\max}_{\mathrm{global}}\), and \(A^{\mathrm{head}}_{\mathrm{global}}\).
+     - recommended SA features are \(\Lambda_{\mathrm{local}}\), \(\Lambda_{\mathrm{global}}\), \(\Gamma_{\mathrm{local}}\), \(\Gamma_{\mathrm{global}}\), \(\mathrm{MC}^{\max}_{\mathrm{global}}\), \(A^{\mathrm{head}}_{\mathrm{global}}\), \(S^{\mathrm{soft}}_{\mathrm{global}}\), and \(A^{\mathrm{soft}}_{\mathrm{global}}\).
    - Interpretation:
      - if SA curves pull away from zero earlier than CA curves, that supports the hypothesis that self-attention actively drives convergence;
      - if CA already shows a clear gap first, then SA may be amplifying an existing proposal bias rather than creating it.
    - Current default implementation:
-     - draw one shared plot whose CA curves are `proposal_pi` and `proposal_vote_share`;
-     - the default SA curves are `local_chainability`, `global_chainability`, `global_mutual_consistency`, and `global_head_agreement`.
+     - draw step-wise curves at fixed layer and layer-wise curves at fixed step;
+     - the x-axis is always the explicit step or layer coordinate;
+     - each feature is drawn with a raw curve plus a smoothed trend curve;
+     - both raw-value and robustly normalized versions are saved;
+     - the default CA curves are `proposal_pi` and `proposal_vote_share`;
+     - the default SA curves are `local_compatibility`, `global_compatibility`, `local_chainability`, `global_chainability`, `global_mutual_consistency`, `global_head_agreement`, `global_soft_head_vote_share`, and `global_soft_head_agreement`.
 
 6. temporal-precedence summary panel
    - Purpose:
@@ -1247,10 +1386,14 @@ The following figure families are the recommended default set.
      - the detailed figure should still be the observation-order curve from item 3;
      - the summary figure can be a bar chart or small table of mean precedence index across frames.
    - Interpretation:
+     - the precedence index of one frame is the earliest observation order at which the winner-minus-loser gap becomes positive and stays positive for the required persistence window;
+     - the plotted bar is the mean of that earliest stable-separation order across frames;
+     - a lower bar means the feature usually separates winner from loser earlier;
+     - a higher bar means the feature usually separates later;
      - this panel is not the primary evidence by itself;
      - it is a compact summary of the richer temporal curves.
    - Current default implementation:
-     - output one bar chart of mean first-stable-separation index across frames.
+     - output one bar chart of mean earliest stable-separation order across frames, with lower values interpreted as earlier winner-loser separation.
 
 #### Layer III. Global scan figures
 
@@ -1283,18 +1426,469 @@ The following figure families are the recommended default set.
    - Purpose:
      - check whether one feature changes smoothly with the anchor-overlap score \(\Omega\), or whether its apparent usefulness is driven by a few outliers.
    - Content:
-     - scatter one selected feature against \(\Omega\).
+     - scatter one selected feature against \(\Omega\) or against \(d^{\mathrm{anchor}}\).
    - Drawing method:
-     - x-axis is the feature value, y-axis is \(\Omega\);
+     - x-axis is the feature value;
+     - y-axis is either \(\Omega\) or \(d^{\mathrm{anchor}}\);
      - color points by winner versus loser when possible.
    - Interpretation:
      - this is a diagnostic tool, not a primary result figure.
    - Current default implementation:
-     - render selected diagnostic scatters for `proposal_pi`, `global_chainability`, and `global_mutual_consistency`.
+     - render two scatter families:
+       - `feature_vs_anchor_iou`;
+       - `feature_vs_anchor_dist`;
+     - each family contains one subdirectory per feature;
+     - each feature subdirectory contains:
+       - one pooled scatter over all selected observations;
+       - one additional scatter for every selected diffusion step;
+       - one extra pooled scatter and one extra by-step scatter that keep only `candidate_count >= 2`, so frames with only one candidate do not dominate the view;
+     - the default feature set includes at least `proposal_pi`, `proposal_vote_share`, `local_compatibility`, `global_compatibility`, `local_chainability`, `global_chainability`, `local_mutual_consistency`, `global_mutual_consistency`, `local_head_agreement`, `global_head_agreement`, `local_soft_head_vote_share`, `global_soft_head_vote_share`, `local_soft_head_agreement`, `global_soft_head_agreement`, `local_link_margin`, `global_link_margin`, `local_dominant_link_ratio`, `global_dominant_link_ratio`, `local_entropy`, and `global_entropy`.
 
 In summary, Layer I figures should be treated as the primary mechanistic evidence, Layer II figures as the main temporal-trend analysis, and Layer III figures only as large-scale navigation maps.
 
-## 10. Optional Appendix: Trajectory Graph and Dynamic Programming
+## 10. Seed-Ensemble Sensitivity and Frame-Level Anchor Analysis
+
+This section defines one follow-up sub-experiment that should be run **after**
+`self_attention_coupling`.
+Its purpose is not to introduce a new external trajectory scorer.
+Instead, it asks two architecture-faithful questions on top of the already saved
+candidate and coupling caches:
+
+1. how large is the seed-specific perturbation relative to the model's
+   prompt-conditioned average winner bias at very early observations;
+2. which frames become unusually decisive or influential during early trajectory
+   disambiguation.
+
+The intended interpretation is:
+
+- the seed-mean signal approximates the stable tendency induced by the trained
+  model under the current prompt;
+- the seed-specific deviation measures how much one random initialization pushes
+  the system away from or toward that stable tendency;
+- large downstream trajectory differences can arise when the early winner bias
+  is weak relative to the scale of seed-induced fluctuations, and when a small
+  number of frames act as strong proposal or routing anchors.
+
+### 10.1 Reused caches and observation scope
+
+This sub-experiment should reuse existing outputs as much as possible.
+The default inputs are:
+
+- `trajectory_consensus_winner_gap.csv`
+- `trajectory_consensus_self_attention_coupling_candidate_features.csv`
+- `trajectory_consensus_self_attention_coupling_pairwise.csv`
+- reused cross-attention `head-mean` maps from `reuse_cross_attention_dir` only
+  for the frame-level spatial-map entropy.
+
+No new candidate extraction is needed.
+No new region definition is introduced.
+All frame-level and seed-level summaries should be computed on the same shared
+candidate partition \(R_{s,\ell,f,k}\) from Section 9.1.
+
+For the first implementation, let the selected observation set be
+
+\[ \mathcal{T} = \{(s,\ell) : s \in \{1,2,3,4,5\},\ \ell \in \mathcal{L}_{\mathrm{all}}\}, \]
+
+where \(\mathcal{L}_{\mathrm{all}}\) contains all transformer layers.
+
+This choice is recommended because:
+
+- the first five diffusion steps are where trajectory ambiguity is still active;
+- later steps are often already close to consensus and therefore less useful for
+  quantifying early seed sensitivity;
+- keeping all layers makes it possible to test whether the amplification is
+  concentrated in shallow layers, especially in the high-write regime suggested
+  by `self_attention_modulation`.
+
+Let the seed ensemble be
+
+\[ \mathcal{R} = \{r_1, \dots, r_N\}. \]
+
+The recommended practical schedule is:
+
+- pilot run: \(N=32\) seeds per prompt;
+- confirmation run: \(N=64\) seeds for the most informative prompts, frames,
+  and early observations identified by the pilot run.
+
+The reason for this two-stage schedule is simple.
+Thirty-two seeds are usually enough to reveal whether a prompt contains early
+high-sensitivity competition zones.
+However, more stable quantitative claims about flip probability, tail behavior,
+and outlier seeds are better supported by sixty-four seeds.
+
+### 10.2 Primary seed-sensitivity variable
+
+For one seed \(r\), one observation \((s,\ell)\), and one frame \(f\), let
+\(k^{+}_{r,s,\ell,f}\) be the winner-aligned candidate and
+\(k^{-}_{r,s,\ell,f}\) be the strongest loser defined exactly as in Section 9.
+
+The primary score for the first implementation should be the winner-minus-loser
+gap of **global mutual consistency**:
+
+\[ z_r(s,\ell,f) = \mathrm{MC}^{\max}_{r,s,\ell,\mathrm{global}}(f,k^{+}_{r,s,\ell,f}) - \mathrm{MC}^{\max}_{r,s,\ell,\mathrm{global}}(f,k^{-}_{r,s,\ell,f}). \]
+
+This choice is recommended because the current qualitative observations already
+suggest that mutual consistency is one of the most informative early indicators,
+and because it is directly tied to reciprocal cross-frame support rather than to
+one-frame proposal strength alone.
+
+In the implementation, the only dedicated metric-selection knob belongs to the
+`seed_sensitivity` mode and specifies exactly this \(z_r\) definition.
+It should therefore be interpreted narrowly as a **\(z_r\)-metric choice**,
+not as a generic metric selector for the whole `seed_influence` stage.
+The `anchor_frame` mode does not use this knob.
+
+The same framework can later be reused with auxiliary variables:
+
+- local mutual consistency;
+- local or global incoming support;
+- local or global incoming preference share;
+- local or global incoming vote share;
+- cross-attention proposal strength \(\pi\) as a baseline.
+
+### 10.3 Seed mean, seed deviation, and fluctuation scale
+
+For one fixed \((s,\ell,f)\), define the seed-ensemble mean
+
+\[ \bar z(s,\ell,f) = \frac{1}{N}\sum_{r \in \mathcal{R}} z_r(s,\ell,f). \]
+
+This quantity is interpreted as the prompt-conditioned, seed-mean early winner
+bias of the selected feature.
+For the primary variable above, \(\bar z > 0\) means that on average the final
+winner already has larger global mutual consistency than the strongest loser at
+that observation.
+
+Now define the seed-specific deviation
+
+\[ \delta_r(s,\ell,f) = z_r(s,\ell,f) - \bar z(s,\ell,f). \]
+
+This term is essential.
+It measures how far one specific seed moves the system away from the seed-mean
+winner bias.
+Large negative \(\delta_r\) means that seed \(r\) weakens the eventual winner's
+advantage at that frame and observation.
+Large positive \(\delta_r\) means that seed \(r\) strengthens it.
+
+Define the sample standard deviation
+
+\[ \hat\sigma(s,\ell,f) = \sqrt{\frac{1}{N-1}\sum_{r \in \mathcal{R}} \delta_r(s,\ell,f)^2}. \]
+
+The use of the **standard deviation** rather than the variance is important,
+because \(\hat\sigma\) has the same physical unit as \(z_r\) and \(\bar z\).
+There is therefore no sign ambiguity:
+\(\hat\sigma \ge 0\) by definition.
+
+### 10.4 Standardized competition margin and flip probability
+
+Define the standardized competition margin
+
+\[ \eta(s,\ell,f) = \frac{\bar z(s,\ell,f)}{\hat\sigma(s,\ell,f) + \varepsilon}. \]
+
+This ratio has a direct statistical meaning.
+The numerator \(\bar z\) is the average winner bias.
+The denominator \(\hat\sigma\) is the scale of seed-to-seed fluctuation around
+that bias.
+Therefore \(\eta\) is a signal-to-fluctuation ratio for the early winner
+advantage.
+
+If \(z_r(s,\ell,f)\) is modeled approximately as a one-dimensional random
+variable with mean \(\bar z\) and standard deviation \(\hat\sigma\), then a
+natural instability event is
+
+\[ z_r(s,\ell,f) \le 0, \]
+
+which means that under seed \(r\), the chosen feature no longer prefers the
+eventual winner over the strongest loser at that observation.
+
+The empirical flip probability is then
+
+\[ p_{\mathrm{flip}}(s,\ell,f) = \frac{1}{N}\sum_{r \in \mathcal{R}} \mathbf{1}[z_r(s,\ell,f) \le 0]. \]
+
+Under a Gaussian approximation,
+
+\[ \Pr[z_r(s,\ell,f) \le 0] \approx \Phi(-\eta(s,\ell,f)), \]
+
+where \(\Phi\) is the standard normal CDF.
+This is the main mathematical reason why \(\eta\) is useful.
+Smaller \(\eta\) implies a larger chance that seed fluctuations overturn the
+average winner bias.
+
+This approximation also gives a practical calibration:
+
+- \(\eta \approx 0.5\) corresponds to a flip probability of about \(0.31\);
+- \(\eta \approx 1.0\) corresponds to a flip probability of about \(0.16\);
+- \(\eta \approx 1.5\) corresponds to a flip probability of about \(0.07\);
+- \(\eta \approx 2.0\) corresponds to a flip probability of about \(0.02\).
+
+The first implementation should therefore use both an absolute and a relative
+selection rule.
+
+1. absolute instability bands
+   - high-sensitivity competition zone: \(\eta < 1.0\);
+   - transitional zone: \(1.0 \le \eta < 2.0\);
+   - stable early winner bias: \(\eta \ge 2.0\).
+
+2. prompt-relative ranking
+   - within one prompt, rank all \((s,\ell,f)\) observations by ascending
+     \(\eta\);
+   - prioritize the bottom decile or bottom quintile for qualitative study.
+
+The empirical flip probability \(p_{\mathrm{flip}}\) should always be reported
+alongside \(\eta\).
+The ratio alone is not the final result.
+It is the compact standardized summary, while the observed flip frequency is the
+direct finite-sample measurement.
+
+### 10.5 Seed-level deviation summaries
+
+The deviation \(\delta_r\) should not be discarded after computing
+\(\hat\sigma\).
+It is also the key object for seed-wise diagnosis.
+
+For one seed \(r\), define the mean standardized deviation over all selected
+observations
+
+\[ B_r = \frac{1}{|\mathcal{Q}|}\sum_{(s,\ell,f) \in \mathcal{Q}} \frac{\delta_r(s,\ell,f)}{\hat\sigma(s,\ell,f) + \varepsilon}, \]
+
+where \(\mathcal{Q}\) contains only observations with at least two candidates
+and finite \(\hat\sigma\).
+
+Also define the seed-level flip rate
+
+\[ F_r = \frac{1}{|\mathcal{Q}|}\sum_{(s,\ell,f) \in \mathcal{Q}} \mathbf{1}[z_r(s,\ell,f) \le 0]. \]
+
+Interpretation:
+
+- strongly negative \(B_r\) means that seed \(r\) systematically weakens the
+  eventual winner bias relative to the seed ensemble;
+- strongly positive \(B_r\) means that seed \(r\) systematically strengthens it;
+- large \(F_r\) means that the seed frequently pushes early competition into the
+  loser-favored regime.
+
+This seed-wise view is useful for connecting early coupling instability to later
+good-versus-bad trajectory outcomes.
+
+### 10.6 Frame-level proposal anchors
+
+Frame-level anchor analysis should reuse existing caches whenever possible.
+For one observation \((s,\ell)\) and frame \(f\), define the following
+proposal-anchor indicators.
+
+1. frame-level candidate entropy
+
+\[ H^{\pi}_{s,\ell}(f) = -\sum_{k=1}^{K_{s,\ell,f}} \pi_{s,\ell,f,k}\log(\pi_{s,\ell,f,k} + \varepsilon). \]
+
+In implementation, this value is already stored as `candidate_entropy` in
+`trajectory_consensus_winner_gap.csv`.
+
+2. frame-level winner-loser gap
+
+\[ G^{\pi}_{s,\ell}(f) = \pi^{(1)}_{s,\ell,f} - \pi^{(2)}_{s,\ell,f}, \]
+
+where \(\pi^{(1)}\) and \(\pi^{(2)}\) are the largest and second-largest
+candidate proposal strengths in frame \(f\).
+In implementation, this value is already stored as `winner_gap` in
+`trajectory_consensus_winner_gap.csv`.
+
+3. frame-level spatial-map entropy
+
+Let \(m_{s,\ell,f}(u)\) be the normalized cross-attention `head-mean` map over
+spatial token location \(u\) in frame \(f\).
+Define
+
+\[ H^{\mathrm{map}}_{s,\ell}(f) = -\sum_u m_{s,\ell,f}(u)\log(m_{s,\ell,f}(u) + \varepsilon). \]
+
+This metric requires only the reused cross-attention maps.
+It does **not** require new candidate extraction.
+
+These three quantities should be kept separate rather than merged into one
+composite score.
+They answer related but not identical questions:
+
+- \(H^{\pi}\): how ambiguous the candidate competition currently is;
+- \(G^{\pi}\): how strongly the current proposal leader is separated from the
+  runner-up;
+- \(H^{\mathrm{map}}\): how concentrated the frame's spatial object readout is.
+
+### 10.7 Frame-level routing anchors from existing self-attention features
+
+The goal here is not to redefine the entire self-attention coupling stage.
+Instead, the frame-level routing analysis should be derived from existing
+candidate-level outputs.
+
+For one frame \(f\), define the frame leader
+
+\[ \hat{k}_{s,\ell,f} = \arg\max_k \pi_{s,\ell,f,k}. \]
+
+Then read the following leader-conditional quantities directly from
+`trajectory_consensus_self_attention_coupling_candidate_features.csv`:
+
+\[ M^{\mathrm{lead}}_{s,\ell,\mathrm{local}}(f) = \mathrm{MC}^{\max}_{s,\ell,\mathrm{local}}(f,\hat{k}_{s,\ell,f}), \]
+
+\[ M^{\mathrm{lead}}_{s,\ell,\mathrm{global}}(f) = \mathrm{MC}^{\max}_{s,\ell,\mathrm{global}}(f,\hat{k}_{s,\ell,f}), \]
+
+\[ I^{\mathrm{support,lead}}_{s,\ell,\mathrm{local}}(f) = I^{\mathrm{support}}_{s,\ell,\mathrm{local}}(f,\hat{k}_{s,\ell,f}), \]
+
+\[ I^{\mathrm{support,lead}}_{s,\ell,\mathrm{global}}(f) = I^{\mathrm{support}}_{s,\ell,\mathrm{global}}(f,\hat{k}_{s,\ell,f}), \]
+
+\[ I^{\mathrm{pref,lead}}_{s,\ell,\mathrm{local}}(f) = I^{\mathrm{pref}}_{s,\ell,\mathrm{local}}(f,\hat{k}_{s,\ell,f}), \]
+
+\[ I^{\mathrm{pref,lead}}_{s,\ell,\mathrm{global}}(f) = I^{\mathrm{pref}}_{s,\ell,\mathrm{global}}(f,\hat{k}_{s,\ell,f}), \]
+
+\[ I^{\mathrm{vote,lead}}_{s,\ell,\mathrm{local}}(f) = I^{\mathrm{vote}}_{s,\ell,\mathrm{local}}(f,\hat{k}_{s,\ell,f}), \]
+
+\[ I^{\mathrm{vote,lead}}_{s,\ell,\mathrm{global}}(f) = I^{\mathrm{vote}}_{s,\ell,\mathrm{global}}(f,\hat{k}_{s,\ell,f}). \]
+
+These are the first routing-anchor indicators and should be treated as the
+default frame-level view of how strongly the current leader candidate is
+supported by the rest of the sequence.
+
+In addition, define frame-level mutual-consistency maxima
+
+\[ M^{\mathrm{frame\text{-}max}}_{s,\ell,\mathrm{local}}(f) = \max_k \mathrm{MC}^{\max}_{s,\ell,\mathrm{local}}(f,k), \]
+
+\[ M^{\mathrm{frame\text{-}max}}_{s,\ell,\mathrm{global}}(f) = \max_k \mathrm{MC}^{\max}_{s,\ell,\mathrm{global}}(f,k). \]
+
+Let \(M^{(1)}\) and \(M^{(2)}\) be the largest and second-largest candidate
+values of \(\mathrm{MC}^{\max}\) inside one frame.
+Define the corresponding frame-level top-two gap
+
+\[ \Delta M^{\mathrm{frame}}_{s,\ell,\mathrm{local}}(f) = M^{(1)}_{s,\ell,\mathrm{local}}(f) - M^{(2)}_{s,\ell,\mathrm{local}}(f), \]
+
+\[ \Delta M^{\mathrm{frame}}_{s,\ell,\mathrm{global}}(f) = M^{(1)}_{s,\ell,\mathrm{global}}(f) - M^{(2)}_{s,\ell,\mathrm{global}}(f). \]
+
+These gap metrics are important because a large frame-level maximum alone does
+not guarantee that the competition inside that frame is resolved.
+If both the top and the second-best candidate have similarly large mutual
+consistency, the frame is still ambiguous.
+
+### 10.8 Frame-to-frame routing strength for arrow visualizations
+
+To visualize which frames act as routing sources, reuse the saved pairwise
+self-attention coupling rows.
+
+The main analysis should use a leader-conditional source definition.
+For one source frame \(f\) and target frame \(g \ne f\), define
+
+\[ A^{\mathrm{lead}}_{s,\ell}(f \to g) = \sum_b \overline C^{\mathrm{raw}}_{s,\ell}(f,\hat{k}_{s,\ell,f} \to g,b). \]
+
+This value asks:
+how much raw candidate-directed support does the current leader candidate in
+frame \(f\) send to frame \(g\)?
+
+As a robustness check, also define the unweighted frame average
+
+\[ A^{\mathrm{avg}}_{s,\ell}(f \to g) = \frac{1}{K_{s,\ell,f}}\sum_{k=1}^{K_{s,\ell,f}} \sum_b \overline C^{\mathrm{raw}}_{s,\ell}(f,k \to g,b). \]
+
+The default interpretation should use \(A^{\mathrm{lead}}\), because the
+scientific question is about how the currently leading candidate in one frame
+influences the rest of the sequence.
+The averaged version is a secondary check that the result is not entirely driven
+by the single leader selection rule.
+
+### 10.9 Planned visualizations
+
+This sub-experiment should provide both conventional statistical figures and a
+small set of more distinctive qualitative figures.
+
+1. seed-sensitivity heatmaps
+   - x-axis: layer;
+   - y-axis: step;
+   - value: frame-averaged \(\eta(s,\ell,f)\) or frame-averaged
+     \(p_{\mathrm{flip}}(s,\ell,f)\).
+
+2. frame-level competition heatmaps
+   - for anchor-frame metrics, render one heatmap **per layer**;
+   - x-axis: frame;
+   - y-axis: step;
+   - this avoids collapsing all selected \((s,\ell)\) observations into one
+     unreadable \((step,layer)\)-stacked panel.
+   - metric family examples:
+     \(H^{\pi}\), \(G^{\pi}\), \(H^{\mathrm{map}}\),
+     \(M^{\mathrm{lead}}\), \(I^{\mathrm{support,lead}}\),
+     \(I^{\mathrm{pref,lead}}\), \(I^{\mathrm{vote,lead}}\),
+     \(M^{\mathrm{frame\text{-}max}}\), and \(\Delta M^{\mathrm{frame}}\).
+
+3. anchor-frame scatter family
+   - mimic the `self_attention_coupling/layer3_navigation` scatter layout;
+   - pool all selected layer-frame observations into one overall scatter per
+     metric, then render an additional scatter for every selected diffusion
+     step;
+   - x-axis: the chosen anchor-frame metric;
+   - y-axis: token frame index;
+   - points that belong to the selected top-\(k\) anchor frames within their own
+     \((s,\ell)\) observation receive a light-blue outline.
+
+4. seed-wise deviation canvas
+   - fix one observation \((s,\ell,f)\) or one selected frame set;
+   - x-axis: frame or ordered observation;
+   - y-axis: seed;
+   - color: standardized deviation
+     \(\delta_r(s,\ell,f) / (\hat\sigma(s,\ell,f) + \varepsilon)\).
+   - This figure is the most direct use of \(\delta_r\) and reveals which seeds
+     consistently weaken or strengthen the early winner bias.
+
+5. empirical flip histogram and Gaussian calibration plot
+   - compare the observed \(p_{\mathrm{flip}}\) against the Gaussian proxy
+     \(\Phi(-\eta)\) over all selected observations;
+   - this checks whether the signal-to-fluctuation interpretation is a useful
+     approximation in practice.
+
+6. routing arrow panels
+   - uniformly sample ten displayed token frames;
+   - the canvas may show only frame labels or a blank background;
+   - draw one panel for \(A^{\mathrm{lead}}(f \to g)\) and one panel for
+     \(A^{\mathrm{avg}}(f \to g)\);
+   - for each displayed source frame \(f\), compute the chosen routing score for
+     all other displayed target frames \(g\);
+   - keep the top-\(k\) targets for \(k \in \{1,2\}\);
+   - draw smooth green arrows from the top-center point of frame \(f\) to the
+     top-center point of each selected target frame;
+   - arrow width is proportional to the globally normalized routing strength over
+     all displayed arrows in the panel.
+
+7. reverse anchor count plot
+   - for each arrow panel, count how many times each frame is selected as a
+     top-\(k\) target by other frames;
+   - render a bar chart or lollipop plot beside the arrow panel;
+   - frames with high incoming arrow counts are candidate routing anchors.
+
+### 10.10 Planned implementation protocol
+
+The planned `seed_influence` stage should expose two independent internal
+modes, `seed_sensitivity` and `anchor_frame`, and should:
+
+1. run as one standalone stage name, `seed_influence`, while using
+   `TRAJECTORY_CONSENSUS_SEED_INFLUENCE_MODE` to choose the internal branch;
+2. expose separate step controls for the two internal branches:
+   `TRAJECTORY_CONSENSUS_SEED_SENSITIVITY_STEPS` and
+   `TRAJECTORY_CONSENSUS_ANCHOR_FRAME_STEPS`;
+3. reuse existing `candidate_consensus` and `self_attention_coupling` caches for
+   each seed under the same prompt whenever the chosen branch allows it;
+4. build the observation set \(\mathcal{T}\) from the branch-specific selected steps
+   and all layers;
+5. compute \(z_r\) from global mutual consistency winner-minus-loser gaps as the
+   primary variable;
+6. compute \(\bar z\), \(\delta_r\), \(\hat\sigma\), \(\eta\), and
+   \(p_{\mathrm{flip}}\) for every valid \((s,\ell,f)\);
+7. export seed-wise summary scores \(B_r\) and \(F_r\);
+8. derive proposal-anchor metrics from `trajectory_consensus_winner_gap.csv` and
+   reused cross-attention maps;
+9. derive routing-anchor metrics from
+   `trajectory_consensus_self_attention_coupling_candidate_features.csv`;
+10. derive both \(A^{\mathrm{lead}}\) and \(A^{\mathrm{avg}}\) frame-to-frame
+   routing arrows from
+   `trajectory_consensus_self_attention_coupling_pairwise.csv`;
+11. rank unstable observations by \(\eta\) and \(p_{\mathrm{flip}}\);
+12. visualize the most unstable early observations and the most influential
+    routing frames before moving to any more expensive causal intervention.
+
+The first implementation should stay **layer-mean** rather than head-wise.
+Head-wise variants are possible later, but they should only be introduced after
+the layer-mean seed-sensitivity results clearly identify the most informative
+shallow layers and early observations.
+
+## 11. Optional Appendix: Trajectory Graph and Dynamic Programming
 
 This section is retained as an optional appendix only.
 It is **not** a near-term implementation priority.
@@ -1307,11 +1901,11 @@ The reason is simple:
 
 The formulas are kept here because they may later be useful as a derived summary.
 
-### 10.1 Node score
+### 11.1 Node score
 
 \[ u_{f,k} = \log(\bar a_{s,\ell,f,k} + \varepsilon). \]
 
-### 10.2 Edge score
+### 11.2 Edge score
 
 Let \(c_{f,k}\) be the candidate center.
 Let \(C_f(k \to k')\) be a self-attention coupling summary between adjacent frames.
@@ -1319,13 +1913,13 @@ Define
 
 \[ \Psi_f(k \to k') = \lambda_{\mathrm{sa}} \log(C_f(k \to k') + \varepsilon) - \lambda_{\mathrm{geo}}\|c_{f+1,k'} - c_{f,k}\|_2^2. \]
 
-### 10.3 Trajectory score
+### 11.3 Trajectory score
 
 For one candidate trajectory \(T = (k_1, k_2, \dots, k_F)\), define
 
 \[ S(T) = \sum_{f=1}^{F} u_{f,k_f} + \sum_{f=1}^{F-1} \Psi_f(k_f \to k_{f+1}). \]
 
-### 10.4 Decoding
+### 11.4 Decoding
 
 The best trajectory can be decoded by Viterbi-style max-sum dynamic programming:
 
@@ -1341,9 +1935,9 @@ The final best path is obtained by tracing back from \(\arg\max_k \mathrm{DP}_F(
 
 For top-\(K\) paths, beam search is the recommended first implementation.
 
-## 11. Seed Sensitivity Interpretation
+## 12. Seed Sensitivity Interpretation
 
-The intended mechanistic interpretation is now centered on Sections 8 and 9.
+The intended mechanistic interpretation is now centered on Sections 8, 9, and 10.
 
 - seeds perturb early candidate weights \(a_{s,\ell,h,f,k}\) and therefore also perturb the clean winner gap \(G_{s,\ell,f}\);
 - seeds also perturb candidate-to-candidate compatibility scores \(C_{s,\ell,h}(f,a \to g,b)\), chainability scores \(\Gamma_{s,\ell,\mathrm{local}}(f,k)\) and \(\Gamma_{s,\ell,\mathrm{global}}(f,k)\), mutual consistency \(\mathrm{MC}_{s,\ell}(f,a;g,b)\), and head agreement \(A^{\mathrm{head}}_{s,\ell}(f,a \to g)\);
@@ -1358,12 +1952,12 @@ The main tools for testing it are therefore:
 - cross-attention proposal baseline versus self-attention precedence comparison;
 - phase-specialization analysis on top of those two.
 
-## 12. Phase Specialization
+## 13. Phase Specialization
 
 `phase_specialization` should be treated as a secondary analysis built on saved caches.
 It should not recollect activations by itself.
 
-### 12.1 Why this is secondary
+### 13.1 Why this is secondary
 
 The main scientific question is not whether a head can be given a label, but which mechanisms drive consensus formation.
 Therefore phase labels should be assigned **after** the primary causal and coupling readouts are available.
@@ -1375,7 +1969,7 @@ The recommended input caches are:
 - head intervention metrics from Section 8;
 - self-attention coupling metrics from Section 9.
 
-### 12.2 Phase windows from clean consensus dynamics
+### 13.2 Phase windows from clean consensus dynamics
 
 Let the ordered downstream observation index be \(t = 1, \dots, T\), where one index \(t\) corresponds to one selected pair \((s_t, \ell_t)\).
 Using the clean candidate statistics, define four phase windows.
@@ -1394,7 +1988,7 @@ Using the clean candidate statistics, define four phase windows.
 
 The exact thresholds should be derived from the clean winner-gap curve rather than fixed globally whenever possible.
 
-### 12.3 Role scores
+### 13.3 Role scores
 
 For one analyzed head \(q\), first aggregate frame-wise intervention metrics into one observation-level summary at observation index \(t\):
 
@@ -1437,7 +2031,7 @@ The intended interpretation is:
 - high `Commitment` means the head stabilizes the winner identity;
 - high `Grounding` means the head contributes strongly to the final output while affecting candidate competition only weakly.
 
-### 12.4 Assignment strategy
+### 13.4 Assignment strategy
 
 The first implementation should use a transparent rule-based assignment:
 
@@ -1447,14 +2041,14 @@ The first implementation should use a transparent rule-based assignment:
 
 This is preferable to clustering as a first pass because it is easier to audit scientifically.
 
-## 13. Current and Planned Outputs
+## 14. Current and Planned Outputs
 
 The current implementation can produce:
 
 - `trajectory_consensus_candidate_regions.csv`
 - `trajectory_consensus_candidate_regions.pt`
-- `trajectory_consensus_candidate_regions_per_head.csv`
-- `trajectory_consensus_candidate_regions_per_head.pt`
+- `trajectory_consensus_candidate_regions_per_head.csv` when `trajectory_consensus_candidate_enable_per_head=True`
+- `trajectory_consensus_candidate_regions_per_head.pt` when `trajectory_consensus_candidate_enable_per_head=True`
 - `trajectory_consensus_candidate_weights.csv`
 - `trajectory_consensus_winner_gap.csv`
 - `trajectory_consensus_candidate_region_viz/`
@@ -1474,11 +2068,16 @@ Planned later outputs include:
 - `trajectory_consensus_self_attention_coupling_candidate_features.csv`
 - `trajectory_consensus_self_attention_coupling_temporal_precedence.csv`
 - `trajectory_consensus_self_attention_plots/`
+- `trajectory_consensus_seed_sensitivity_framewise.csv`
+- `trajectory_consensus_seed_sensitivity_seedwise.csv`
+- `trajectory_consensus_seed_sensitivity_summary.csv`
+- `trajectory_consensus_anchor_frames.csv`
+- `trajectory_consensus_anchor_plots/`
 - `trajectory_consensus_phase_scores.csv`
 - optional `trajectory_consensus_trajectory_graph.csv`
 - optional `trajectory_consensus_topk_paths.json`
 
-## 14. Recommended Execution Order
+## 15. Recommended Execution Order
 
 The recommended workflow is:
 
@@ -1486,18 +2085,22 @@ The recommended workflow is:
 2. optionally run `head_trajectory_dynamics` if early-alignment scatter plots are needed;
 3. run `trajectory_consensus_dynamics` with `trajectory_consensus_stages=candidate_consensus`;
 4. run the planned `self_attention_coupling` stage, because it reuses the cached candidate partition and helps identify the most interesting self-attention heads and candidate features;
-5. run `trajectory_consensus_dynamics` with `trajectory_consensus_stages=head_contribution`;
-6. later run the planned `candidate_intervention` stage on a smaller set of selected source heads selected from the earlier analyses;
-7. run `phase_specialization` only after the earlier caches exist.
+5. run the planned `seed_influence` stage, because it reuses the saved coupling features and highlights the most unstable observations and the most influential frames;
+6. run `trajectory_consensus_dynamics` with `trajectory_consensus_stages=head_contribution`;
+7. later run the planned `candidate_intervention` stage on a smaller set of selected source heads selected from the earlier analyses;
+8. run `phase_specialization` only after the earlier caches exist.
 
 Rerun any completed stage with `trajectory_consensus_plot_only_from_csv=True` whenever only visualization updates are needed.
 
 This order keeps expensive runtime ablation separate from offline candidate extraction and makes the later phase analysis auditable.
 
-## 15. Practical Notes
+## 16. Practical Notes
 
 - The current heatmaps in this experiment use a diverging `bwr` colormap.
 - The current code parallelizes candidate-region extraction and candidate visualization rendering over CPU workers.
+- `trajectory_consensus_num_workers` is a bounded engineering control: it caps both the number of worker processes and the number of in-flight tasks submitted to one process pool, so large plotting batches do not queue the full task list in memory at once.
+- The shared CPU worker helper uses an explicit `spawn` multiprocessing context instead of inheriting the already-loaded Wan runtime via `fork`; this avoids the misleading multi-process memory explosion in process monitors and reduces copy-on-write risk once plotting or feature workers start mutating Python or NumPy state.
+- In `self_attention_coupling`, scatter plots are rendered as one compact batch per feature-target family rather than as one heavy task per output PDF; this keeps the plotting payload proportional to the relevant point cloud instead of repeatedly copying the full candidate-feature table.
 - The candidate extractor must be validated visually before any quantitative interpretation is trusted.
 - Candidate intervention should always evaluate ablated runs on the clean candidate partition before introducing any more complex rematching logic.
 - Frame-wise candidate regions are the primary representation; the trajectory-graph appendix is optional and not a current priority.

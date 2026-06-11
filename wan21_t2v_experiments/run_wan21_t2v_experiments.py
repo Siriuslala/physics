@@ -28,6 +28,24 @@ def _parse_csv_strs(s: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
+def _parse_wan21_t2v_channel_profile_target_pairs(s: str) -> List[Tuple[int, int]]:
+    if not s:
+        return []
+    pairs: List[Tuple[int, int]] = []
+    for item in s.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                "self_attention_modulation_channel_profile_targets must use step:layer pairs, "
+                f"got {item!r}."
+            )
+        step_text, layer_text = item.split(":", 1)
+        pairs.append((int(step_text.strip()), int(layer_text.strip())))
+    return pairs
+
+
 def _parse_optional_csv_strs_with_none(s: str) -> Optional[List[str]]:
     """Parse a CSV string with an explicit `None` sentinel.
 
@@ -905,6 +923,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="If true, stop diffusion immediately after the last requested self_attention_modulation probe step.",
     )
+    parser.add_argument(
+        "--self_attention_modulation_channel_profile_targets",
+        type=str,
+        default="",
+        help=(
+            "CSV of step:layer pairs for extra channel-profile bar plots in self_attention_modulation, "
+            'for example "1:0,1:28,25:0". Empty means draw bar plots for all collected step-layer pairs.'
+        ),
+    )
+    parser.add_argument(
+        "--self_attention_modulation_channel_profile_topk",
+        type=int,
+        default=12,
+        help="Top-k channel indices annotated on each channel-profile bar plot.",
+    )
+    parser.add_argument(
+        "--self_attention_modulation_plot_only_from_saved",
+        type=_str2bool,
+        default=False,
+        help=(
+            "If true, skip sampling/model execution and redraw self_attention_modulation figures "
+            "only from saved CSV/PT artifacts under output_dir."
+        ),
+    )
 
     # Seed-to-trajectory predictability options
     parser.add_argument(
@@ -973,7 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="candidate_consensus,head_contribution",
         help=(
             "CSV stages for trajectory_consensus_dynamics. Supported: "
-            "candidate_consensus,head_contribution,self_attention_coupling."
+            "candidate_consensus,head_contribution,self_attention_coupling,seed_influence."
         ),
     )
     parser.add_argument(
@@ -1031,7 +1073,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--trajectory_consensus_scatter_outlier_heads",
         type=str,
         default="",
-        help="CSV head tags like `L0H4` removed only from the filtered scatter plots.",
+        help="Legacy CSV head tags like `L0H4` removed from filtered scatter plots for both cross and self modules.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_scatter_outlier_cross_heads",
+        type=str,
+        default="",
+        help="CSV cross-attention head tags like `L0H4` removed only from filtered cross-attention scatter plots.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_scatter_outlier_self_heads",
+        type=str,
+        default="",
+        help="CSV self-attention head tags like `L0H4` removed only from filtered self-attention scatter plots.",
     )
     parser.add_argument("--trajectory_consensus_candidate_base_quantile", type=float, default=0.85)
     parser.add_argument(
@@ -1047,6 +1101,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trajectory_consensus_candidate_preprocess_despike_quantile", type=float, default=0.98)
     parser.add_argument("--trajectory_consensus_candidate_min_component_area", type=int, default=4)
     parser.add_argument("--trajectory_consensus_candidate_viz_num_frames", type=int, default=8)
+    parser.add_argument("--trajectory_consensus_candidate_enable_per_head", type=_str2bool, default=True)
     parser.add_argument(
         "--trajectory_consensus_contribution_method",
         type=str,
@@ -1134,6 +1189,52 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trajectory_consensus_plot_only_from_csv", type=_str2bool, default=False)
     parser.add_argument("--trajectory_consensus_skip_existing_plots", type=_str2bool, default=True)
     parser.add_argument(
+        "--trajectory_consensus_seed_influence_mode",
+        type=str,
+        default="seed_sensitivity",
+        choices=["seed_sensitivity", "anchor_frame"],
+        help="Mode used when trajectory_consensus_dynamics runs the seed_influence stage.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_seed_influence_seeds",
+        type=str,
+        default="",
+        help="CSV seed list used by trajectory_consensus_dynamics seed_influence seed_sensitivity mode.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_seed_sensitivity_zr_metric",
+        type=str,
+        default="global_mutual_consistency",
+        help=(
+            "Candidate-level scalar used to define z_r in trajectory_consensus_dynamics "
+            "seed_influence seed_sensitivity mode."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_consensus_seed_sensitivity_steps",
+        type=str,
+        default="",
+        help="CSV step list used only by trajectory_consensus_dynamics seed_influence seed_sensitivity mode.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_anchor_frame_steps",
+        type=str,
+        default="",
+        help="CSV step list used only by trajectory_consensus_dynamics seed_influence anchor_frame mode.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_seed_influence_anchor_topk",
+        type=int,
+        default=2,
+        help="Number of anchor frames highlighted in seed_influence anchor_frame scatter plots.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_seed_influence_arrow_topk",
+        type=int,
+        default=2,
+        help="Top-k routing targets drawn per source frame in seed_influence anchor_frame arrow plots.",
+    )
+    parser.add_argument(
         "--trajectory_consensus_num_workers",
         type=int,
         default=0,
@@ -1205,6 +1306,9 @@ def main():
     self_attention_viz_query_video_frame_indices = _parse_csv_ints(args.self_attention_viz_query_video_frame_indices)
     self_attention_modulation_steps = _parse_csv_ints(args.self_attention_modulation_steps)
     self_attention_modulation_layers = _parse_csv_ints(args.self_attention_modulation_layers)
+    self_attention_modulation_channel_profile_targets = _parse_wan21_t2v_channel_profile_target_pairs(
+        args.self_attention_modulation_channel_profile_targets
+    )
     seed_to_trajectory_early_steps = _parse_csv_ints(args.seed_to_trajectory_early_steps)
     event_token_value_words = _parse_csv_strs(args.event_token_value_words)
     event_token_value_steps = _parse_csv_ints(args.event_token_value_steps)
@@ -1221,6 +1325,11 @@ def main():
     trajectory_consensus_modules = _parse_csv_strs(args.trajectory_consensus_modules)
     trajectory_consensus_reference_distance_metrics = _parse_csv_strs(args.trajectory_consensus_reference_distance_metric)
     trajectory_consensus_scatter_outlier_heads = _parse_csv_strs(args.trajectory_consensus_scatter_outlier_heads)
+    trajectory_consensus_scatter_outlier_cross_heads = _parse_csv_strs(args.trajectory_consensus_scatter_outlier_cross_heads)
+    trajectory_consensus_scatter_outlier_self_heads = _parse_csv_strs(args.trajectory_consensus_scatter_outlier_self_heads)
+    trajectory_consensus_seed_influence_seeds = _parse_csv_ints(args.trajectory_consensus_seed_influence_seeds)
+    trajectory_consensus_seed_sensitivity_steps = _parse_csv_ints(args.trajectory_consensus_seed_sensitivity_steps)
+    trajectory_consensus_anchor_frame_steps = _parse_csv_ints(args.trajectory_consensus_anchor_frame_steps)
     viz_layers = _parse_csv_ints(args.viz_layers)
     viz_frame_indices = _parse_csv_ints(args.viz_frame_indices)
     self_attention_viz_viz_frame_indices = _parse_csv_ints(args.self_attention_viz_viz_frame_indices)
@@ -1523,6 +1632,9 @@ def main():
             self_attention_modulation_layers=self_attention_modulation_layers,
             self_attention_modulation_branch=args.self_attention_modulation_branch,
             self_attention_modulation_stop_after_last_probe_step=args.self_attention_modulation_stop_after_last_probe_step,
+            self_attention_modulation_channel_profile_targets=self_attention_modulation_channel_profile_targets,
+            self_attention_modulation_channel_profile_topk=args.self_attention_modulation_channel_profile_topk,
+            self_attention_modulation_plot_only_from_saved=args.self_attention_modulation_plot_only_from_saved,
             save_video=args.save_video,
         )
     elif experiment_name == "seed_to_trajectory_predictability":
@@ -1714,6 +1826,8 @@ def main():
             trajectory_consensus_branch=args.trajectory_consensus_branch,
             trajectory_consensus_reference_distance_metrics=trajectory_consensus_reference_distance_metrics,
             trajectory_consensus_scatter_outlier_heads=trajectory_consensus_scatter_outlier_heads,
+            trajectory_consensus_scatter_outlier_cross_heads=trajectory_consensus_scatter_outlier_cross_heads,
+            trajectory_consensus_scatter_outlier_self_heads=trajectory_consensus_scatter_outlier_self_heads,
             trajectory_consensus_candidate_base_quantile=args.trajectory_consensus_candidate_base_quantile,
             trajectory_consensus_candidate_split_quantiles=tuple(
                 float(x) for x in _parse_csv_strs(args.trajectory_consensus_candidate_split_quantiles)
@@ -1725,6 +1839,7 @@ def main():
             trajectory_consensus_candidate_preprocess_despike_quantile=args.trajectory_consensus_candidate_preprocess_despike_quantile,
             trajectory_consensus_candidate_min_component_area=args.trajectory_consensus_candidate_min_component_area,
             trajectory_consensus_candidate_viz_num_frames=args.trajectory_consensus_candidate_viz_num_frames,
+            trajectory_consensus_candidate_enable_per_head=args.trajectory_consensus_candidate_enable_per_head,
             trajectory_consensus_do_ablation=args.trajectory_consensus_do_ablation,
             trajectory_consensus_contribution_method=args.trajectory_consensus_contribution_method,
             trajectory_consensus_ablate_position=args.trajectory_consensus_ablate_position,
@@ -1741,6 +1856,13 @@ def main():
             trajectory_consensus_sa_covered_mass_min=args.trajectory_consensus_sa_covered_mass_min,
             trajectory_consensus_sa_precedence_persistence=args.trajectory_consensus_sa_precedence_persistence,
             trajectory_consensus_plot_only_from_csv=args.trajectory_consensus_plot_only_from_csv,
+            trajectory_consensus_seed_influence_mode=args.trajectory_consensus_seed_influence_mode,
+            trajectory_consensus_seed_influence_seeds=trajectory_consensus_seed_influence_seeds,
+            trajectory_consensus_seed_sensitivity_zr_metric=args.trajectory_consensus_seed_sensitivity_zr_metric,
+            trajectory_consensus_seed_sensitivity_steps=trajectory_consensus_seed_sensitivity_steps,
+            trajectory_consensus_anchor_frame_steps=trajectory_consensus_anchor_frame_steps,
+            trajectory_consensus_seed_influence_anchor_topk=args.trajectory_consensus_seed_influence_anchor_topk,
+            trajectory_consensus_seed_influence_arrow_topk=args.trajectory_consensus_seed_influence_arrow_topk,
             trajectory_consensus_skip_existing_plots=args.trajectory_consensus_skip_existing_plots,
             trajectory_consensus_num_workers=args.trajectory_consensus_num_workers,
         )

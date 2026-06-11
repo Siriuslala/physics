@@ -22,6 +22,7 @@ import pickle
 import random
 import re
 import sys
+import gc
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -44,6 +45,7 @@ from .self_attention_distribution import (
 )
 from .utils import (
     Wan21T2VParallelConfig,
+    _map_wan21_t2v_token_frame_to_video_frame_label,
     _broadcast_seed_if_needed,
     _build_wan21_t2v_pipeline,
     _dedup_wan21_t2v_int_list,
@@ -63,6 +65,7 @@ from .utils import (
     _resolve_wan21_t2v_branch_from_forward_call_index,
     _resolve_wan21_t2v_num_workers,
     _resolve_wan21_t2v_offload_model,
+    _resolve_wan21_t2v_viz_frame_indices,
     _run_wan21_t2v_once_with_patch,
     _save_csv,
     _save_json,
@@ -101,6 +104,29 @@ def _load_wan21_t2v_torch_cache(path: str) -> Any:
             return torch.load(path, map_location="cpu")
 
 
+def _resolve_wan21_t2v_trajectory_consensus_viz_frames(
+    attention_frame_count: int,
+    video_frame_count: int,
+    num_frames: int,
+) -> Tuple[List[int], List[int]]:
+    """Resolve token-frame indices and display them using token-frame labels.
+
+    The selected frame subset still reuses the same sampling rule as
+    `cross_attention_token_viz`, but trajectory-consensus figures now display
+    the token-frame indices directly, that is, `0 .. attention_frame_count-1`.
+    """
+    attention_frame_indices, _ = _resolve_wan21_t2v_viz_frame_indices(
+        attention_frame_count=int(attention_frame_count),
+        video_frame_count=int(video_frame_count),
+        num_frames=int(num_frames),
+        explicit_indices=None,
+    )
+    return (
+        [int(frame_index) for frame_index in attention_frame_indices],
+        [int(frame_index) for frame_index in attention_frame_indices],
+    )
+
+
 def _resolve_wan21_t2v_selected_head_specs_from_layer_counts(
     explicit_head_specs: Optional[Sequence[str]],
     num_heads_per_layer: Dict[int, int],
@@ -131,6 +157,7 @@ def _plot_wan21_t2v_trajectory_consensus_heatmap(
     value_key: str,
     row_label: str,
     col_label: str,
+    cmap: str = "bwr",
 ):
     """Render a heatmap from flat row dictionaries."""
     import matplotlib
@@ -156,16 +183,19 @@ def _plot_wan21_t2v_trajectory_consensus_heatmap(
     fig, axis = plt.subplots(1, 1, figsize=(fig_width, fig_height))
     heatmap_np = heatmap.numpy()
     finite_values = heatmap[~torch.isnan(heatmap)]
+    cmap_name = str(cmap).strip() or "bwr"
     if finite_values.numel() > 0:
         data_min = float(finite_values.min().item())
         data_max = float(finite_values.max().item())
-        if data_min < 0.0 < data_max:
+        if cmap_name.lower() == "blues":
+            image = axis.imshow(heatmap_np, cmap=cmap_name, aspect="auto", vmin=0.0, vmax=max(data_max, 1e-12))
+        elif data_min < 0.0 < data_max:
             bound = max(abs(data_min), abs(data_max))
-            image = axis.imshow(heatmap_np, cmap="bwr", aspect="auto", vmin=-bound, vmax=bound)
+            image = axis.imshow(heatmap_np, cmap=cmap_name, aspect="auto", vmin=-bound, vmax=bound)
         else:
-            image = axis.imshow(heatmap_np, cmap="bwr", aspect="auto", vmin=data_min, vmax=data_max)
+            image = axis.imshow(heatmap_np, cmap=cmap_name, aspect="auto", vmin=data_min, vmax=data_max)
     else:
-        image = axis.imshow(heatmap_np, cmap="bwr", aspect="auto")
+        image = axis.imshow(heatmap_np, cmap=cmap_name, aspect="auto")
     axis.set_title(title)
     axis.set_xlabel(col_label)
     axis.set_ylabel(row_label)
@@ -328,7 +358,8 @@ def _trajectory_consensus_render_candidate_viz_task(task: Tuple) -> str:
         label_map_fhw,
         save_file,
         title,
-        frame_indices,
+        attention_frame_indices,
+        video_frame_labels,
         draw_candidate_contours,
         raw_map_cmap,
     ) = task
@@ -337,7 +368,8 @@ def _trajectory_consensus_render_candidate_viz_task(task: Tuple) -> str:
         label_map_fhw=label_map_fhw,
         save_file=save_file,
         title=title,
-        frame_indices=frame_indices,
+        attention_frame_indices=attention_frame_indices,
+        video_frame_labels=video_frame_labels,
         draw_candidate_contours=bool(draw_candidate_contours),
         raw_map_cmap=str(raw_map_cmap),
     )
@@ -363,7 +395,8 @@ def _trajectory_consensus_render_head_specific_candidate_viz_task(task: Tuple) -
         label_map_fhw,
         save_file,
         title,
-        frame_indices,
+        attention_frame_indices,
+        video_frame_labels,
         draw_candidate_contours,
         raw_map_cmap,
     ) = task
@@ -372,7 +405,8 @@ def _trajectory_consensus_render_head_specific_candidate_viz_task(task: Tuple) -
         label_map_fhw=label_map_fhw,
         save_file=save_file,
         title=title,
-        frame_indices=frame_indices,
+        attention_frame_indices=attention_frame_indices,
+        video_frame_labels=video_frame_labels,
         draw_candidate_contours=bool(draw_candidate_contours),
         raw_map_cmap=str(raw_map_cmap),
     )
@@ -1129,12 +1163,219 @@ def _compute_wan21_t2v_candidate_weights_for_head_map(
     return all_weights
 
 
+def _build_wan21_t2v_reference_object_boxes(
+    reference_map_fhw: torch.Tensor,
+    center_mode: str = "centroid",
+    traj_power: float = 1.5,
+    traj_quantile: float = 0.8,
+    support_radius_mode: str = "adaptive_area",
+    support_radius_fixed: float = 2.0,
+    support_radius_alpha: float = 1.5,
+    support_radius_min: float = 1.0,
+    support_radius_max_ratio: float = 0.25,
+) -> List[Dict[str, float]]:
+    """Construct one reference object box per token frame from a reference head-mean map."""
+    reference_trajectory_data = _extract_wan21_t2v_reference_peak_and_centroid_trajectory(
+        map_fhw=reference_map_fhw,
+        power=float(traj_power),
+        quantile=float(traj_quantile),
+    )
+    center_mode = str(center_mode).strip().lower()
+    if center_mode == "peak":
+        center_trajectory = reference_trajectory_data["peak_centers"]
+    elif center_mode == "geometric_center":
+        center_trajectory = reference_trajectory_data["geometric_centers"]
+    else:
+        center_trajectory = reference_trajectory_data["centroid_centers"]
+
+    _, support_radius_per_frame = _build_wan21_t2v_trajectory_support_mask_from_centers(
+        center_trajectory=center_trajectory,
+        component_areas=reference_trajectory_data["component_areas"],
+        token_grid_height=int(reference_map_fhw.shape[1]),
+        token_grid_width=int(reference_map_fhw.shape[2]),
+        support_radius_mode=str(support_radius_mode),
+        support_radius_fixed=float(support_radius_fixed),
+        support_radius_alpha=float(support_radius_alpha),
+        support_radius_min=float(support_radius_min),
+        support_radius_max_ratio=float(support_radius_max_ratio),
+    )
+
+    token_grid_height = int(reference_map_fhw.shape[1])
+    token_grid_width = int(reference_map_fhw.shape[2])
+    boxes: List[Dict[str, float]] = []
+    for frame_index, ((center_y, center_x), radius_value) in enumerate(zip(center_trajectory, support_radius_per_frame)):
+        half_extent = float(max(1.0, float(radius_value)))
+        y0 = max(0.0, float(center_y) - half_extent)
+        y1 = min(float(token_grid_height - 1), float(center_y) + half_extent)
+        x0 = max(0.0, float(center_x) - half_extent)
+        x1 = min(float(token_grid_width - 1), float(center_x) + half_extent)
+        boxes.append(
+            {
+                "frame": float(frame_index),
+                "center_y": float(center_y),
+                "center_x": float(center_x),
+                "radius": float(radius_value),
+                "y0": float(y0),
+                "y1": float(y1),
+                "x0": float(x0),
+                "x1": float(x1),
+            }
+        )
+    return boxes
+
+
+def _merge_wan21_t2v_candidate_regions_by_reference_box(
+    label_map_fhw: torch.Tensor,
+    frame_metadata: Sequence[Sequence[Dict[str, object]]],
+    reference_boxes: Sequence[Dict[str, float]],
+    min_overlap_ratio: float = 0.75,
+) -> Tuple[torch.Tensor, List[List[Dict[str, object]]]]:
+    """Merge fragmented candidate regions that mostly lie inside the reference object box.
+
+    A candidate is merge-eligible only if a sufficient fraction of its own area
+    lies inside the frame-wise reference object box. If multiple candidates
+    satisfy this overlap-ratio rule, they are merged directly into one object
+    region. No additional center-distance, adjacency, or ranking heuristics are
+    applied here.
+    """
+    label_map = label_map_fhw.detach().cpu().to(torch.int64).clone()
+    merged_metadata: List[List[Dict[str, object]]] = []
+    frame_count = int(label_map.shape[0])
+    min_overlap_ratio = max(0.0, min(1.0, float(min_overlap_ratio)))
+
+    for frame_index in range(frame_count):
+        frame_label_map = label_map[frame_index]
+        original_frame_label_map = frame_label_map.clone()
+        frame_box = reference_boxes[frame_index] if frame_index < len(reference_boxes) else None
+        if frame_box is None:
+            merged_metadata.append([dict(row) for row in frame_metadata[frame_index]])
+            continue
+
+        token_grid_height = int(frame_label_map.shape[0])
+        token_grid_width = int(frame_label_map.shape[1])
+        y0 = max(0, min(token_grid_height - 1, int(math.floor(float(frame_box["y0"])))))
+        y1 = max(0, min(token_grid_height - 1, int(math.ceil(float(frame_box["y1"])))))
+        x0 = max(0, min(token_grid_width - 1, int(math.floor(float(frame_box["x0"])))))
+        x1 = max(0, min(token_grid_width - 1, int(math.ceil(float(frame_box["x1"])))))
+        box_mask = torch.zeros_like(frame_label_map, dtype=torch.bool)
+        box_mask[y0 : y1 + 1, x0 : x1 + 1] = True
+
+        eligible_candidate_ids: List[int] = []
+        frame_candidate_count = int(frame_label_map.max().item())
+        original_rows_by_candidate = {
+            int(row.get("candidate_index", -1)): dict(row)
+            for row in frame_metadata[frame_index]
+        }
+        candidate_masks: Dict[int, torch.Tensor] = {}
+        merged_source_indices: Dict[int, List[int]] = {
+            int(candidate_index): [int(candidate_index)]
+            for candidate_index in range(1, frame_candidate_count + 1)
+        }
+
+        for candidate_index in range(1, frame_candidate_count + 1):
+            candidate_mask = original_frame_label_map == int(candidate_index)
+            candidate_area = int(candidate_mask.sum().item())
+            if candidate_area <= 0:
+                continue
+            candidate_masks[int(candidate_index)] = candidate_mask
+            overlap_area = int(torch.logical_and(candidate_mask, box_mask).sum().item())
+            overlap_ratio = float(overlap_area / max(1, candidate_area))
+            if overlap_ratio < min_overlap_ratio:
+                continue
+            eligible_candidate_ids.append(int(candidate_index))
+
+        eligible_candidate_ids = sorted(set(int(candidate_index) for candidate_index in eligible_candidate_ids))
+        if len(eligible_candidate_ids) >= 2:
+            anchor_index = int(eligible_candidate_ids[0])
+            for candidate_index in eligible_candidate_ids[1:]:
+                frame_label_map[candidate_masks[int(candidate_index)]] = int(anchor_index)
+                merged_source_indices[int(anchor_index)].extend(
+                    merged_source_indices.get(int(candidate_index), [int(candidate_index)])
+                )
+                merged_source_indices[int(candidate_index)] = []
+
+        unique_candidate_indices = sorted(
+            int(candidate_index)
+            for candidate_index in torch.unique(frame_label_map).tolist()
+            if int(candidate_index) > 0
+        )
+        remapped_label_map = torch.zeros_like(frame_label_map, dtype=torch.int64)
+        remapped_rows: List[Dict[str, object]] = []
+        for new_candidate_index, old_candidate_index in enumerate(unique_candidate_indices, start=1):
+            candidate_mask = frame_label_map == int(old_candidate_index)
+            remapped_label_map[candidate_mask] = int(new_candidate_index)
+            points = torch.nonzero(candidate_mask, as_tuple=False).float()
+            candidate_area = int(points.shape[0])
+            bbox_stats = _wan21_t2v_candidate_mask_bbox_stats(candidate_mask)
+            centroid_y = float(points[:, 0].mean().item()) if candidate_area > 0 else 0.0
+            centroid_x = float(points[:, 1].mean().item()) if candidate_area > 0 else 0.0
+            source_rows = [
+                original_rows_by_candidate[source_index]
+                for source_index in merged_source_indices.get(int(old_candidate_index), [int(old_candidate_index)])
+                if int(source_index) in original_rows_by_candidate
+            ]
+            if source_rows:
+                representative_row = max(
+                    source_rows,
+                    key=lambda row: (
+                        float(row.get("mass", float("-inf"))),
+                        int(row.get("area", 0)),
+                    ),
+                )
+                merged_mass = float(
+                    sum(float(row.get("mass", 0.0)) for row in source_rows if math.isfinite(float(row.get("mass", float("nan")))))
+                )
+                if not math.isfinite(merged_mass) or merged_mass <= 0.0:
+                    merged_mass = float("nan")
+                merged_density = (
+                    float(merged_mass / max(1, candidate_area))
+                    if math.isfinite(merged_mass)
+                    else float("nan")
+                )
+            else:
+                representative_row = None
+                merged_mass = float("nan")
+                merged_density = float("nan")
+            remapped_rows.append(
+                {
+                    "candidate_index": int(new_candidate_index),
+                    "area": int(candidate_area),
+                    "mass": float(merged_mass),
+                    "density": float(merged_density),
+                    "bbox_height": float(bbox_stats["bbox_height"]),
+                    "bbox_width": float(bbox_stats["bbox_width"]),
+                    "bbox_y_min": float(bbox_stats["bbox_y_min"]),
+                    "bbox_y_max": float(bbox_stats["bbox_y_max"]),
+                    "bbox_x_min": float(bbox_stats["bbox_x_min"]),
+                    "bbox_x_max": float(bbox_stats["bbox_x_max"]),
+                    "peak_y": float(representative_row.get("peak_y", centroid_y)) if representative_row is not None else float(centroid_y),
+                    "peak_x": float(representative_row.get("peak_x", centroid_x)) if representative_row is not None else float(centroid_x),
+                    "centroid_y": float(centroid_y),
+                    "centroid_x": float(centroid_x),
+                    "seed_y": float(representative_row.get("seed_y", centroid_y)) if representative_row is not None else float(centroid_y),
+                    "seed_x": float(representative_row.get("seed_x", centroid_x)) if representative_row is not None else float(centroid_x),
+                    "seed_score": float(representative_row.get("seed_score", float("nan"))) if representative_row is not None else float("nan"),
+                    "support_count": int(
+                        sum(int(row.get("support_count", 0)) for row in source_rows)
+                    ) if source_rows else 0,
+                    "support_level": float(
+                        max(float(row.get("support_level", float("-inf"))) for row in source_rows)
+                    ) if source_rows else float("nan"),
+                }
+            )
+        label_map[frame_index] = remapped_label_map
+        merged_metadata.append(remapped_rows)
+
+    return label_map, merged_metadata
+
+
 def _plot_wan21_t2v_candidate_region_viz(
     raw_map_fhw: torch.Tensor,
     label_map_fhw: torch.Tensor,
     save_file: str,
     title: str,
-    frame_indices: Sequence[int],
+    attention_frame_indices: Sequence[int],
+    video_frame_labels: Optional[Sequence[int]] = None,
     draw_candidate_contours: bool = False,
     raw_map_cmap: str = "magma",
 ):
@@ -1149,25 +1390,28 @@ def _plot_wan21_t2v_candidate_region_viz(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    if not frame_indices:
+    if not attention_frame_indices:
         return ""
 
     raw_map_fhw = torch.as_tensor(raw_map_fhw)
     label_map_fhw = torch.as_tensor(label_map_fhw)
     raw_map_cmap = str(raw_map_cmap).strip() or "magma"
-    num_frames = len(frame_indices)
+    if video_frame_labels is None:
+        video_frame_labels = [int(frame_index) for frame_index in attention_frame_indices]
+    num_frames = len(attention_frame_indices)
     fig, axes = plt.subplots(2, num_frames, figsize=(max(3.0 * num_frames, 6.0), 5.6))
     if num_frames == 1:
         axes = axes.reshape(2, 1)
 
-    for col_index, frame_index in enumerate(frame_indices):
+    for col_index, frame_index in enumerate(attention_frame_indices):
+        display_frame_label = int(video_frame_labels[col_index]) if col_index < len(video_frame_labels) else int(frame_index)
         raw_frame = raw_map_fhw[int(frame_index)].detach().cpu().float()
         label_frame = label_map_fhw[int(frame_index)].detach().cpu().long()
         support_frame = (label_frame > 0).float()
 
         axis_raw = axes[0, col_index]
         axis_raw.imshow(raw_frame.numpy(), cmap=raw_map_cmap)
-        axis_raw.set_title(f"frame={int(frame_index)}", fontsize=9)
+        axis_raw.set_title(f"frame={int(display_frame_label)}", fontsize=9)
         axis_raw.set_xticks([])
         axis_raw.set_yticks([])
 
@@ -1187,7 +1431,7 @@ def _plot_wan21_t2v_candidate_region_viz(
                 )
         axis_mask.set_xticks([])
         axis_mask.set_yticks([])
-        axis_mask.set_xlabel(f"K={int(label_frame.max().item())}", fontsize=8)
+        axis_mask.set_xlabel(f"K={int(label_frame.max().item())}", fontsize=24, labelpad=10)
 
     fig.suptitle(title, fontsize=11)
     fig.tight_layout()
@@ -3385,17 +3629,13 @@ def _resolve_wan21_t2v_steps_and_layers_from_maps(
 
 
 def _resolve_wan21_t2v_candidate_viz_frame_indices(frame_count: int, num_frames: int) -> List[int]:
-    """Return evenly spaced frame indices for candidate visualization."""
-    if int(frame_count) <= 0:
-        return []
-    requested = min(max(1, int(num_frames)), int(frame_count))
-    return (
-        torch.linspace(0, int(frame_count) - 1, steps=requested)
-        .round()
-        .long()
-        .unique(sorted=True)
-        .tolist()
+    """Backward-compatible wrapper that returns attention-frame indices only."""
+    frame_indices, _ = _resolve_wan21_t2v_trajectory_consensus_viz_frames(
+        attention_frame_count=int(frame_count),
+        video_frame_count=81,
+        num_frames=int(num_frames),
     )
+    return [int(frame_index) for frame_index in frame_indices]
 
 
 def _load_wan21_t2v_reference_distance_summary(
@@ -3586,7 +3826,7 @@ def _render_wan21_t2v_head_contribution_plots(
     output_dir: str,
     head_rows: Sequence[Dict[str, object]],
     scatter_rows: Sequence[Dict[str, object]],
-    scatter_outlier_heads: Sequence[str],
+    scatter_outlier_heads_by_module: Optional[Dict[str, Sequence[str]]] = None,
     skip_existing_plots: bool = False,
 ):
     """Render contribution heatmaps, curves, and scatter plots."""
@@ -3596,11 +3836,13 @@ def _render_wan21_t2v_head_contribution_plots(
     plots_root_dir = os.path.join(output_dir, "trajectory_consensus_head_contribution_plots")
     heatmap_plots_dir = os.path.join(plots_root_dir, "heatmaps")
     plot_paths: List[str] = []
-    scatter_outlier_head_set = {
-        str(head_tag).strip().upper()
-        for head_tag in scatter_outlier_heads
-        if str(head_tag).strip()
-    }
+    normalized_outlier_by_module: Dict[str, set] = {}
+    for module_name, head_tags in (scatter_outlier_heads_by_module or {}).items():
+        normalized_outlier_by_module[str(module_name).strip().lower()] = {
+            str(head_tag).strip().upper()
+            for head_tag in head_tags
+            if str(head_tag).strip()
+        }
 
     method_metric_keys = {
         "exact_ablation": [
@@ -3636,6 +3878,7 @@ def _render_wan21_t2v_head_contribution_plots(
             if not metric_rows:
                 continue
             metric_dir = os.path.join(heatmap_plots_dir, module_name, branch_name, metric_key)
+            metric_cmap = "Blues" if metric_key == "contribution" else "bwr"
 
             mean_rows = []
             grouped = defaultdict(list)
@@ -3664,8 +3907,39 @@ def _render_wan21_t2v_head_contribution_plots(
                         value_key="value",
                         row_label="layer",
                         col_label="step",
+                        cmap=metric_cmap,
                     )
                 )
+            if metric_key == "contribution" and str(module_name).strip().lower() == "self":
+                deep_layer_cutoff = 26
+                shallow_mean_rows = [
+                    row
+                    for row in mean_rows
+                    if int(row["layer"]) < int(deep_layer_cutoff)
+                ]
+                if shallow_mean_rows:
+                    shallow_save_file = os.path.join(
+                        metric_dir,
+                        f"{metric_key}_step_layer_heatmap-remove_deep_layers.pdf",
+                    )
+                    if _maybe_skip_wan21_t2v_existing_plot(shallow_save_file, skip_existing_plots):
+                        plot_paths.append(shallow_save_file)
+                    else:
+                        plot_paths.append(
+                            _plot_wan21_t2v_trajectory_consensus_heatmap(
+                                matrix_rows=shallow_mean_rows,
+                                save_file=shallow_save_file,
+                                title=(
+                                    f"{metric_key} with layers<26 ({method_name}, {module_name}, {branch_name})"
+                                ),
+                                row_key="layer",
+                                col_key="step",
+                                value_key="value",
+                                row_label="layer",
+                                col_label="step",
+                                cmap="Blues",
+                            )
+                        )
 
             steps = sorted(set(int(row["step"]) for row in metric_rows))
             layers = sorted(set(int(row["layer"]) for row in metric_rows))
@@ -3697,8 +3971,40 @@ def _render_wan21_t2v_head_contribution_plots(
                             value_key="value",
                             row_label="layer",
                             col_label="head",
+                            cmap=metric_cmap,
                         )
                     )
+                if metric_key == "contribution" and str(module_name).strip().lower() == "self":
+                    deep_layer_cutoff = 26
+                    shallow_step_rows = [
+                        row
+                        for row in step_rows
+                        if int(row["layer"]) < int(deep_layer_cutoff)
+                    ]
+                    if shallow_step_rows:
+                        shallow_save_file = os.path.join(
+                            step_dir,
+                            f"{metric_key}_layer_head-remove_deep_layers-step_{int(step):03d}.pdf",
+                        )
+                        if _maybe_skip_wan21_t2v_existing_plot(shallow_save_file, skip_existing_plots):
+                            plot_paths.append(shallow_save_file)
+                        else:
+                            plot_paths.append(
+                                _plot_wan21_t2v_trajectory_consensus_heatmap(
+                                    matrix_rows=shallow_step_rows,
+                                    save_file=shallow_save_file,
+                                    title=(
+                                        f"{metric_key} at step={int(step)} with layers<26 "
+                                        f"({method_name}, {module_name}, {branch_name})"
+                                    ),
+                                    row_key="layer",
+                                    col_key="head",
+                                    value_key="value",
+                                    row_label="layer",
+                                    col_label="head",
+                                    cmap="Blues",
+                                )
+                            )
             for layer in layers:
                 layer_rows = [
                     {
@@ -3726,6 +4032,7 @@ def _render_wan21_t2v_head_contribution_plots(
                             value_key="value",
                             row_label="head",
                             col_label="step",
+                            cmap=metric_cmap,
                         )
                     )
 
@@ -3745,6 +4052,7 @@ def _render_wan21_t2v_head_contribution_plots(
         alignment_metric_tag = _normalize_wan21_t2v_path_component(alignment_metric_name)
         scatter_plots_dir = os.path.join(plots_root_dir, f"scatter_{alignment_metric_tag}")
         metric_dir = os.path.join(scatter_plots_dir, module_name, branch_name, metric_name)
+        scatter_outlier_head_set = normalized_outlier_by_module.get(str(module_name).strip().lower(), set())
         scatter_variants = [("", rows)]
         if scatter_outlier_head_set:
             filtered_rows = [
@@ -4107,6 +4415,185 @@ def _smooth_wan21_t2v_curve_values(
     return x_values, smoothed
 
 
+def _trajectory_consensus_self_attention_feature_display_name(feature_name: str) -> str:
+    """Return a readable display label for one self-attention coupling feature."""
+    feature_key = str(feature_name)
+    display_names = {
+        "proposal_pi": "CA proposal strength",
+        "proposal_vote_share": "CA vote share",
+        "local_avg_covered_mass": "SA local covered mass",
+        "local_avg_covered_mass_filtered": "SA local covered mass (filtered)",
+        "global_avg_covered_mass": "SA global covered mass",
+        "global_avg_covered_mass_filtered": "SA global covered mass (filtered)",
+        "local_entropy": "SA local entropy",
+        "local_entropy_filtered": "SA local entropy (filtered)",
+        "global_entropy": "SA global entropy",
+        "global_entropy_filtered": "SA global entropy (filtered)",
+        "local_dominant_link_ratio": "SA local dominant-link ratio",
+        "local_dominant_link_ratio_filtered": "SA local dominant-link ratio (filtered)",
+        "global_dominant_link_ratio": "SA global dominant-link ratio",
+        "global_dominant_link_ratio_filtered": "SA global dominant-link ratio (filtered)",
+        "local_link_margin": "SA local link margin",
+        "local_link_margin_filtered": "SA local link margin (filtered)",
+        "global_link_margin": "SA global link margin",
+        "global_link_margin_filtered": "SA global link margin (filtered)",
+        "local_head_agreement": "SA local head agreement",
+        "local_head_agreement_filtered": "SA local head agreement (filtered)",
+        "global_head_agreement": "SA global head agreement",
+        "global_head_agreement_filtered": "SA global head agreement (filtered)",
+        "local_soft_head_vote_share": "SA local soft head-vote share",
+        "global_soft_head_vote_share": "SA global soft head-vote share",
+        "local_soft_head_agreement": "SA local soft head agreement",
+        "global_soft_head_agreement": "SA global soft head agreement",
+        "local_compatibility": "SA local compatibility",
+        "global_compatibility": "SA global compatibility",
+        "local_chainability": "SA local chainability",
+        "global_chainability": "SA global chainability",
+        "local_incoming_support": "SA local incoming support",
+        "global_incoming_support": "SA global incoming support",
+        "local_incoming_preference_share": "SA local incoming preference share",
+        "global_incoming_preference_share": "SA global incoming preference share",
+        "local_incoming_vote_share": "SA local incoming vote share",
+        "global_incoming_vote_share": "SA global incoming vote share",
+        "local_mutual_consistency": "SA local mutual consistency",
+        "global_mutual_consistency": "SA global mutual consistency",
+        "anchor_iou": "anchor IoU",
+        "anchor_distance": "anchor-distance score",
+        "anchor_center_l2": "anchor-distance score",
+    }
+    return display_names.get(feature_key, feature_key.replace("_", " "))
+
+
+def _trajectory_consensus_self_attention_feature_plot_range(
+    feature_name: str,
+    finite_values: Sequence[float],
+) -> Tuple[float, float]:
+    """Return a stable color range for one overlay feature."""
+    values = [
+        float(value)
+        for value in finite_values
+        if math.isfinite(float(value))
+    ]
+    if not values:
+        return (0.0, 1.0)
+    feature_key = str(feature_name)
+    bounded_zero_one = {
+        "proposal_pi",
+        "proposal_vote_share",
+        "proposal_agreement_frame",
+        "local_avg_covered_mass",
+        "local_avg_covered_mass_filtered",
+        "global_avg_covered_mass",
+        "global_avg_covered_mass_filtered",
+        "local_dominant_link_ratio",
+        "local_dominant_link_ratio_filtered",
+        "global_dominant_link_ratio",
+        "global_dominant_link_ratio_filtered",
+        "local_link_margin",
+        "local_link_margin_filtered",
+        "global_link_margin",
+        "global_link_margin_filtered",
+        "local_head_agreement",
+        "local_head_agreement_filtered",
+        "global_head_agreement",
+        "global_head_agreement_filtered",
+        "local_soft_head_vote_share",
+        "local_soft_head_vote_share_filtered",
+        "global_soft_head_vote_share",
+        "global_soft_head_vote_share_filtered",
+        "local_soft_head_agreement",
+        "local_soft_head_agreement_filtered",
+        "global_soft_head_agreement",
+        "global_soft_head_agreement_filtered",
+        "local_chainability",
+        "global_chainability",
+        "local_incoming_preference_share",
+        "global_incoming_preference_share",
+        "local_incoming_vote_share",
+        "global_incoming_vote_share",
+        "local_mutual_consistency",
+        "global_mutual_consistency",
+    }
+    bounded_zero_two = {
+        "local_compatibility",
+        "global_compatibility",
+    }
+    if feature_key in bounded_zero_one:
+        return (0.0, 1.0)
+    if feature_key in bounded_zero_two:
+        return (0.0, 2.0)
+    vmin = float(min(values))
+    vmax = float(max(values))
+    if abs(vmax - vmin) < 1e-8:
+        center = float(values[0])
+        if abs(center) < 1e-8:
+            return (0.0, 1.0)
+        if center > 0.0:
+            return (0.0, float(center))
+        return (float(center), 0.0)
+    return (vmin, vmax)
+
+
+def _trajectory_consensus_prepare_display_candidate_mask(candidate_mask: np.ndarray) -> np.ndarray:
+    """Return a visualization-friendly candidate mask with interior holes filled."""
+    mask_bool = np.asarray(candidate_mask, dtype=np.bool_)
+    if not np.any(mask_bool):
+        return mask_bool
+    try:
+        from scipy.ndimage import binary_fill_holes
+        return np.asarray(binary_fill_holes(mask_bool), dtype=np.bool_)
+    except Exception:
+        return mask_bool
+
+
+def _trajectory_consensus_candidate_edge_color(fill_color: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """Derive a contour color that stays visually distinct from the fill color."""
+    import colorsys
+
+    red, green, blue = [max(0.0, min(1.0, float(channel))) for channel in fill_color]
+    hue, lightness, saturation = colorsys.rgb_to_hls(red, green, blue)
+    comp_hue = (float(hue) + 0.5) % 1.0
+    comp_lightness = min(0.78, max(0.28, 0.52 if lightness > 0.62 else 0.42))
+    comp_saturation = min(1.0, max(0.55, float(saturation)))
+    comp_red, comp_green, comp_blue = colorsys.hls_to_rgb(
+        comp_hue,
+        comp_lightness,
+        comp_saturation,
+    )
+    return (float(comp_red), float(comp_green), float(comp_blue))
+
+
+def _resolve_wan21_t2v_overlay_anchor_role_candidates(
+    frame_rows: Sequence[Dict[str, object]],
+    anchor_mode: str,
+) -> Tuple[int, int]:
+    """Resolve overlay winner/loser using one anchor-based ranking rule."""
+    mode = str(anchor_mode).strip().lower()
+    if mode not in {"anchor_iou", "anchor_distance"}:
+        raise ValueError(f"Unsupported overlay anchor mode: {anchor_mode}")
+    scored_rows: List[Tuple[float, int]] = []
+    for row in frame_rows:
+        candidate_index = int(row["candidate_index"])
+        if mode == "anchor_iou":
+            score_value = _safe_wan21_t2v_float(row.get("anchor_iou", float("nan")))
+            if math.isfinite(score_value):
+                scored_rows.append((float(score_value), int(candidate_index)))
+        else:
+            distance_value = _safe_wan21_t2v_float(row.get("anchor_distance", float("nan")))
+            if math.isfinite(distance_value):
+                scored_rows.append((float(-distance_value), int(candidate_index)))
+    if not scored_rows:
+        return (-1, -1)
+    scored_rows = sorted(
+        scored_rows,
+        key=lambda item: (float(item[0]), -int(item[1])),
+        reverse=True,
+    )
+    winner_candidate = int(scored_rows[0][1])
+    loser_candidate = int(scored_rows[1][1]) if len(scored_rows) >= 2 else -1
+    return (winner_candidate, loser_candidate)
+
+
 def _build_wan21_t2v_self_attention_pairwise_layer_stats(
     pairwise_rows: Sequence[Dict[str, object]],
 ) -> Tuple[
@@ -4160,7 +4647,8 @@ def _build_wan21_t2v_self_attention_pairwise_layer_stats(
             layer_vectors.append(vector)
             layer_covered_values.append(float(covered_mass))
 
-        layer_mean_vector = np.mean(np.stack(layer_vectors, axis=0), axis=0)
+        layer_matrix = np.stack(layer_vectors, axis=0)
+        layer_mean_vector = np.mean(layer_matrix, axis=0)
         pairwise_layer_vectors[group_key] = layer_mean_vector
         if float(layer_mean_vector.sum()) > 1e-8:
             layer_entropy = float(-(layer_mean_vector * np.log(np.clip(layer_mean_vector, 1e-8, None))).sum())
@@ -4181,12 +4669,49 @@ def _build_wan21_t2v_self_attention_pairwise_layer_stats(
             if vote_counts
             else float("nan")
         )
+        hard_vote_winner = (
+            max(vote_counts.items(), key=lambda item: int(item[1]))[0]
+            if vote_counts
+            else (int(layer_mean_vector.argmax()) + 1 if float(layer_mean_vector.sum()) > 1e-8 else -1)
+        )
+        if hard_vote_winner > 0 and int(hard_vote_winner - 1) < int(layer_matrix.shape[1]):
+            soft_head_vote_share = float(layer_matrix[:, int(hard_vote_winner - 1)].mean())
+        else:
+            soft_head_vote_share = float("nan")
+
+        valid_distribution_vectors = [
+            np.asarray(vector, dtype=np.float64)
+            for vector in layer_vectors
+            if float(np.asarray(vector, dtype=np.float64).sum()) > 1e-8
+        ]
+        if len(valid_distribution_vectors) <= 0:
+            soft_head_agreement = float("nan")
+        elif len(valid_distribution_vectors) == 1:
+            soft_head_agreement = 1.0
+        else:
+            pairwise_cosines: List[float] = []
+            for left_index in range(len(valid_distribution_vectors)):
+                left_vector = valid_distribution_vectors[left_index]
+                left_norm = float(np.linalg.norm(left_vector))
+                if left_norm <= 1e-12:
+                    continue
+                for right_index in range(left_index + 1, len(valid_distribution_vectors)):
+                    right_vector = valid_distribution_vectors[right_index]
+                    right_norm = float(np.linalg.norm(right_vector))
+                    if right_norm <= 1e-12:
+                        continue
+                    pairwise_cosines.append(
+                        float(np.dot(left_vector, right_vector) / max(1e-12, left_norm * right_norm))
+                    )
+            soft_head_agreement = float(_mean_wan21_t2v_finite(pairwise_cosines))
         pairwise_layer_metrics[group_key] = {
             "covered_mass": float(_mean_wan21_t2v_finite(layer_covered_values)),
             "entropy": float(layer_entropy),
             "dominant_link_ratio": float(layer_dominant),
             "link_margin": float(layer_margin),
             "head_agreement": float(head_agreement),
+            "soft_head_vote_share": float(soft_head_vote_share),
+            "soft_head_agreement": float(soft_head_agreement),
         }
     return pairwise_layer_vectors, pairwise_layer_metrics
 
@@ -4424,6 +4949,28 @@ def _trajectory_consensus_compute_candidate_feature_task(
     pairwise_layer_vectors, pairwise_layer_metrics = _build_wan21_t2v_self_attention_pairwise_layer_stats(
         pairwise_rows
     )
+    raw_pairwise_layer_vectors = _build_wan21_t2v_self_attention_pairwise_layer_value_vectors(
+        pairwise_rows,
+        value_key="raw_coupling",
+    )
+    frame_to_frame_raw_support_vectors: Dict[Tuple[int, int], np.ndarray] = {}
+    for source_frame in range(frame_count):
+        for target_frame in range(frame_count):
+            if int(source_frame) == int(target_frame):
+                continue
+            support_vectors: List[np.ndarray] = []
+            for source_candidate in range(1, int(candidate_counts[source_frame]) + 1):
+                support_vector = raw_pairwise_layer_vectors.get(
+                    (int(source_frame), int(source_candidate), int(target_frame))
+                )
+                if support_vector is None:
+                    continue
+                support_vectors.append(np.asarray(support_vector, dtype=np.float64))
+            if support_vectors:
+                frame_to_frame_raw_support_vectors[(int(source_frame), int(target_frame))] = np.sum(
+                    np.stack(support_vectors, axis=0),
+                    axis=0,
+                )
 
     candidate_feature_rows: List[Dict[str, object]] = []
 
@@ -4451,6 +4998,52 @@ def _trajectory_consensus_compute_candidate_feature_task(
             return (float("nan"), float("nan"))
         return (float(points[:, 0].mean()), float(points[:, 1].mean()))
 
+    def _aggregate_incoming_support(
+        source_frames: Sequence[int],
+        target_frame: int,
+        target_candidate: int,
+    ) -> float:
+        values: List[float] = []
+        for source_frame in source_frames:
+            support_vector = frame_to_frame_raw_support_vectors.get((int(source_frame), int(target_frame)))
+            if support_vector is None or int(target_candidate - 1) >= int(support_vector.shape[0]):
+                continue
+            values.append(float(support_vector[int(target_candidate - 1)]))
+        return _mean_wan21_t2v_finite(values)
+
+    def _aggregate_incoming_preference_share(
+        source_frames: Sequence[int],
+        target_frame: int,
+        target_candidate: int,
+    ) -> float:
+        values: List[float] = []
+        for source_frame in source_frames:
+            support_vector = frame_to_frame_raw_support_vectors.get((int(source_frame), int(target_frame)))
+            if support_vector is None or int(target_candidate - 1) >= int(support_vector.shape[0]):
+                continue
+            total_support = float(np.asarray(support_vector, dtype=np.float64).sum())
+            if total_support <= 1e-12:
+                continue
+            values.append(float(support_vector[int(target_candidate - 1)] / total_support))
+        return _mean_wan21_t2v_finite(values)
+
+    def _aggregate_incoming_vote_share(
+        source_frames: Sequence[int],
+        target_frame: int,
+        target_candidate: int,
+    ) -> float:
+        votes: List[float] = []
+        for source_frame in source_frames:
+            support_vector = frame_to_frame_raw_support_vectors.get((int(source_frame), int(target_frame)))
+            if support_vector is None or int(support_vector.shape[0]) <= 0:
+                continue
+            total_support = float(np.asarray(support_vector, dtype=np.float64).sum())
+            if total_support <= 1e-12:
+                continue
+            voted_candidate = int(np.asarray(support_vector, dtype=np.float64).argmax()) + 1
+            votes.append(1.0 if int(voted_candidate) == int(target_candidate) else 0.0)
+        return _mean_wan21_t2v_finite(votes)
+
     for frame_index in range(frame_count):
         frame_candidate_count = int(candidate_counts[frame_index])
         if frame_candidate_count <= 0:
@@ -4463,6 +5056,8 @@ def _trajectory_consensus_compute_candidate_feature_task(
         global_in_frames = [int(g) for g in range(frame_count) if int(g) < int(frame_index)]
         global_out_frames = [int(g) for g in range(frame_count) if int(g) > int(frame_index)]
         local_frames = [int(g) for g in range(frame_count) if abs(int(g) - int(frame_index)) == 1]
+        incoming_local_source_frames = [int(g) for g in range(frame_count) if abs(int(g) - int(frame_index)) == 1]
+        incoming_global_source_frames = [int(g) for g in range(frame_count) if int(g) != int(frame_index)]
 
         for candidate_index in range(1, frame_candidate_count + 1):
             candidate_mask = (label_map_fhw[frame_index] == int(candidate_index))
@@ -4498,6 +5093,14 @@ def _trajectory_consensus_compute_candidate_feature_task(
             local_head_agreement_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "head_agreement", local_frames, True)
             global_head_agreement = _aggregate_pairwise_metric(frame_index, candidate_index, "head_agreement", global_in_frames + global_out_frames, False)
             global_head_agreement_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "head_agreement", global_in_frames + global_out_frames, True)
+            local_soft_head_vote_share = _aggregate_pairwise_metric(frame_index, candidate_index, "soft_head_vote_share", local_frames, False)
+            local_soft_head_vote_share_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "soft_head_vote_share", local_frames, True)
+            global_soft_head_vote_share = _aggregate_pairwise_metric(frame_index, candidate_index, "soft_head_vote_share", global_in_frames + global_out_frames, False)
+            global_soft_head_vote_share_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "soft_head_vote_share", global_in_frames + global_out_frames, True)
+            local_soft_head_agreement = _aggregate_pairwise_metric(frame_index, candidate_index, "soft_head_agreement", local_frames, False)
+            local_soft_head_agreement_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "soft_head_agreement", local_frames, True)
+            global_soft_head_agreement = _aggregate_pairwise_metric(frame_index, candidate_index, "soft_head_agreement", global_in_frames + global_out_frames, False)
+            global_soft_head_agreement_filtered = _aggregate_pairwise_metric(frame_index, candidate_index, "soft_head_agreement", global_in_frames + global_out_frames, True)
 
             local_in = float("nan")
             local_out = float("nan")
@@ -4505,14 +5108,14 @@ def _trajectory_consensus_compute_candidate_feature_task(
                 prev_frame = int(frame_index) - 1
                 incoming_values = []
                 for prev_candidate in range(1, int(candidate_counts[prev_frame]) + 1):
-                    incoming_vector = pairwise_layer_vectors.get((int(prev_frame), int(prev_candidate), int(frame_index)))
+                    incoming_vector = raw_pairwise_layer_vectors.get((int(prev_frame), int(prev_candidate), int(frame_index)))
                     if incoming_vector is None or int(candidate_index - 1) >= int(incoming_vector.shape[0]):
                         continue
                     incoming_values.append(float(incoming_vector[int(candidate_index - 1)]))
                 local_in = float(sum(incoming_values)) if incoming_values else float("nan")
             if int(frame_index) + 1 < frame_count:
                 next_frame = int(frame_index) + 1
-                outgoing_vector = pairwise_layer_vectors.get((int(frame_index), int(candidate_index), int(next_frame)))
+                outgoing_vector = raw_pairwise_layer_vectors.get((int(frame_index), int(candidate_index), int(next_frame)))
                 if outgoing_vector is not None:
                     local_out = float(outgoing_vector.sum())
 
@@ -4522,14 +5125,14 @@ def _trajectory_consensus_compute_candidate_feature_task(
                     if incoming:
                         incoming_values = []
                         for other_candidate in range(1, int(candidate_counts[int(other_frame)]) + 1):
-                            incoming_vector = pairwise_layer_vectors.get((int(other_frame), int(other_candidate), int(frame_index)))
+                            incoming_vector = raw_pairwise_layer_vectors.get((int(other_frame), int(other_candidate), int(frame_index)))
                             if incoming_vector is None or int(candidate_index - 1) >= int(incoming_vector.shape[0]):
                                 continue
                             incoming_values.append(float(incoming_vector[int(candidate_index - 1)]))
                         if incoming_values:
                             direction_values.append(float(sum(incoming_values)))
                     else:
-                        outgoing_vector = pairwise_layer_vectors.get((int(frame_index), int(candidate_index), int(other_frame)))
+                        outgoing_vector = raw_pairwise_layer_vectors.get((int(frame_index), int(candidate_index), int(other_frame)))
                         if outgoing_vector is not None:
                             direction_values.append(float(outgoing_vector.sum()))
                 return _mean_wan21_t2v_finite(direction_values)
@@ -4544,6 +5147,36 @@ def _trajectory_consensus_compute_candidate_feature_task(
                 sum(value for value in [global_in, global_out] if math.isfinite(value))
             ) if any(math.isfinite(value) for value in [global_in, global_out]) else float("nan")
             global_chainability = float(min(global_in, global_out)) if math.isfinite(global_in) and math.isfinite(global_out) else float("nan")
+            local_incoming_support = _aggregate_incoming_support(
+                source_frames=incoming_local_source_frames,
+                target_frame=int(frame_index),
+                target_candidate=int(candidate_index),
+            )
+            global_incoming_support = _aggregate_incoming_support(
+                source_frames=incoming_global_source_frames,
+                target_frame=int(frame_index),
+                target_candidate=int(candidate_index),
+            )
+            local_incoming_preference_share = _aggregate_incoming_preference_share(
+                source_frames=incoming_local_source_frames,
+                target_frame=int(frame_index),
+                target_candidate=int(candidate_index),
+            )
+            global_incoming_preference_share = _aggregate_incoming_preference_share(
+                source_frames=incoming_global_source_frames,
+                target_frame=int(frame_index),
+                target_candidate=int(candidate_index),
+            )
+            local_incoming_vote_share = _aggregate_incoming_vote_share(
+                source_frames=incoming_local_source_frames,
+                target_frame=int(frame_index),
+                target_candidate=int(candidate_index),
+            )
+            global_incoming_vote_share = _aggregate_incoming_vote_share(
+                source_frames=incoming_global_source_frames,
+                target_frame=int(frame_index),
+                target_candidate=int(candidate_index),
+            )
 
             def _mutual_consistency_max(key_frame: int) -> float:
                 forward_vector = pairwise_layer_vectors.get((int(frame_index), int(candidate_index), int(key_frame)))
@@ -4577,10 +5210,11 @@ def _trajectory_consensus_compute_candidate_feature_task(
                 "centroid_y": float(centroid_y),
                 "centroid_x": float(centroid_x),
                 "anchor_iou": float(anchor_iou),
+                "anchor_distance": float(anchor_center_l2),
                 "anchor_center_l2": float(anchor_center_l2),
-                "proposal_pi": float(proposal_weights.get((int(frame_index), int(candidate_index)), float("nan"))),
+                "proposal_pi": float(proposal_weights.get((int(frame_index), int(candidate_index)), 0.0)),
                 "proposal_vote_share": float(
-                    proposal_vote_share_by_frame.get(int(frame_index), {}).get(int(candidate_index), float("nan"))
+                    proposal_vote_share_by_frame.get(int(frame_index), {}).get(int(candidate_index), 0.0)
                 ),
                 "proposal_agreement_frame": float(proposal_agreement_by_frame.get(int(frame_index), float("nan"))),
                 "local_avg_covered_mass": float(local_avg_covered_mass),
@@ -4603,10 +5237,24 @@ def _trajectory_consensus_compute_candidate_feature_task(
                 "local_head_agreement_filtered": float(local_head_agreement_filtered),
                 "global_head_agreement": float(global_head_agreement),
                 "global_head_agreement_filtered": float(global_head_agreement_filtered),
+                "local_soft_head_vote_share": float(local_soft_head_vote_share),
+                "local_soft_head_vote_share_filtered": float(local_soft_head_vote_share_filtered),
+                "global_soft_head_vote_share": float(global_soft_head_vote_share),
+                "global_soft_head_vote_share_filtered": float(global_soft_head_vote_share_filtered),
+                "local_soft_head_agreement": float(local_soft_head_agreement),
+                "local_soft_head_agreement_filtered": float(local_soft_head_agreement_filtered),
+                "global_soft_head_agreement": float(global_soft_head_agreement),
+                "global_soft_head_agreement_filtered": float(global_soft_head_agreement_filtered),
                 "local_compatibility": float(local_compatibility),
                 "local_chainability": float(local_chainability),
                 "global_compatibility": float(global_compatibility),
                 "global_chainability": float(global_chainability),
+                "local_incoming_support": float(local_incoming_support),
+                "global_incoming_support": float(global_incoming_support),
+                "local_incoming_preference_share": float(local_incoming_preference_share),
+                "global_incoming_preference_share": float(global_incoming_preference_share),
+                "local_incoming_vote_share": float(local_incoming_vote_share),
+                "global_incoming_vote_share": float(global_incoming_vote_share),
                 "local_mutual_consistency": float(local_mc_max),
                 "global_mutual_consistency": float(global_mc_max),
             })
@@ -4664,10 +5312,24 @@ def _summarize_wan21_t2v_self_attention_candidate_features(
         "local_head_agreement_filtered",
         "global_head_agreement",
         "global_head_agreement_filtered",
+        "local_soft_head_vote_share",
+        "local_soft_head_vote_share_filtered",
+        "global_soft_head_vote_share",
+        "global_soft_head_vote_share_filtered",
+        "local_soft_head_agreement",
+        "local_soft_head_agreement_filtered",
+        "global_soft_head_agreement",
+        "global_soft_head_agreement_filtered",
         "local_compatibility",
         "global_compatibility",
         "local_chainability",
         "global_chainability",
+        "local_incoming_support",
+        "global_incoming_support",
+        "local_incoming_preference_share",
+        "global_incoming_preference_share",
+        "local_incoming_vote_share",
+        "global_incoming_vote_share",
         "local_mutual_consistency",
         "global_mutual_consistency",
     ]
@@ -4683,6 +5345,8 @@ def _summarize_wan21_t2v_self_attention_candidate_features(
             auroc_value = _compute_wan21_t2v_binary_auroc(labels, scores)
             anchor_iou_values = [_safe_wan21_t2v_float(row.get("anchor_iou", float("nan"))) for row in group_rows]
             anchor_iou_correlation = _compute_wan21_t2v_pearson_correlation(scores, anchor_iou_values)
+            anchor_distance_values = [_safe_wan21_t2v_float(row.get("anchor_distance", float("nan"))) for row in group_rows]
+            anchor_distance_correlation = _compute_wan21_t2v_pearson_correlation(scores, anchor_distance_values)
 
             rows_by_frame: Dict[int, List[Dict[str, object]]] = defaultdict(list)
             for row in group_rows:
@@ -4705,6 +5369,7 @@ def _summarize_wan21_t2v_self_attention_candidate_features(
                 "winner_loser_gap": float(_mean_wan21_t2v_finite(gap_values)),
                 "auroc": float(auroc_value),
                 "anchor_iou_correlation": float(anchor_iou_correlation),
+                "anchor_distance_correlation": float(anchor_distance_correlation),
             })
     return summary_rows
 
@@ -4717,12 +5382,24 @@ def _summarize_wan21_t2v_self_attention_temporal_precedence(
     feature_names = [
         "proposal_pi",
         "proposal_vote_share",
+        "local_compatibility",
+        "global_compatibility",
         "local_chainability",
         "global_chainability",
+        "local_incoming_support",
+        "global_incoming_support",
+        "local_incoming_preference_share",
+        "global_incoming_preference_share",
+        "local_incoming_vote_share",
+        "global_incoming_vote_share",
         "local_mutual_consistency",
         "global_mutual_consistency",
         "local_head_agreement",
         "global_head_agreement",
+        "local_soft_head_vote_share",
+        "global_soft_head_vote_share",
+        "local_soft_head_agreement",
+        "global_soft_head_agreement",
     ]
     observation_order = sorted(
         {
@@ -4812,6 +5489,8 @@ def _build_wan21_t2v_self_attention_signed_offset_rows(
                 ),
                 "link_margin": float(_mean_wan21_t2v_finite(metric_lists.get("link_margin", []))),
                 "head_agreement": float(_mean_wan21_t2v_finite(metric_lists.get("head_agreement", []))),
+                "soft_head_vote_share": float(_mean_wan21_t2v_finite(metric_lists.get("soft_head_vote_share", []))),
+                "soft_head_agreement": float(_mean_wan21_t2v_finite(metric_lists.get("soft_head_agreement", []))),
             })
     return aggregated_rows
 
@@ -4820,17 +5499,22 @@ def _plot_wan21_t2v_self_attention_candidate_score_overlay(
     label_map_fhw: torch.Tensor,
     feature_rows: Sequence[Dict[str, object]],
     feature_name: str,
+    anchor_mode: str,
     save_file: str,
     title: str,
     frame_indices: Sequence[int],
+    video_frame_labels: Optional[Sequence[int]] = None,
 ) -> str:
     """Render candidate masks colored by one candidate-level scalar."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib import colors as mpl_colors
 
     if not frame_indices or not feature_rows:
         return ""
+    if video_frame_labels is None:
+        video_frame_labels = [int(frame_index) for frame_index in frame_indices]
 
     label_map_fhw = torch.as_tensor(label_map_fhw).detach().cpu().to(torch.int64)
     rows_by_frame: Dict[int, List[Dict[str, object]]] = defaultdict(list)
@@ -4843,8 +5527,10 @@ def _plot_wan21_t2v_self_attention_candidate_score_overlay(
     ]
     if not finite_values:
         return ""
-    vmin = float(min(finite_values))
-    vmax = float(max(finite_values))
+    vmin, vmax = _trajectory_consensus_self_attention_feature_plot_range(
+        feature_name=str(feature_name),
+        finite_values=finite_values,
+    )
     if abs(vmax - vmin) < 1e-8:
         vmax = vmin + 1e-8
 
@@ -4858,57 +5544,91 @@ def _plot_wan21_t2v_self_attention_candidate_score_overlay(
     if num_frames == 1:
         axes = [axes]
     image = None
-    for axis, frame_index in zip(axes, frame_indices):
+    cmap = plt.get_cmap("viridis")
+    value_norm = mpl_colors.Normalize(vmin=vmin, vmax=vmax)
+    text_pad_x = 2.2
+    right_margin = 7.0
+    for axis, frame_index, video_frame_label in zip(axes, frame_indices, video_frame_labels):
         label_frame = label_map_fhw[int(frame_index)].numpy()
         canvas = np.full(label_frame.shape, np.nan, dtype=np.float32)
-        winner_candidate = -1
-        loser_candidate = -1
-        for row in rows_by_frame.get(int(frame_index), []):
+        feature_by_candidate: Dict[int, float] = {}
+        display_payloads: List[Tuple[int, np.ndarray, np.ndarray, float]] = []
+        frame_rows = rows_by_frame.get(int(frame_index), [])
+        winner_candidate, loser_candidate = _resolve_wan21_t2v_overlay_anchor_role_candidates(
+            frame_rows=frame_rows,
+            anchor_mode=str(anchor_mode),
+        )
+        for row in frame_rows:
             candidate_index = int(row["candidate_index"])
             feature_value = _safe_wan21_t2v_float(row.get(feature_name, float("nan")))
-            if math.isfinite(feature_value):
-                canvas[label_frame == int(candidate_index)] = np.float32(feature_value)
-            if int(row.get("is_winner_aligned", 0)) == 1:
-                winner_candidate = int(candidate_index)
-            if int(row.get("is_strongest_loser", 0)) == 1:
-                loser_candidate = int(candidate_index)
+            if (not math.isfinite(feature_value)) and str(feature_name) in {"proposal_pi", "proposal_vote_share"}:
+                feature_value = 0.0
+            feature_by_candidate[int(candidate_index)] = float(feature_value)
 
-        axis.imshow(np.ones_like(label_frame, dtype=np.float32), cmap="gray", vmin=0.0, vmax=1.0, alpha=0.12)
-        image = axis.imshow(np.ma.masked_invalid(canvas), cmap="viridis", vmin=vmin, vmax=vmax)
         candidate_count = int(label_frame.max())
         for candidate_index in range(1, candidate_count + 1):
             candidate_mask = (label_frame == int(candidate_index))
             if not np.any(candidate_mask):
                 continue
-            axis.contour(candidate_mask.astype(np.float32), levels=[0.5], colors=["#ffffff"], linewidths=0.9)
-            points = np.argwhere(candidate_mask)
-            feature_value = _safe_wan21_t2v_float(
-                next(
-                    (
-                        row.get(feature_name, float("nan"))
-                        for row in rows_by_frame.get(int(frame_index), [])
-                        if int(row["candidate_index"]) == int(candidate_index)
-                    ),
-                    float("nan"),
-                )
+            display_mask = _trajectory_consensus_prepare_display_candidate_mask(candidate_mask)
+            points = np.argwhere(display_mask)
+            feature_value = _safe_wan21_t2v_float(feature_by_candidate.get(int(candidate_index), float("nan")))
+            if math.isfinite(feature_value):
+                canvas[display_mask] = np.float32(feature_value)
+            display_payloads.append((int(candidate_index), display_mask, points, float(feature_value)))
+
+        axis.imshow(np.ones_like(label_frame, dtype=np.float32), cmap="gray", vmin=0.0, vmax=1.0, alpha=0.12)
+        image = axis.imshow(np.ma.masked_invalid(canvas), cmap="viridis", vmin=vmin, vmax=vmax)
+        for candidate_index, display_mask, points, feature_value in display_payloads:
+            if math.isfinite(feature_value):
+                fill_color = cmap(value_norm(float(feature_value)))[:3]
+                edge_color = _trajectory_consensus_candidate_edge_color(fill_color)
+            else:
+                edge_color = (0.45, 0.45, 0.45)
+            line_style = "-"
+            line_width = 1.3
+            role_suffix = ""
+            if int(candidate_index) == int(winner_candidate):
+                line_width = 2.1
+                line_style = "-"
+                role_suffix = " [W]"
+            elif int(candidate_index) == int(loser_candidate):
+                line_width = 2.1
+                line_style = "--"
+                role_suffix = " [L]"
+            axis.contour(
+                display_mask.astype(np.float32),
+                levels=[0.5],
+                colors=[edge_color],
+                linewidths=line_width,
+                linestyles=[line_style],
             )
             if points.size > 0 and math.isfinite(feature_value):
-                x_anchor = float(points[:, 1].max()) + 0.5
+                x_anchor = float(points[:, 1].max()) + text_pad_x
                 y_anchor = float(points[:, 0].mean())
                 axis.text(
                     x_anchor,
                     y_anchor,
-                    f"K{candidate_index}:{feature_value:.2f}",
+                    f"K{candidate_index}:{feature_value:.2f}{role_suffix}",
                     fontsize=11,
                     color="black",
                     ha="left",
                     va="center",
                 )
-        if winner_candidate > 0:
-            axis.contour((label_frame == int(winner_candidate)).astype(np.float32), levels=[0.5], colors=["#22c55e"], linewidths=2.0)
-        if loser_candidate > 0:
-            axis.contour((label_frame == int(loser_candidate)).astype(np.float32), levels=[0.5], colors=["#ef4444"], linewidths=2.0)
-        axis.set_title(f"frame={int(frame_index)}", fontsize=15)
+            elif points.size > 0:
+                x_anchor = float(points[:, 1].max()) + text_pad_x
+                y_anchor = float(points[:, 0].mean())
+                axis.text(
+                    x_anchor,
+                    y_anchor,
+                    f"K{candidate_index}:NA{role_suffix}",
+                    fontsize=11,
+                    color="black",
+                    ha="left",
+                    va="center",
+                )
+        axis.set_title(f"frame={int(video_frame_label)}", fontsize=30)
+        axis.set_xlim(-0.5, float(label_frame.shape[1]) - 0.5 + right_margin)
         axis.set_xticks([])
         axis.set_yticks([])
     if image is not None:
@@ -4919,6 +5639,19 @@ def _plot_wan21_t2v_self_attention_candidate_score_overlay(
     else:
         fig.subplots_adjust(left=0.02, right=0.98, top=0.84, bottom=0.06, wspace=0.03)
     fig.suptitle(title, fontsize=17)
+    fig.text(
+        0.02,
+        0.015,
+        (
+            "W/L criterion: anchor IoU ranking"
+            if str(anchor_mode).strip().lower() == "anchor_iou"
+            else "W/L criterion: anchor center-distance ranking"
+        ),
+        fontsize=10,
+        color="#334155",
+        ha="left",
+        va="bottom",
+    )
     _ensure_dir(os.path.dirname(save_file))
     fig.savefig(save_file, format="pdf")
     plt.close(fig)
@@ -4935,6 +5668,8 @@ def _plot_wan21_t2v_self_attention_coupling_storyboard(
     save_file: str,
     title: str,
     value_name: str,
+    query_video_frame_label: Optional[int] = None,
+    target_video_frame_labels: Optional[Sequence[int]] = None,
 ) -> str:
     """Render winner-versus-loser routing patterns across target frames."""
     import matplotlib
@@ -4943,14 +5678,18 @@ def _plot_wan21_t2v_self_attention_coupling_storyboard(
 
     if winner_candidate <= 0 or loser_candidate <= 0 or not target_frames:
         return ""
+    if query_video_frame_label is None:
+        query_video_frame_label = int(query_frame)
+    if target_video_frame_labels is None:
+        target_video_frame_labels = [int(frame_index) for frame_index in target_frames]
 
     label_map_fhw = torch.as_tensor(label_map_fhw).detach().cpu().to(torch.int64)
     candidate_specs = [
-        ("winner-aligned", int(winner_candidate), "#22c55e"),
-        ("strongest loser", int(loser_candidate), "#ef4444"),
+        ("winner-aligned", int(winner_candidate)),
+        ("strongest loser", int(loser_candidate)),
     ]
     vmax_candidates: List[float] = []
-    for _, candidate_index, _ in candidate_specs:
+    for _, candidate_index in candidate_specs:
         for target_frame in target_frames:
             vector = pairwise_layer_vectors.get((int(query_frame), int(candidate_index), int(target_frame)))
             if vector is not None:
@@ -4962,26 +5701,53 @@ def _plot_wan21_t2v_self_attention_coupling_storyboard(
         len(candidate_specs),
         1 + len(target_frames),
         figsize=(max(4.3 * (1 + len(target_frames)), 12.0), 6.8),
-        gridspec_kw={"wspace": 0.03, "hspace": 0.06},
+        gridspec_kw={"wspace": 0.03, "hspace": 0.12},
     )
     if len(candidate_specs) == 1:
         axes = np.asarray([axes])
 
-    for row_index, (row_name, candidate_index, contour_color) in enumerate(candidate_specs):
+    query_cmap = plt.get_cmap("YlOrBr")
+    key_cmap = plt.get_cmap("viridis")
+    for row_index, (row_name, candidate_index) in enumerate(candidate_specs):
         query_label = label_map_fhw[int(query_frame)].numpy()
         query_axis = axes[row_index, 0]
+        query_axis.set_facecolor(query_cmap(0.0))
         query_axis.imshow(np.ones_like(query_label, dtype=np.float32), cmap="gray", vmin=0.0, vmax=1.0, alpha=0.12)
-        query_axis.imshow((query_label == int(candidate_index)).astype(np.float32), cmap="YlOrBr", vmin=0.0, vmax=1.0)
+        query_mask = _trajectory_consensus_prepare_display_candidate_mask(query_label == int(candidate_index))
+        query_canvas = np.zeros_like(query_label, dtype=np.float32)
+        query_canvas[query_mask] = 1.0
+        query_axis.imshow(query_canvas, cmap="YlOrBr", vmin=0.0, vmax=1.0)
         for other_candidate in range(1, int(query_label.max()) + 1):
-            candidate_mask = (query_label == int(other_candidate))
+            candidate_mask = _trajectory_consensus_prepare_display_candidate_mask(query_label == int(other_candidate))
             if np.any(candidate_mask):
-                query_axis.contour(candidate_mask.astype(np.float32), levels=[0.5], colors=["#ffffff"], linewidths=0.8)
-        query_axis.contour((query_label == int(candidate_index)).astype(np.float32), levels=[0.5], colors=[contour_color], linewidths=2.2)
-        query_axis.set_title(f"query frame={int(query_frame)}\n{row_name} K{int(candidate_index)}", fontsize=14)
+                if int(other_candidate) == int(candidate_index):
+                    continue
+                query_axis.contour(
+                    candidate_mask.astype(np.float32),
+                    levels=[0.5],
+                    colors=["#cbd5e1"],
+                    linewidths=0.8,
+                )
+        query_edge_color = _trajectory_consensus_candidate_edge_color(query_cmap(1.0)[:3])
+        query_axis.contour(
+            query_mask.astype(np.float32),
+            levels=[0.5],
+            colors=[query_edge_color],
+            linewidths=2.2,
+            linestyles=["-" if row_name == "winner-aligned" else "--"],
+        )
+        query_axis.set_title(
+            f"query frame={int(query_video_frame_label)}\n{row_name} K{int(candidate_index)}",
+            fontsize=14,
+        )
+        query_axis.set_xlim(-0.5, float(query_label.shape[1]) - 0.5 + 7.0)
         query_axis.set_xticks([])
         query_axis.set_yticks([])
 
-        for col_index, target_frame in enumerate(target_frames, start=1):
+        for col_index, (target_frame, target_video_frame_label) in enumerate(
+            zip(target_frames, target_video_frame_labels),
+            start=1,
+        ):
             axis = axes[row_index, col_index]
             label_frame = label_map_fhw[int(target_frame)].numpy()
             vector = pairwise_layer_vectors.get((int(query_frame), int(candidate_index), int(target_frame)))
@@ -4989,23 +5755,34 @@ def _plot_wan21_t2v_self_attention_coupling_storyboard(
             if vector is not None:
                 for key_candidate in range(1, int(label_frame.max()) + 1):
                     if int(key_candidate - 1) < int(vector.shape[0]):
-                        canvas[label_frame == int(key_candidate)] = np.float32(vector[int(key_candidate - 1)])
+                        display_mask = _trajectory_consensus_prepare_display_candidate_mask(label_frame == int(key_candidate))
+                        canvas[display_mask] = np.float32(vector[int(key_candidate - 1)])
             axis.imshow(np.ones_like(label_frame, dtype=np.float32), cmap="gray", vmin=0.0, vmax=1.0, alpha=0.12)
             axis.imshow(np.ma.masked_invalid(canvas), cmap="viridis", vmin=0.0, vmax=vmax)
             for key_candidate in range(1, int(label_frame.max()) + 1):
-                candidate_mask = (label_frame == int(key_candidate))
+                candidate_mask = _trajectory_consensus_prepare_display_candidate_mask(label_frame == int(key_candidate))
                 if not np.any(candidate_mask):
                     continue
-                axis.contour(candidate_mask.astype(np.float32), levels=[0.5], colors=["#ffffff"], linewidths=0.8)
                 points = np.argwhere(candidate_mask)
                 metric_value = (
                     float(vector[int(key_candidate - 1)])
                     if vector is not None and int(key_candidate - 1) < int(vector.shape[0])
                     else float("nan")
                 )
+                if math.isfinite(metric_value):
+                    fill_color = key_cmap(float(metric_value) / max(vmax, 1e-8))[:3]
+                    edge_color = _trajectory_consensus_candidate_edge_color(fill_color)
+                else:
+                    edge_color = (0.45, 0.45, 0.45)
+                axis.contour(
+                    candidate_mask.astype(np.float32),
+                    levels=[0.5],
+                    colors=[edge_color],
+                    linewidths=1.2,
+                )
                 if points.size > 0 and math.isfinite(metric_value):
                     center_y = float(points[:, 0].mean())
-                    x_anchor = float(points[:, 1].max()) + 0.5
+                    x_anchor = float(points[:, 1].max()) + 2.0
                     axis.text(
                         x_anchor,
                         center_y,
@@ -5015,15 +5792,64 @@ def _plot_wan21_t2v_self_attention_coupling_storyboard(
                         ha="left",
                         va="center",
                     )
-            axis.set_title(f"key frame={int(target_frame)}", fontsize=14)
+            axis.set_title(f"key frame={int(target_video_frame_label)}", fontsize=14)
+            axis.set_xlim(-0.5, float(label_frame.shape[1]) - 0.5 + 7.0)
             axis.set_xticks([])
             axis.set_yticks([])
     fig.suptitle(f"{title} ({value_name})", fontsize=17)
-    fig.subplots_adjust(left=0.02, right=0.99, top=0.86, bottom=0.05, wspace=0.03, hspace=0.06)
+    fig.subplots_adjust(left=0.02, right=0.99, top=0.86, bottom=0.05, wspace=0.03, hspace=0.12)
     _ensure_dir(os.path.dirname(save_file))
     fig.savefig(save_file, format="pdf")
     plt.close(fig)
     return save_file
+
+
+def _select_wan21_t2v_storyboard_target_frames(
+    frame_count: int,
+    query_frame: int,
+    mode: str,
+) -> List[int]:
+    """Select storyboard key frames using one named heuristic."""
+    frame_count = int(frame_count)
+    query_frame = int(query_frame)
+    mode = str(mode).strip().lower()
+    if frame_count <= 0:
+        return []
+
+    if mode == "fixed_local_global":
+        candidate_frames = [0, int(frame_count // 2), int(frame_count - 1), int(query_frame - 1), int(query_frame + 1)]
+    elif mode == "next6":
+        candidate_frames = [int(query_frame + offset) for offset in range(1, 7)]
+        if len([frame for frame in candidate_frames if 0 <= int(frame) < frame_count]) < 6:
+            deficit = 6 - len([frame for frame in candidate_frames if 0 <= int(frame) < frame_count])
+            left_candidates = [int(query_frame - offset) for offset in range(1, frame_count)]
+            candidate_frames.extend(left_candidates[:deficit])
+    elif mode == "around5":
+        candidate_frames = [int(query_frame - 2), int(query_frame - 1), int(query_frame + 1), int(query_frame + 2), int(query_frame + 3)]
+        valid_count = len([frame for frame in candidate_frames if 0 <= int(frame) < frame_count])
+        if valid_count < 5:
+            deficit = 5 - valid_count
+            extra_pool = []
+            left_candidates = [int(query_frame - offset) for offset in range(3, frame_count)]
+            right_candidates = [int(query_frame + offset) for offset in range(4, frame_count)]
+            extra_pool.extend(left_candidates)
+            extra_pool.extend(right_candidates)
+            candidate_frames.extend(extra_pool[:deficit])
+    else:
+        raise ValueError(f"Unsupported storyboard target-frame mode: {mode}")
+
+    filtered_frames = [
+        int(frame)
+        for frame in candidate_frames
+        if 0 <= int(frame) < frame_count and int(frame) != int(query_frame)
+    ]
+    unique_frames = sorted(dict.fromkeys(filtered_frames))
+    if mode == "next6":
+        # Keep the first 6 frames after deduplication/fallback expansion.
+        return unique_frames[:6]
+    if mode == "around5":
+        return unique_frames[:5]
+    return unique_frames
 
 
 def _plot_wan21_t2v_self_attention_feature_evolution_panel(
@@ -5078,7 +5904,7 @@ def _plot_wan21_t2v_self_attention_feature_evolution_panel(
         if smooth_xs.size > 0:
             axis.plot(smooth_xs, smooth_ys, linewidth=2.4, color="#dc2626", alpha=0.95, label="smoothed gap")
         axis.axhline(0.0, color="#64748b", linewidth=1.0, linestyle="--", alpha=0.75)
-        axis.set_title(feature_name, fontsize=10)
+        axis.set_title(_trajectory_consensus_self_attention_feature_display_name(feature_name), fontsize=10)
         axis.set_xlabel(x_label)
         axis.set_ylabel("winner-minus-loser gap")
         axis.grid(alpha=0.22, linestyle="--")
@@ -5111,11 +5937,13 @@ def _plot_wan21_t2v_self_attention_signed_offset_panel(
         ("dominant_link_ratio", "dominant-link ratio"),
         ("link_margin", "link margin"),
         ("head_agreement", "head agreement"),
+        ("soft_head_vote_share", "soft head-vote share"),
+        ("soft_head_agreement", "soft head agreement"),
     ]
     if not signed_offset_rows or not selected_observations:
         return ""
-    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.8))
-    axes = axes.reshape(2, 2)
+    fig, axes = plt.subplots(3, 2, figsize=(11.5, 10.8))
+    axes = axes.reshape(3, 2)
     color_map = plt.get_cmap("tab10")
     for metric_index, (metric_key, metric_label) in enumerate(metrics):
         axis = axes[metric_index // 2, metric_index % 2]
@@ -5166,26 +5994,38 @@ def _plot_wan21_t2v_self_attention_competition_curves(
     selected_features = [
         "proposal_pi",
         "proposal_vote_share",
+        "local_compatibility",
+        "global_compatibility",
         "local_chainability",
         "global_chainability",
         "global_mutual_consistency",
         "global_head_agreement",
+        "global_soft_head_vote_share",
+        "global_soft_head_agreement",
     ]
     feature_labels = {
         "proposal_pi": "CA proposal strength",
         "proposal_vote_share": "CA vote share",
+        "local_compatibility": "SA local compatibility",
+        "global_compatibility": "SA global compatibility",
         "local_chainability": "SA local chainability",
         "global_chainability": "SA global chainability",
         "global_mutual_consistency": "SA global mutual consistency",
         "global_head_agreement": "SA global head agreement",
+        "global_soft_head_vote_share": "SA global soft head-vote share",
+        "global_soft_head_agreement": "SA global soft head agreement",
     }
     feature_colors = {
         "proposal_pi": "#1d4ed8",
         "proposal_vote_share": "#38bdf8",
+        "local_compatibility": "#f59e0b",
+        "global_compatibility": "#b45309",
         "local_chainability": "#f59e0b",
         "global_chainability": "#dc2626",
         "global_mutual_consistency": "#7c3aed",
         "global_head_agreement": "#059669",
+        "global_soft_head_vote_share": "#0f766e",
+        "global_soft_head_agreement": "#14b8a6",
     }
     axis_mode = str(axis_mode).strip().lower()
     if axis_mode not in {"step", "layer"}:
@@ -5259,14 +6099,16 @@ def _plot_wan21_t2v_self_attention_competition_curves(
     return save_file
 
 
-def _plot_wan21_t2v_self_attention_overlap_scatter(
+def _plot_wan21_t2v_self_attention_feature_target_scatter(
     candidate_feature_rows: Sequence[Dict[str, object]],
     feature_name: str,
+    target_key: str,
+    target_label: str,
     save_file: str,
     title: str,
     selected_step: Optional[int] = None,
 ) -> str:
-    """Scatter one feature against anchor overlap for diagnostic inspection."""
+    """Scatter one feature against one target quantity for diagnostic inspection."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -5276,8 +6118,8 @@ def _plot_wan21_t2v_self_attention_overlap_scatter(
         if selected_step is not None and int(row["step"]) != int(selected_step):
             continue
         feature_value = _safe_wan21_t2v_float(row.get(feature_name, float("nan")))
-        anchor_iou = _safe_wan21_t2v_float(row.get("anchor_iou", float("nan")))
-        if not math.isfinite(feature_value) or not math.isfinite(anchor_iou):
+        target_value = _safe_wan21_t2v_float(row.get(target_key, float("nan")))
+        if not math.isfinite(feature_value) or not math.isfinite(target_value):
             continue
         if int(row.get("is_winner_aligned", 0)) == 1:
             role = "winner"
@@ -5288,7 +6130,7 @@ def _plot_wan21_t2v_self_attention_overlap_scatter(
         else:
             role = "other"
             color = "#94a3b8"
-        plot_rows.append((feature_value, anchor_iou, role, color))
+        plot_rows.append((feature_value, target_value, role, color))
     if not plot_rows:
         return ""
 
@@ -5311,13 +6153,13 @@ def _plot_wan21_t2v_self_attention_overlap_scatter(
             fit_xs,
             fit_ys,
             color="black",
-            linewidth=2.0,
+            linewidth=1.5,
             alpha=0.9,
             label="linear fit",
         )
     axis.set_title(title)
-    axis.set_xlabel(feature_name)
-    axis.set_ylabel("anchor IoU")
+    axis.set_xlabel(_trajectory_consensus_self_attention_feature_display_name(feature_name))
+    axis.set_ylabel(str(target_label))
     axis.grid(alpha=0.22, linestyle="--")
     axis.legend(fontsize=8)
     fig.tight_layout()
@@ -5325,6 +6167,110 @@ def _plot_wan21_t2v_self_attention_overlap_scatter(
     fig.savefig(save_file, format="pdf")
     plt.close(fig)
     return save_file
+
+
+def _plot_wan21_t2v_self_attention_feature_target_scatter_points(
+    feature_values: np.ndarray,
+    target_values: np.ndarray,
+    role_codes: np.ndarray,
+    feature_name: str,
+    target_label: str,
+    save_file: str,
+    title: str,
+) -> str:
+    """Render one scatter plot from compact per-point arrays."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    feature_values = np.asarray(feature_values, dtype=np.float64)
+    target_values = np.asarray(target_values, dtype=np.float64)
+    role_codes = np.asarray(role_codes, dtype=np.int8)
+    if feature_values.size == 0 or target_values.size == 0 or role_codes.size == 0:
+        return ""
+
+    fig, axis = plt.subplots(1, 1, figsize=(6.9, 5.4))
+    role_specs = [
+        (0, "other", "#94a3b8"),
+        (1, "strongest loser", "#dc2626"),
+        (2, "winner", "#16a34a"),
+    ]
+    for role_code, role_name, role_color in role_specs:
+        role_mask = role_codes == int(role_code)
+        if not np.any(role_mask):
+            continue
+        xs = feature_values[role_mask]
+        ys = target_values[role_mask]
+        axis.scatter(
+            xs,
+            ys,
+            s=18 if role_code == 0 else 24,
+            alpha=0.72,
+            color=role_color,
+            edgecolors="none",
+            label=role_name,
+        )
+
+    if feature_values.size >= 2 and np.unique(feature_values).size >= 2:
+        slope, intercept = np.polyfit(feature_values, target_values, deg=1)
+        fit_xs = np.linspace(float(feature_values.min()), float(feature_values.max()), num=200)
+        fit_ys = slope * fit_xs + intercept
+        axis.plot(
+            fit_xs,
+            fit_ys,
+            color="black",
+            linewidth=1.5,
+            alpha=0.9,
+            label="linear fit",
+        )
+    axis.set_title(title)
+    axis.set_xlabel(_trajectory_consensus_self_attention_feature_display_name(feature_name))
+    axis.set_ylabel(str(target_label))
+    axis.grid(alpha=0.22, linestyle="--")
+    axis.legend(fontsize=8)
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _build_wan21_t2v_self_attention_scatter_family_payload(
+    candidate_feature_rows: Sequence[Dict[str, object]],
+    feature_name: str,
+    target_key: str,
+    min_candidate_count: int = 1,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Build compact per-point arrays for one scatter family."""
+    feature_values: List[float] = []
+    target_values: List[float] = []
+    role_codes: List[int] = []
+    step_values: List[int] = []
+    for row in candidate_feature_rows:
+        if int(row.get("candidate_count", 0)) < max(1, int(min_candidate_count)):
+            continue
+        feature_value = _safe_wan21_t2v_float(row.get(feature_name, float("nan")))
+        target_value = _safe_wan21_t2v_float(row.get(target_key, float("nan")))
+        if not math.isfinite(feature_value) or not math.isfinite(target_value):
+            continue
+        if int(row.get("is_winner_aligned", 0)) == 1:
+            role_code = 2
+        elif int(row.get("is_strongest_loser", 0)) == 1:
+            role_code = 1
+        else:
+            role_code = 0
+        feature_values.append(float(feature_value))
+        target_values.append(float(target_value))
+        role_codes.append(int(role_code))
+        step_values.append(int(row["step"]))
+    if not feature_values:
+        return None
+    return (
+        np.asarray(feature_values, dtype=np.float32),
+        np.asarray(target_values, dtype=np.float32),
+        np.asarray(role_codes, dtype=np.int8),
+        np.asarray(step_values, dtype=np.int16),
+    )
 
 
 def _trajectory_consensus_render_self_attention_observation_plots_task(
@@ -5338,7 +6284,10 @@ def _trajectory_consensus_render_self_attention_observation_plots_task(
         feature_rows_for_obs,
         pairwise_rows_for_obs,
         overlay_features,
+        overlay_anchor_modes,
         overlay_frame_indices,
+        overlay_video_frame_labels,
+        storyboard_modes,
         layer1_overlay_dir,
         layer1_storyboard_dir,
         skip_existing_plots,
@@ -5350,26 +6299,33 @@ def _trajectory_consensus_render_self_attention_observation_plots_task(
     layer = int(layer)
     frame_count = int(label_map_fhw.shape[0])
 
-    for feature_name in overlay_features:
-        save_file = os.path.join(
-            str(layer1_overlay_dir),
-            f"step_{int(step):03d}",
-            f"layer_{int(layer):02d}",
-            f"candidate_score_overlay_{str(feature_name)}.pdf",
-        )
-        if _maybe_skip_wan21_t2v_existing_plot(save_file, bool(skip_existing_plots)):
-            plot_paths.append(save_file)
-        else:
-            plot_path = _plot_wan21_t2v_self_attention_candidate_score_overlay(
-                label_map_fhw=label_map_fhw,
-                feature_rows=feature_rows_for_obs,
-                feature_name=str(feature_name),
-                save_file=save_file,
-                title=f"Candidate score overlay at step={int(step)}, layer={int(layer)} ({str(feature_name)})",
-                frame_indices=overlay_frame_indices,
+    for anchor_mode in overlay_anchor_modes:
+        for feature_name in overlay_features:
+            save_file = os.path.join(
+                str(layer1_overlay_dir),
+                str(anchor_mode),
+                f"step_{int(step):03d}",
+                f"layer_{int(layer):02d}",
+                f"candidate_score_overlay_{str(feature_name)}.pdf",
             )
-            if plot_path:
-                plot_paths.append(plot_path)
+            if _maybe_skip_wan21_t2v_existing_plot(save_file, bool(skip_existing_plots)):
+                plot_paths.append(save_file)
+            else:
+                plot_path = _plot_wan21_t2v_self_attention_candidate_score_overlay(
+                    label_map_fhw=label_map_fhw,
+                    feature_rows=feature_rows_for_obs,
+                    feature_name=str(feature_name),
+                    anchor_mode=str(anchor_mode),
+                    save_file=save_file,
+                    title=(
+                        f"Candidate score overlay at step={int(step)}, layer={int(layer)} "
+                        f"({str(feature_name)}, {str(anchor_mode)})"
+                    ),
+                    frame_indices=overlay_frame_indices,
+                    video_frame_labels=overlay_video_frame_labels,
+                )
+                if plot_path:
+                    plot_paths.append(plot_path)
 
     if pairwise_rows_for_obs:
         raw_coupling_vectors = _build_wan21_t2v_self_attention_pairwise_layer_value_vectors(
@@ -5388,24 +6344,9 @@ def _trajectory_consensus_render_self_attention_observation_plots_task(
             loser_rows = [row for row in frame_rows if int(row.get("is_strongest_loser", 0)) == 1]
             if not winner_rows or not loser_rows:
                 continue
+            query_video_frame_label = int(frame_index)
             winner_candidate = int(winner_rows[0]["candidate_index"])
             loser_candidate = int(loser_rows[0]["candidate_index"])
-            candidate_target_frames = sorted(
-                {
-                    int(candidate_frame)
-                    for candidate_frame in (
-                        [0, int(frame_count // 2), int(frame_count - 1), int(frame_index - 1), int(frame_index + 1)]
-                    )
-                    if 0 <= int(candidate_frame) < int(frame_count)
-                    and int(candidate_frame) != int(frame_index)
-                }
-            )
-            if not candidate_target_frames:
-                candidate_target_frames = [
-                    int(candidate_frame)
-                    for candidate_frame in range(frame_count)
-                    if int(candidate_frame) != int(frame_index)
-                ][:4]
             for value_name, value_vectors in [
                 ("raw_coupling", raw_coupling_vectors),
                 ("normalized_coupling", normalized_coupling_vectors),
@@ -5414,12 +6355,18 @@ def _trajectory_consensus_render_self_attention_observation_plots_task(
                     str(layer1_storyboard_dir),
                     f"step_{int(step):03d}",
                     f"layer_{int(layer):02d}",
-                    f"frame_{int(frame_index):02d}",
+                    f"frame_{int(query_video_frame_label):03d}",
                     f"winner_loser_coupling_storyboard_{str(value_name)}.pdf",
                 )
                 if _maybe_skip_wan21_t2v_existing_plot(storyboard_save, bool(skip_existing_plots)):
                     plot_paths.append(storyboard_save)
                 else:
+                    candidate_target_frames = _select_wan21_t2v_storyboard_target_frames(
+                        frame_count=int(frame_count),
+                        query_frame=int(frame_index),
+                        mode="fixed_local_global",
+                    )
+                    candidate_target_video_labels = [int(candidate_frame) for candidate_frame in candidate_target_frames]
                     plot_path = _plot_wan21_t2v_self_attention_coupling_storyboard(
                         label_map_fhw=label_map_fhw,
                         pairwise_layer_vectors=value_vectors,
@@ -5430,16 +6377,61 @@ def _trajectory_consensus_render_self_attention_observation_plots_task(
                         save_file=storyboard_save,
                         title=(
                             f"Winner-versus-loser coupling storyboard at step={int(step)}, "
-                            f"layer={int(layer)}, query frame={int(frame_index)}"
+                            f"layer={int(layer)}, query frame={int(query_video_frame_label)}"
                         ),
                         value_name=str(value_name),
+                        query_video_frame_label=int(query_video_frame_label),
+                        target_video_frame_labels=tuple(int(x) for x in candidate_target_video_labels),
+                    )
+                    if plot_path:
+                        plot_paths.append(plot_path)
+            if "next6" in {str(mode) for mode in storyboard_modes} or "around5" in {str(mode) for mode in storyboard_modes}:
+                normalized_value_vectors = normalized_coupling_vectors
+                storyboard_variants = [
+                    ("next6", "fixed next-6 frames", "winner_loser_coupling_storyboard_normalized_coupling_next6.pdf"),
+                    ("around5", "local 5-frame neighborhood", "winner_loser_coupling_storyboard_normalized_coupling_around5.pdf"),
+                ]
+                for mode, mode_title, filename in storyboard_variants:
+                    storyboard_save = os.path.join(
+                        str(layer1_storyboard_dir),
+                        f"step_{int(step):03d}",
+                        f"layer_{int(layer):02d}",
+                        f"frame_{int(frame_index):03d}",
+                        filename,
+                    )
+                    if _maybe_skip_wan21_t2v_existing_plot(storyboard_save, bool(skip_existing_plots)):
+                        plot_paths.append(storyboard_save)
+                        continue
+                    candidate_target_frames = _select_wan21_t2v_storyboard_target_frames(
+                        frame_count=int(frame_count),
+                        query_frame=int(frame_index),
+                        mode=str(mode),
+                    )
+                    if not candidate_target_frames:
+                        continue
+                    candidate_target_video_labels = [int(candidate_frame) for candidate_frame in candidate_target_frames]
+                    plot_path = _plot_wan21_t2v_self_attention_coupling_storyboard(
+                        label_map_fhw=label_map_fhw,
+                        pairwise_layer_vectors=normalized_value_vectors,
+                        query_frame=int(frame_index),
+                        winner_candidate=int(winner_candidate),
+                        loser_candidate=int(loser_candidate),
+                        target_frames=candidate_target_frames,
+                        save_file=storyboard_save,
+                        title=(
+                            f"Winner-versus-loser coupling storyboard ({mode_title}) at step={int(step)}, "
+                            f"layer={int(layer)}, query frame={int(frame_index)}"
+                        ),
+                        value_name="normalized_coupling",
+                        query_video_frame_label=int(frame_index),
+                        target_video_frame_labels=tuple(int(x) for x in candidate_target_video_labels),
                     )
                     if plot_path:
                         plot_paths.append(plot_path)
     return plot_paths
 
 
-def _trajectory_consensus_render_self_attention_plot_task(task: Tuple) -> str:
+def _trajectory_consensus_render_self_attention_plot_task(task: Tuple) -> Any:
     """Render one non-observation self-attention plot task."""
     plot_kind = str(task[0])
     if plot_kind == "evolution":
@@ -5504,19 +6496,74 @@ def _trajectory_consensus_render_self_attention_plot_task(task: Tuple) -> str:
             col_label=str(col_label),
         )
     if plot_kind == "scatter":
-        _, candidate_feature_rows, feature_name, save_file, title, selected_step = task
-        return _plot_wan21_t2v_self_attention_overlap_scatter(
+        _, candidate_feature_rows, feature_name, target_key, target_label, save_file, title, selected_step = task
+        return _plot_wan21_t2v_self_attention_feature_target_scatter(
             candidate_feature_rows=candidate_feature_rows,
             feature_name=str(feature_name),
+            target_key=str(target_key),
+            target_label=str(target_label),
             save_file=str(save_file),
             title=str(title),
             selected_step=(None if selected_step is None else int(selected_step)),
         )
+    if plot_kind == "scatter_family":
+        (
+            _,
+            feature_values_np,
+            target_values_np,
+            role_codes_np,
+            step_values_np,
+            feature_name,
+            target_label,
+            overall_save_file,
+            overall_title,
+            by_step_jobs,
+            skip_existing_plots,
+        ) = task
+        plot_paths: List[str] = []
+        feature_values_np = np.asarray(feature_values_np, dtype=np.float32)
+        target_values_np = np.asarray(target_values_np, dtype=np.float32)
+        role_codes_np = np.asarray(role_codes_np, dtype=np.int8)
+        step_values_np = np.asarray(step_values_np, dtype=np.int16)
+        if _maybe_skip_wan21_t2v_existing_plot(str(overall_save_file), bool(skip_existing_plots)):
+            plot_paths.append(str(overall_save_file))
+        else:
+            plot_path = _plot_wan21_t2v_self_attention_feature_target_scatter_points(
+                feature_values=feature_values_np,
+                target_values=target_values_np,
+                role_codes=role_codes_np,
+                feature_name=str(feature_name),
+                target_label=str(target_label),
+                save_file=str(overall_save_file),
+                title=str(overall_title),
+            )
+            if plot_path:
+                plot_paths.append(plot_path)
+        for step_value, save_file, title in by_step_jobs:
+            if _maybe_skip_wan21_t2v_existing_plot(str(save_file), bool(skip_existing_plots)):
+                plot_paths.append(str(save_file))
+                continue
+            step_mask = step_values_np == int(step_value)
+            if not np.any(step_mask):
+                continue
+            plot_path = _plot_wan21_t2v_self_attention_feature_target_scatter_points(
+                feature_values=feature_values_np[step_mask],
+                target_values=target_values_np[step_mask],
+                role_codes=role_codes_np[step_mask],
+                feature_name=str(feature_name),
+                target_label=str(target_label),
+                save_file=str(save_file),
+                title=str(title),
+            )
+            if plot_path:
+                plot_paths.append(plot_path)
+        return plot_paths
     raise ValueError(f"Unsupported self-attention plot task kind: {plot_kind}")
 
 
 def _render_wan21_t2v_self_attention_coupling_plots(
     output_dir: str,
+    frame_num: int,
     pairwise_rows: Sequence[Dict[str, object]],
     candidate_feature_rows: Sequence[Dict[str, object]],
     feature_summary_rows: Sequence[Dict[str, object]],
@@ -5542,6 +6589,7 @@ def _render_wan21_t2v_self_attention_coupling_plots(
     heatmap_auroc_dir = os.path.join(heatmaps_dir, "auroc")
     scatter_dir = os.path.join(layer3_dir, "scatter")
     scatter_anchor_dir = os.path.join(scatter_dir, "feature_vs_anchor_iou")
+    scatter_anchor_dist_dir = os.path.join(scatter_dir, "feature_vs_anchor_dist")
     for directory in [
         layer1_dir,
         layer2_dir,
@@ -5557,6 +6605,7 @@ def _render_wan21_t2v_self_attention_coupling_plots(
         heatmap_auroc_dir,
         scatter_dir,
         scatter_anchor_dir,
+        scatter_anchor_dist_dir,
     ]:
         _ensure_dir(directory)
 
@@ -5584,6 +6633,21 @@ def _render_wan21_t2v_self_attention_coupling_plots(
         "global_chainability",
         "local_mutual_consistency",
         "global_mutual_consistency",
+        "local_head_agreement",
+        "global_head_agreement",
+        "local_soft_head_vote_share",
+        "global_soft_head_vote_share",
+        "local_soft_head_agreement",
+        "global_soft_head_agreement",
+    ]
+    overlay_anchor_modes = [
+        "anchor_iou",
+        "anchor_distance",
+    ]
+    storyboard_modes = [
+        "fixed_local_global",
+        "next6",
+        "around5",
     ]
     sorted_step_layer_keys = sorted(step_layer_feature_rows.keys())
     observation_plot_tasks: List[Tuple] = []
@@ -5595,7 +6659,11 @@ def _render_wan21_t2v_self_attention_coupling_plots(
             continue
         label_map_fhw = label_payload["label_map_fhw"]
         frame_count = int(label_map_fhw.shape[0])
-        overlay_frame_indices = _sample_wan21_t2v_evenly_spaced_indices(frame_count, max_count=10)
+        overlay_frame_indices, overlay_video_frame_labels = _resolve_wan21_t2v_trajectory_consensus_viz_frames(
+            attention_frame_count=int(frame_count),
+            video_frame_count=int(frame_num),
+            num_frames=10,
+        )
         label_map_np = np.ascontiguousarray(
             label_map_fhw.detach().cpu().numpy().astype(np.int16, copy=False)
         )
@@ -5607,7 +6675,10 @@ def _render_wan21_t2v_self_attention_coupling_plots(
                 feature_rows_for_obs,
                 pairwise_rows_for_obs,
                 tuple(str(feature_name) for feature_name in overlay_features),
+                tuple(str(anchor_mode) for anchor_mode in overlay_anchor_modes),
                 tuple(int(frame_index) for frame_index in overlay_frame_indices),
+                tuple(int(frame_label) for frame_label in overlay_video_frame_labels),
+                tuple(str(mode) for mode in storyboard_modes),
                 str(layer1_overlay_dir),
                 str(layer1_storyboard_dir),
                 bool(skip_existing_plots),
@@ -5646,10 +6717,32 @@ def _render_wan21_t2v_self_attention_coupling_plots(
     evolution_features = [
         "proposal_pi",
         "proposal_vote_share",
+        "local_avg_covered_mass",
+        "global_avg_covered_mass",
+        "local_entropy",
+        "global_entropy",
+        "local_dominant_link_ratio",
+        "global_dominant_link_ratio",
+        "local_link_margin",
+        "global_link_margin",
+        "local_compatibility",
+        "global_compatibility",
         "local_chainability",
         "global_chainability",
+        "local_incoming_support",
+        "global_incoming_support",
+        "local_incoming_preference_share",
+        "global_incoming_preference_share",
+        "local_incoming_vote_share",
+        "global_incoming_vote_share",
+        "local_mutual_consistency",
         "global_mutual_consistency",
+        "local_head_agreement",
         "global_head_agreement",
+        "local_soft_head_vote_share",
+        "global_soft_head_vote_share",
+        "local_soft_head_agreement",
+        "global_soft_head_agreement",
     ]
     stepwise_gap_rows = _build_wan21_t2v_self_attention_stepwise_gap_rows(gap_rows)
     layerwise_gap_rows = _build_wan21_t2v_self_attention_layerwise_gap_rows(gap_rows)
@@ -5821,11 +6914,11 @@ def _render_wan21_t2v_self_attention_coupling_plots(
                     "precedence_bar",
                     precedence_summary_rows,
                     precedence_save,
-                    "Temporal precedence summary",
+                    "Temporal precedence summary (lower means earlier stable winner-loser separation)",
                     "feature",
                     "mean_precedence_index",
                     "feature",
-                    "mean first stable separation index",
+                    "mean earliest stable separation order (lower earlier)",
                 )
             )
 
@@ -5870,49 +6963,104 @@ def _render_wan21_t2v_self_attention_coupling_plots(
 
     scatter_features = [
         "proposal_pi",
+        "proposal_vote_share",
+        "local_compatibility",
+        "global_compatibility",
+        "local_chainability",
         "global_chainability",
+        "local_incoming_support",
+        "global_incoming_support",
+        "local_incoming_preference_share",
+        "global_incoming_preference_share",
+        "local_incoming_vote_share",
+        "global_incoming_vote_share",
+        "local_mutual_consistency",
         "global_mutual_consistency",
+        "local_head_agreement",
+        "global_head_agreement",
+        "local_soft_head_vote_share",
+        "global_soft_head_vote_share",
+        "local_soft_head_agreement",
+        "global_soft_head_agreement",
+        "local_link_margin",
+        "global_link_margin",
+        "local_dominant_link_ratio",
+        "global_dominant_link_ratio",
+        "local_entropy",
+        "global_entropy",
     ]
     all_scatter_steps = sorted({int(row["step"]) for row in candidate_feature_rows})
+    scatter_targets = [
+        ("anchor_iou", "anchor IoU", scatter_anchor_dir, "anchor_iou"),
+        ("anchor_distance", "anchor-distance score", scatter_anchor_dist_dir, "anchor_dist"),
+    ]
+    scatter_filter_specs = [
+        (1, "", ""),
+        (2, "_candidate_count_ge_2", " | candidate_count>=2"),
+    ]
     for feature_name in scatter_features:
-        feature_scatter_dir = os.path.join(scatter_anchor_dir, str(feature_name))
-        overall_dir = os.path.join(feature_scatter_dir, "overall")
-        by_step_dir = os.path.join(feature_scatter_dir, "by_step")
-        _ensure_dir(overall_dir)
-        _ensure_dir(by_step_dir)
-        scatter_save = os.path.join(overall_dir, f"{feature_name}_vs_anchor_iou.pdf")
-        if _maybe_skip_wan21_t2v_existing_plot(scatter_save, skip_existing_plots):
-            plot_paths.append(scatter_save)
-        else:
-            misc_plot_tasks.append(
-                (
-                    "scatter",
-                    candidate_feature_rows,
-                    feature_name,
-                    scatter_save,
-                    f"{feature_name} versus anchor overlap",
-                    None,
+        for target_key, target_label, target_root_dir, target_tag in scatter_targets:
+            feature_scatter_dir = os.path.join(target_root_dir, str(feature_name))
+            overall_dir = os.path.join(feature_scatter_dir, "overall")
+            by_step_dir = os.path.join(feature_scatter_dir, "by_step")
+            _ensure_dir(overall_dir)
+            _ensure_dir(by_step_dir)
+            for min_candidate_count, file_suffix, title_suffix in scatter_filter_specs:
+                scatter_payload = _build_wan21_t2v_self_attention_scatter_family_payload(
+                    candidate_feature_rows=candidate_feature_rows,
+                    feature_name=str(feature_name),
+                    target_key=str(target_key),
+                    min_candidate_count=int(min_candidate_count),
                 )
-            )
-        for step in all_scatter_steps:
-            scatter_save = os.path.join(
-                by_step_dir,
-                f"step_{int(step):03d}",
-                f"{feature_name}_vs_anchor_iou_step_{int(step):03d}.pdf",
-            )
-            if _maybe_skip_wan21_t2v_existing_plot(scatter_save, skip_existing_plots):
-                plot_paths.append(scatter_save)
-            else:
-                misc_plot_tasks.append(
-                    (
-                        "scatter",
-                        candidate_feature_rows,
-                        feature_name,
-                        scatter_save,
-                        f"{feature_name} versus anchor overlap at step={int(step)}",
-                        int(step),
+                if scatter_payload is None:
+                    continue
+                overall_save = os.path.join(
+                    overall_dir,
+                    f"{feature_name}_vs_{target_tag}{file_suffix}.pdf",
+                )
+                overall_exists = _maybe_skip_wan21_t2v_existing_plot(overall_save, skip_existing_plots)
+                overall_title = (
+                    f"{_trajectory_consensus_self_attention_feature_display_name(feature_name)} "
+                    f"versus {target_label}{title_suffix}"
+                )
+                if overall_exists:
+                    plot_paths.append(overall_save)
+                by_step_jobs: List[Tuple[int, str, str]] = []
+                for step in all_scatter_steps:
+                    step_scatter_save = os.path.join(
+                        by_step_dir,
+                        f"step_{int(step):03d}",
+                        f"{feature_name}_vs_{target_tag}_step_{int(step):03d}{file_suffix}.pdf",
                     )
-                )
+                    if _maybe_skip_wan21_t2v_existing_plot(step_scatter_save, skip_existing_plots):
+                        plot_paths.append(step_scatter_save)
+                        continue
+                    by_step_jobs.append(
+                        (
+                            int(step),
+                            step_scatter_save,
+                            (
+                                f"{_trajectory_consensus_self_attention_feature_display_name(feature_name)} "
+                                f"versus {target_label} at step={int(step)}{title_suffix}"
+                            ),
+                        )
+                    )
+                if (not overall_exists) or by_step_jobs:
+                    misc_plot_tasks.append(
+                        (
+                            "scatter_family",
+                            scatter_payload[0],
+                            scatter_payload[1],
+                            scatter_payload[2],
+                            scatter_payload[3],
+                            feature_name,
+                            target_label,
+                            overall_save,
+                            overall_title,
+                            tuple(by_step_jobs),
+                            bool(skip_existing_plots),
+                        )
+                    )
 
     misc_progress_bar = None
     if misc_plot_tasks:
@@ -5931,13 +7079,15 @@ def _render_wan21_t2v_self_attention_coupling_plots(
             requested_num_workers=int(num_workers),
             task_count=int(len(misc_plot_tasks)),
         )
-        for plot_path in _iter_wan21_t2v_parallel_results(
+        for plot_result in _iter_wan21_t2v_parallel_results(
             tasks=misc_plot_tasks,
             worker_fn=_trajectory_consensus_render_self_attention_plot_task,
             num_workers=int(effective_num_workers),
         ):
-            if plot_path:
-                plot_paths.append(plot_path)
+            if isinstance(plot_result, (list, tuple)):
+                plot_paths.extend([path for path in plot_result if path])
+            elif plot_result:
+                plot_paths.append(plot_result)
             if misc_progress_bar is not None:
                 misc_progress_bar.update(1)
     finally:
@@ -5975,6 +7125,8 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     trajectory_consensus_branch: str = "cond",
     trajectory_consensus_reference_distance_metrics: Sequence[str] = ("center_l2",),
     trajectory_consensus_scatter_outlier_heads: Sequence[str] = tuple(),
+    trajectory_consensus_scatter_outlier_cross_heads: Sequence[str] = tuple(),
+    trajectory_consensus_scatter_outlier_self_heads: Sequence[str] = tuple(),
     trajectory_consensus_candidate_base_quantile: float = 0.85,
     trajectory_consensus_candidate_split_quantiles: Sequence[float] = (0.92, 0.95, 0.97),
     trajectory_consensus_candidate_smooth_radius: int = 1,
@@ -5984,6 +7136,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     trajectory_consensus_candidate_preprocess_despike_quantile: float = 0.98,
     trajectory_consensus_candidate_min_component_area: int = 4,
     trajectory_consensus_candidate_viz_num_frames: int = 8,
+    trajectory_consensus_candidate_enable_per_head: bool = True,
     trajectory_consensus_do_ablation: bool = True,
     trajectory_consensus_contribution_method: str = "exact_ablation",
     trajectory_consensus_ablate_position: str = "pre_o",
@@ -6000,6 +7153,13 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     trajectory_consensus_sa_covered_mass_min: float = 0.0,
     trajectory_consensus_sa_precedence_persistence: int = 2,
     trajectory_consensus_plot_only_from_csv: bool = False,
+    trajectory_consensus_seed_influence_mode: str = "seed_sensitivity",
+    trajectory_consensus_seed_influence_seeds: Sequence[int] = tuple(),
+    trajectory_consensus_seed_sensitivity_zr_metric: str = "global_mutual_consistency",
+    trajectory_consensus_seed_sensitivity_steps: Sequence[int] = tuple(),
+    trajectory_consensus_anchor_frame_steps: Sequence[int] = tuple(),
+    trajectory_consensus_seed_influence_anchor_topk: int = 2,
+    trajectory_consensus_seed_influence_arrow_topk: int = 2,
     trajectory_consensus_skip_existing_plots: bool = True,
     trajectory_consensus_num_workers: int = 0,
 ) -> Dict[str, object]:
@@ -6007,12 +7167,67 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     _ensure_dir(output_dir)
     stages = [str(stage).strip().lower() for stage in trajectory_consensus_stages if str(stage).strip()]
     stages = list(dict.fromkeys(stages))
-    allowed_stages = {"candidate_consensus", "head_contribution", "self_attention_coupling"}
+    allowed_stages = {"candidate_consensus", "head_contribution", "self_attention_coupling", "seed_influence"}
     bad_stages = [stage for stage in stages if stage not in allowed_stages]
     if bad_stages:
         raise ValueError(f"Unsupported trajectory_consensus stages: {bad_stages}")
     if not stages:
         raise ValueError("trajectory_consensus_stages must be non-empty.")
+    if "seed_influence" in stages and len(stages) > 1:
+        raise ValueError(
+            "seed_influence should be run as a standalone trajectory_consensus stage. "
+            "Please set trajectory_consensus_stages to `seed_influence` only."
+        )
+    if stages == ["seed_influence"]:
+        from .trajectory_consensus_seed_influence import (
+            run_wan21_t2v_trajectory_consensus_seed_influence,
+        )
+        return run_wan21_t2v_trajectory_consensus_seed_influence(
+            wan21_root=wan21_root,
+            ckpt_dir=ckpt_dir,
+            output_dir=output_dir,
+            prompt=prompt,
+            size=size,
+            task=task,
+            frame_num=frame_num,
+            shift=shift,
+            sample_solver=sample_solver,
+            sampling_steps=sampling_steps,
+            guide_scale=guide_scale,
+            device_id=device_id,
+            offload_model=offload_model,
+            parallel_cfg=parallel_cfg,
+            target_object_words=target_object_words,
+            target_verb_words=target_verb_words,
+            reuse_cross_attention_dir=reuse_cross_attention_dir,
+            trajectory_consensus_steps=trajectory_consensus_steps,
+            trajectory_consensus_seed_sensitivity_steps=trajectory_consensus_seed_sensitivity_steps,
+            trajectory_consensus_anchor_frame_steps=trajectory_consensus_anchor_frame_steps,
+            trajectory_consensus_layers=trajectory_consensus_layers,
+            trajectory_consensus_self_heads=trajectory_consensus_self_heads,
+            trajectory_consensus_branch=trajectory_consensus_branch,
+            trajectory_consensus_candidate_base_quantile=trajectory_consensus_candidate_base_quantile,
+            trajectory_consensus_candidate_split_quantiles=trajectory_consensus_candidate_split_quantiles,
+            trajectory_consensus_candidate_smooth_radius=trajectory_consensus_candidate_smooth_radius,
+            trajectory_consensus_candidate_stable_peak_min_levels=trajectory_consensus_candidate_stable_peak_min_levels,
+            trajectory_consensus_candidate_peak_merge_distance=trajectory_consensus_candidate_peak_merge_distance,
+            trajectory_consensus_candidate_preprocess_winsorize_quantile=trajectory_consensus_candidate_preprocess_winsorize_quantile,
+            trajectory_consensus_candidate_preprocess_despike_quantile=trajectory_consensus_candidate_preprocess_despike_quantile,
+            trajectory_consensus_candidate_min_component_area=trajectory_consensus_candidate_min_component_area,
+            trajectory_consensus_object_mask_reference_step=trajectory_consensus_object_mask_reference_step,
+            trajectory_consensus_object_mask_reference_layer=trajectory_consensus_object_mask_reference_layer,
+            trajectory_consensus_sa_anchor_step=trajectory_consensus_sa_anchor_step,
+            trajectory_consensus_sa_anchor_layer=trajectory_consensus_sa_anchor_layer,
+            trajectory_consensus_sa_covered_mass_min=trajectory_consensus_sa_covered_mass_min,
+            trajectory_consensus_plot_only_from_csv=trajectory_consensus_plot_only_from_csv,
+            trajectory_consensus_seed_influence_mode=trajectory_consensus_seed_influence_mode,
+            trajectory_consensus_seed_influence_seeds=trajectory_consensus_seed_influence_seeds,
+            trajectory_consensus_seed_sensitivity_zr_metric=trajectory_consensus_seed_sensitivity_zr_metric,
+            trajectory_consensus_seed_influence_anchor_topk=trajectory_consensus_seed_influence_anchor_topk,
+            trajectory_consensus_seed_influence_arrow_topk=trajectory_consensus_seed_influence_arrow_topk,
+            trajectory_consensus_skip_existing_plots=trajectory_consensus_skip_existing_plots,
+            trajectory_consensus_num_workers=trajectory_consensus_num_workers,
+        )
     do_ablation = bool(trajectory_consensus_do_ablation)
     contribution_method = str(trajectory_consensus_contribution_method).strip().lower()
     if contribution_method not in {"exact_ablation", "taylor_approx"}:
@@ -6034,11 +7249,30 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     ]
     if not reference_distance_metrics:
         reference_distance_metrics = ["center_l2"]
-    scatter_outlier_heads = [
+    legacy_scatter_outlier_heads = [
         str(head_tag).strip()
         for head_tag in trajectory_consensus_scatter_outlier_heads
         if str(head_tag).strip()
     ]
+    scatter_outlier_cross_heads = [
+        str(head_tag).strip()
+        for head_tag in trajectory_consensus_scatter_outlier_cross_heads
+        if str(head_tag).strip()
+    ]
+    scatter_outlier_self_heads = [
+        str(head_tag).strip()
+        for head_tag in trajectory_consensus_scatter_outlier_self_heads
+        if str(head_tag).strip()
+    ]
+    if legacy_scatter_outlier_heads:
+        if not scatter_outlier_cross_heads:
+            scatter_outlier_cross_heads = list(legacy_scatter_outlier_heads)
+        if not scatter_outlier_self_heads:
+            scatter_outlier_self_heads = list(legacy_scatter_outlier_heads)
+    scatter_outlier_heads_by_module = {
+        "cross": list(scatter_outlier_cross_heads),
+        "self": list(scatter_outlier_self_heads),
+    }
     taylor_object_only = bool(trajectory_consensus_taylor_object_only)
     taylor_num_latent_frames = int(trajectory_consensus_taylor_num_latent_frames)
     taylor_metric_scope = str(trajectory_consensus_taylor_metric_scope).strip().lower()
@@ -6146,7 +7380,9 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
         "trajectory_consensus_do_ablation": bool(do_ablation),
         "trajectory_consensus_do_direct_proxy": bool(do_direct_proxy),
         "trajectory_consensus_reference_distance_metrics": list(reference_distance_metrics),
-        "trajectory_consensus_scatter_outlier_heads": list(scatter_outlier_heads),
+        "trajectory_consensus_scatter_outlier_heads": list(legacy_scatter_outlier_heads),
+        "trajectory_consensus_scatter_outlier_cross_heads": list(scatter_outlier_cross_heads),
+        "trajectory_consensus_scatter_outlier_self_heads": list(scatter_outlier_self_heads),
         "trajectory_consensus_head_contribution_output_dirs": dict(head_contribution_output_dirs),
         "object_words_in_maps": list(object_words_in_maps),
         "trajectory_consensus_contribution_method": str(contribution_method),
@@ -6162,6 +7398,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
         "trajectory_consensus_plot_only_from_csv": bool(trajectory_consensus_plot_only_from_csv),
         "trajectory_consensus_skip_existing_plots": bool(trajectory_consensus_skip_existing_plots),
         "trajectory_consensus_num_workers": int(trajectory_consensus_num_workers),
+        "trajectory_consensus_candidate_enable_per_head": bool(trajectory_consensus_candidate_enable_per_head),
     }
 
     candidate_region_rows: List[Dict[str, object]] = []
@@ -6189,6 +7426,32 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
             output_dir,
             "trajectory_consensus_candidate_regions_per_head.csv",
         )
+        reference_object_boxes: Optional[List[Dict[str, float]]] = None
+        reference_head_maps = _mean_wan21_t2v_head_maps_for_words(
+            mean_maps=mean_maps,
+            step=int(trajectory_consensus_object_mask_reference_step),
+            layer=int(trajectory_consensus_object_mask_reference_layer),
+            words=object_words_in_maps,
+        )
+        if reference_head_maps is not None:
+            reference_head_mean_map = reference_head_maps.mean(dim=0)
+            reference_preprocessed_head_mean_map, _ = _preprocess_wan21_t2v_attention_map_fhw(
+                map_fhw=reference_head_mean_map,
+                winsorize_quantile=float(trajectory_consensus_candidate_preprocess_winsorize_quantile),
+                despike_quantile=float(trajectory_consensus_candidate_preprocess_despike_quantile),
+                min_component_area=int(trajectory_consensus_candidate_min_component_area),
+            )
+            reference_object_boxes = _build_wan21_t2v_reference_object_boxes(
+                reference_map_fhw=reference_preprocessed_head_mean_map,
+                center_mode="geometric_center",
+                traj_power=1.5,
+                traj_quantile=0.95,
+                support_radius_mode="adaptive_area",
+                support_radius_fixed=2.0,
+                support_radius_alpha=1.0,
+                support_radius_min=1.0,
+                support_radius_max_ratio=0.25,
+            )
 
         if bool(trajectory_consensus_plot_only_from_csv):
             if not os.path.exists(candidate_regions_pt_path):
@@ -6209,7 +7472,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
             candidate_region_rows = _load_wan21_t2v_csv_rows(candidate_regions_csv_path)
             candidate_weight_rows = _load_wan21_t2v_csv_rows(candidate_weights_csv_path)
             winner_gap_rows = _load_wan21_t2v_csv_rows(winner_gap_csv_path)
-            if os.path.exists(per_head_candidate_regions_pt_path):
+            if bool(trajectory_consensus_candidate_enable_per_head) and os.path.exists(per_head_candidate_regions_pt_path):
                 loaded_per_head_cache = _load_wan21_t2v_torch_cache(per_head_candidate_regions_pt_path)
                 per_head_candidate_region_cache = {
                     (int(step), int(layer), int(head)): {
@@ -6221,7 +7484,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                     }
                     for (step, layer, head), candidate_payload in loaded_per_head_cache.items()
                 }
-            if os.path.exists(per_head_candidate_regions_csv_path):
+            if bool(trajectory_consensus_candidate_enable_per_head) and os.path.exists(per_head_candidate_regions_csv_path):
                 per_head_candidate_region_rows = _load_wan21_t2v_csv_rows(per_head_candidate_regions_csv_path)
         else:
             extraction_tasks = []
@@ -6303,6 +7566,14 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                     candidate_data["label_map_fhw"] = torch.from_numpy(
                         np.asarray(candidate_data.pop("label_map_fhw_np"))
                     ).to(torch.int64)
+                    if reference_object_boxes is not None:
+                        merged_label_map_fhw, merged_frame_metadata = _merge_wan21_t2v_candidate_regions_by_reference_box(
+                            label_map_fhw=candidate_data["label_map_fhw"],
+                            frame_metadata=candidate_data["frame_metadata"],
+                            reference_boxes=reference_object_boxes,
+                        )
+                        candidate_data["label_map_fhw"] = merged_label_map_fhw
+                        candidate_data["frame_metadata"] = merged_frame_metadata
                     candidate_region_cache[(int(step), int(layer))] = candidate_data
                     label_map_fhw = candidate_data["label_map_fhw"]
                     frame_metadata = candidate_data["frame_metadata"]
@@ -6404,154 +7675,161 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
             _save_csv(candidate_weights_csv_path, candidate_weight_rows)
             _save_csv(winner_gap_csv_path, winner_gap_rows)
 
-        per_head_specs_by_layer: Dict[int, List[int]] = defaultdict(list)
-        for layer_index, head_index in selected_cross_head_specs:
-            if int(layer_index) not in selected_layers:
-                continue
-            per_head_specs_by_layer[int(layer_index)].append(int(head_index))
+        if bool(trajectory_consensus_candidate_enable_per_head):
+            per_head_specs_by_layer: Dict[int, List[int]] = defaultdict(list)
+            for layer_index, head_index in selected_cross_head_specs:
+                if int(layer_index) not in selected_layers:
+                    continue
+                per_head_specs_by_layer[int(layer_index)].append(int(head_index))
 
-        per_head_extraction_tasks = []
-        per_head_extraction_result_count = 0
-        for step in selected_steps:
-            for layer_index in selected_layers:
-                selected_head_indices = sorted(
-                    {
-                        int(head_index)
-                        for head_index in per_head_specs_by_layer.get(int(layer_index), [])
-                        if (int(step), int(layer_index), int(head_index)) not in per_head_candidate_region_cache
-                    }
-                )
-                if not selected_head_indices:
-                    continue
-                head_maps = _mean_wan21_t2v_head_maps_for_words(
-                    mean_maps=mean_maps,
-                    step=int(step),
-                    layer=int(layer_index),
-                    words=object_words_in_maps,
-                )
-                if head_maps is None:
-                    continue
-                head_payloads = []
-                for head_index in selected_head_indices:
-                    if int(head_index) >= int(head_maps.shape[0]):
-                        continue
-                    # IMPORTANT:
-                    # Keep the per-head path consistent with head-mean extraction.
-                    # `avg_pool2d` inside `_smooth_wan21_t2v_map_fhw` can hang in
-                    # forked workers in this environment, so optional smoothing must
-                    # happen on the parent process before we dispatch worker tasks.
-                    if int(trajectory_consensus_candidate_smooth_radius) > 0:
-                        worker_map_fhw = _smooth_wan21_t2v_map_fhw(
-                            head_maps[int(head_index)],
-                            smooth_radius=int(trajectory_consensus_candidate_smooth_radius),
-                        )
-                        worker_smooth_radius = 0
-                    else:
-                        worker_map_fhw = head_maps[int(head_index)]
-                        worker_smooth_radius = 0
-                    head_payloads.append((int(head_index), worker_map_fhw))
-                if not head_payloads:
-                    continue
-                per_head_extraction_result_count += int(len(head_payloads))
-                per_head_extraction_tasks.append(
-                    (
-                        int(step),
-                        int(layer_index),
-                        tuple(head_payloads),
-                        float(trajectory_consensus_candidate_base_quantile),
-                        tuple(float(x) for x in trajectory_consensus_candidate_split_quantiles),
-                        int(trajectory_consensus_candidate_min_component_area),
-                        int(worker_smooth_radius),
-                        int(trajectory_consensus_candidate_stable_peak_min_levels),
-                        float(trajectory_consensus_candidate_peak_merge_distance),
-                        float(trajectory_consensus_candidate_preprocess_winsorize_quantile),
-                        float(trajectory_consensus_candidate_preprocess_despike_quantile),
-                        int(trajectory_consensus_candidate_min_component_area),
+            per_head_extraction_tasks = []
+            per_head_extraction_result_count = 0
+            for step in selected_steps:
+                for layer_index in selected_layers:
+                    selected_head_indices = sorted(
+                        {
+                            int(head_index)
+                            for head_index in per_head_specs_by_layer.get(int(layer_index), [])
+                            if (int(step), int(layer_index), int(head_index)) not in per_head_candidate_region_cache
+                        }
                     )
-                )
+                    if not selected_head_indices:
+                        continue
+                    head_maps = _mean_wan21_t2v_head_maps_for_words(
+                        mean_maps=mean_maps,
+                        step=int(step),
+                        layer=int(layer_index),
+                        words=object_words_in_maps,
+                    )
+                    if head_maps is None:
+                        continue
+                    head_payloads = []
+                    for head_index in selected_head_indices:
+                        if int(head_index) >= int(head_maps.shape[0]):
+                            continue
+                        # IMPORTANT:
+                        # Keep the per-head path consistent with head-mean extraction.
+                        # `avg_pool2d` inside `_smooth_wan21_t2v_map_fhw` can hang in
+                        # forked workers in this environment, so optional smoothing must
+                        # happen on the parent process before we dispatch worker tasks.
+                        if int(trajectory_consensus_candidate_smooth_radius) > 0:
+                            worker_map_fhw = _smooth_wan21_t2v_map_fhw(
+                                head_maps[int(head_index)],
+                                smooth_radius=int(trajectory_consensus_candidate_smooth_radius),
+                            )
+                            worker_smooth_radius = 0
+                        else:
+                            worker_map_fhw = head_maps[int(head_index)]
+                            worker_smooth_radius = 0
+                        head_payloads.append((int(head_index), worker_map_fhw))
+                    if not head_payloads:
+                        continue
+                    per_head_extraction_result_count += int(len(head_payloads))
+                    per_head_extraction_tasks.append(
+                        (
+                            int(step),
+                            int(layer_index),
+                            tuple(head_payloads),
+                            float(trajectory_consensus_candidate_base_quantile),
+                            tuple(float(x) for x in trajectory_consensus_candidate_split_quantiles),
+                            int(trajectory_consensus_candidate_min_component_area),
+                            int(worker_smooth_radius),
+                            int(trajectory_consensus_candidate_stable_peak_min_levels),
+                            float(trajectory_consensus_candidate_peak_merge_distance),
+                            float(trajectory_consensus_candidate_preprocess_winsorize_quantile),
+                            float(trajectory_consensus_candidate_preprocess_despike_quantile),
+                            int(trajectory_consensus_candidate_min_component_area),
+                        )
+                    )
 
-        per_head_extraction_progress_bar = None
-        if per_head_extraction_tasks:
+            per_head_extraction_progress_bar = None
+            if per_head_extraction_tasks:
+                try:
+                    from tqdm import tqdm
+                    per_head_extraction_progress_bar = tqdm(
+                        total=int(per_head_extraction_result_count),
+                        desc="trajectory consensus per-head candidate extraction",
+                        unit="head",
+                        leave=True,
+                    )
+                except Exception:
+                    per_head_extraction_progress_bar = None
             try:
-                from tqdm import tqdm
-                per_head_extraction_progress_bar = tqdm(
-                    total=int(per_head_extraction_result_count),
-                    desc="trajectory consensus per-head candidate extraction",
-                    unit="head",
-                    leave=True,
+                effective_num_workers = _resolve_wan21_t2v_num_workers(
+                    requested_num_workers=int(trajectory_consensus_num_workers),
+                    task_count=int(len(per_head_extraction_tasks)),
                 )
-            except Exception:
-                per_head_extraction_progress_bar = None
-        try:
-            effective_num_workers = _resolve_wan21_t2v_num_workers(
-                requested_num_workers=int(trajectory_consensus_num_workers),
-                task_count=int(len(per_head_extraction_tasks)),
-            )
-            for step, layer, head_results in _iter_wan21_t2v_parallel_results(
-                tasks=per_head_extraction_tasks,
-                worker_fn=_trajectory_consensus_extract_layer_head_candidates_task,
-                num_workers=int(effective_num_workers),
-            ):
-                for head, candidate_data in head_results:
-                    candidate_data = dict(candidate_data)
-                    label_map_fhw = torch.from_numpy(
-                        np.asarray(candidate_data.pop("label_map_fhw_np"))
-                    ).to(torch.int64)
-                    per_head_candidate_region_cache[(int(step), int(layer), int(head))] = {
-                        "label_map_fhw": label_map_fhw,
-                    }
-                    frame_metadata = candidate_data["frame_metadata"]
-                    for frame_index, frame_candidates in enumerate(frame_metadata):
-                        for candidate_row in frame_candidates:
-                            per_head_candidate_region_rows.append({
-                                "step": int(step),
-                                "layer": int(layer),
-                                "head": int(head),
-                                "head_tag": f"L{int(layer)}H{int(head)}",
-                                "frame": int(frame_index),
-                                "candidate_index": int(candidate_row["candidate_index"]),
-                                "area": int(candidate_row["area"]),
-                                "mass": float(candidate_row.get("mass", float("nan"))),
-                                "density": float(candidate_row.get("density", float("nan"))),
-                                "bbox_height": float(candidate_row.get("bbox_height", float("nan"))),
-                                "bbox_width": float(candidate_row.get("bbox_width", float("nan"))),
-                                "peak_y": float(candidate_row["peak_y"]),
-                                "peak_x": float(candidate_row["peak_x"]),
-                                "centroid_y": float(candidate_row["centroid_y"]),
-                                "centroid_x": float(candidate_row["centroid_x"]),
-                                "seed_y": float(candidate_row.get("seed_y", float("nan"))),
-                                "seed_x": float(candidate_row.get("seed_x", float("nan"))),
-                                "seed_score": float(candidate_row.get("seed_score", float("nan"))),
-                                "support_count": int(candidate_row.get("support_count", 0)),
-                                "support_level": float(candidate_row.get("support_level", float("nan"))),
-                                "candidate_count_in_frame": int(len(frame_candidates)),
-                            })
-                    if per_head_extraction_progress_bar is not None:
-                        per_head_extraction_progress_bar.update(1)
-        finally:
-            if per_head_extraction_progress_bar is not None:
-                per_head_extraction_progress_bar.close()
+                for step, layer, head_results in _iter_wan21_t2v_parallel_results(
+                    tasks=per_head_extraction_tasks,
+                    worker_fn=_trajectory_consensus_extract_layer_head_candidates_task,
+                    num_workers=int(effective_num_workers),
+                ):
+                    for head, candidate_data in head_results:
+                        candidate_data = dict(candidate_data)
+                        label_map_fhw = torch.from_numpy(
+                            np.asarray(candidate_data.pop("label_map_fhw_np"))
+                        ).to(torch.int64)
+                        frame_metadata = candidate_data["frame_metadata"]
+                        if reference_object_boxes is not None:
+                            label_map_fhw, frame_metadata = _merge_wan21_t2v_candidate_regions_by_reference_box(
+                                label_map_fhw=label_map_fhw,
+                                frame_metadata=frame_metadata,
+                                reference_boxes=reference_object_boxes,
+                            )
+                        per_head_candidate_region_cache[(int(step), int(layer), int(head))] = {
+                            "label_map_fhw": label_map_fhw,
+                        }
+                        for frame_index, frame_candidates in enumerate(frame_metadata):
+                            for candidate_row in frame_candidates:
+                                per_head_candidate_region_rows.append({
+                                    "step": int(step),
+                                    "layer": int(layer),
+                                    "head": int(head),
+                                    "head_tag": f"L{int(layer)}H{int(head)}",
+                                    "frame": int(frame_index),
+                                    "candidate_index": int(candidate_row["candidate_index"]),
+                                    "area": int(candidate_row["area"]),
+                                    "mass": float(candidate_row.get("mass", float("nan"))),
+                                    "density": float(candidate_row.get("density", float("nan"))),
+                                    "bbox_height": float(candidate_row.get("bbox_height", float("nan"))),
+                                    "bbox_width": float(candidate_row.get("bbox_width", float("nan"))),
+                                    "peak_y": float(candidate_row["peak_y"]),
+                                    "peak_x": float(candidate_row["peak_x"]),
+                                    "centroid_y": float(candidate_row["centroid_y"]),
+                                    "centroid_x": float(candidate_row["centroid_x"]),
+                                    "seed_y": float(candidate_row.get("seed_y", float("nan"))),
+                                    "seed_x": float(candidate_row.get("seed_x", float("nan"))),
+                                    "seed_score": float(candidate_row.get("seed_score", float("nan"))),
+                                    "support_count": int(candidate_row.get("support_count", 0)),
+                                    "support_level": float(candidate_row.get("support_level", float("nan"))),
+                                    "candidate_count_in_frame": int(len(frame_candidates)),
+                                })
+                        if per_head_extraction_progress_bar is not None:
+                            per_head_extraction_progress_bar.update(1)
+            finally:
+                if per_head_extraction_progress_bar is not None:
+                    per_head_extraction_progress_bar.close()
 
-        if per_head_candidate_region_rows:
-            per_head_candidate_region_rows = sorted(
-                per_head_candidate_region_rows,
-                key=lambda row: (
-                    int(row["step"]),
-                    int(row["layer"]),
-                    int(row["head"]),
-                    int(row["frame"]),
-                    int(row["candidate_index"]),
-                ),
-            )
-            _save_csv(per_head_candidate_regions_csv_path, per_head_candidate_region_rows)
-        if per_head_candidate_region_cache:
-            per_head_candidate_region_cache_to_save = {
-                (int(step), int(layer), int(head)): {
-                    "label_map_fhw": candidate_data["label_map_fhw"].detach().cpu().to(torch.int16),
+            if per_head_candidate_region_rows:
+                per_head_candidate_region_rows = sorted(
+                    per_head_candidate_region_rows,
+                    key=lambda row: (
+                        int(row["step"]),
+                        int(row["layer"]),
+                        int(row["head"]),
+                        int(row["frame"]),
+                        int(row["candidate_index"]),
+                    ),
+                )
+                _save_csv(per_head_candidate_regions_csv_path, per_head_candidate_region_rows)
+            if per_head_candidate_region_cache:
+                per_head_candidate_region_cache_to_save = {
+                    (int(step), int(layer), int(head)): {
+                        "label_map_fhw": candidate_data["label_map_fhw"].detach().cpu().to(torch.int16),
+                    }
+                    for (step, layer, head), candidate_data in per_head_candidate_region_cache.items()
                 }
-                for (step, layer, head), candidate_data in per_head_candidate_region_cache.items()
-            }
-            torch.save(per_head_candidate_region_cache_to_save, per_head_candidate_regions_pt_path)
+                torch.save(per_head_candidate_region_cache_to_save, per_head_candidate_regions_pt_path)
 
         plot_paths.extend(
             _render_wan21_t2v_candidate_consensus_plots(
@@ -6576,8 +7854,9 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                     words=object_words_in_maps,
                 )
                 if headmean_map is not None:
-                    frame_indices = _resolve_wan21_t2v_candidate_viz_frame_indices(
-                        frame_count=int(headmean_map.shape[0]),
+                    attention_frame_indices, video_frame_labels = _resolve_wan21_t2v_trajectory_consensus_viz_frames(
+                        attention_frame_count=int(headmean_map.shape[0]),
+                        video_frame_count=int(frame_num),
                         num_frames=int(trajectory_consensus_candidate_viz_num_frames),
                     )
                     save_file = os.path.join(
@@ -6616,7 +7895,8 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                 label_map_np,
                                 save_file,
                                 f"Candidate regions | step={int(step)} layer={int(layer_index)} head=mean",
-                                frame_indices,
+                                tuple(int(frame_index) for frame_index in attention_frame_indices),
+                                tuple(int(frame_label) for frame_label in video_frame_labels),
                                 False,
                                 "magma",
                             )
@@ -6631,13 +7911,14 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                     f"Candidate regions with contours | step={int(step)} "
                                     f"layer={int(layer_index)} head=mean"
                                 ),
-                                frame_indices,
+                                tuple(int(frame_index) for frame_index in attention_frame_indices),
+                                tuple(int(frame_label) for frame_label in video_frame_labels),
                                 True,
                                 "magma",
                             )
                         )
 
-            if selected_cross_head_specs:
+            if bool(trajectory_consensus_candidate_enable_per_head) and selected_cross_head_specs:
                 for layer_index, head_index in selected_cross_head_specs:
                     if int(layer_index) not in selected_layers:
                         continue
@@ -6649,8 +7930,9 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                     )
                     if head_maps is None or int(head_index) >= int(head_maps.shape[0]):
                         continue
-                    frame_indices = _resolve_wan21_t2v_candidate_viz_frame_indices(
-                        frame_count=int(head_maps.shape[1]),
+                    attention_frame_indices, video_frame_labels = _resolve_wan21_t2v_trajectory_consensus_viz_frames(
+                        attention_frame_count=int(head_maps.shape[1]),
+                        video_frame_count=int(frame_num),
                         num_frames=int(trajectory_consensus_candidate_viz_num_frames),
                     )
                     save_file = os.path.join(
@@ -6698,7 +7980,8 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                     f"Candidate regions | step={int(step)} "
                                     f"layer={int(layer_index)} head={int(head_index)}"
                                 ),
-                                frame_indices,
+                                tuple(int(frame_index) for frame_index in attention_frame_indices),
+                                tuple(int(frame_label) for frame_label in video_frame_labels),
                                 False,
                                 "magma",
                             )
@@ -6713,7 +7996,8 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                     f"Candidate regions with contours | step={int(step)} "
                                     f"layer={int(layer_index)} head={int(head_index)}"
                                 ),
-                                frame_indices,
+                                tuple(int(frame_index) for frame_index in attention_frame_indices),
+                                tuple(int(frame_label) for frame_label in video_frame_labels),
                                 True,
                                 "magma",
                             )
@@ -6748,35 +8032,36 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
             if viz_progress_bar is not None:
                 viz_progress_bar.close()
 
-        head_viz_progress_bar = None
-        if head_specific_candidate_viz_tasks:
+        if bool(trajectory_consensus_candidate_enable_per_head):
+            head_viz_progress_bar = None
+            if head_specific_candidate_viz_tasks:
+                try:
+                    from tqdm import tqdm
+                    head_viz_progress_bar = tqdm(
+                        total=int(len(head_specific_candidate_viz_tasks)),
+                        desc="trajectory consensus per-head candidate viz",
+                        unit="plot",
+                        leave=True,
+                    )
+                except Exception:
+                    head_viz_progress_bar = None
             try:
-                from tqdm import tqdm
-                head_viz_progress_bar = tqdm(
-                    total=int(len(head_specific_candidate_viz_tasks)),
-                    desc="trajectory consensus per-head candidate viz",
-                    unit="plot",
-                    leave=True,
+                effective_num_workers = _resolve_wan21_t2v_num_workers(
+                    requested_num_workers=int(trajectory_consensus_num_workers),
+                    task_count=int(len(head_specific_candidate_viz_tasks)),
                 )
-            except Exception:
-                head_viz_progress_bar = None
-        try:
-            effective_num_workers = _resolve_wan21_t2v_num_workers(
-                requested_num_workers=int(trajectory_consensus_num_workers),
-                task_count=int(len(head_specific_candidate_viz_tasks)),
-            )
-            for plot_path in _iter_wan21_t2v_parallel_results(
-                tasks=head_specific_candidate_viz_tasks,
-                worker_fn=_trajectory_consensus_render_head_specific_candidate_viz_task,
-                num_workers=int(effective_num_workers),
-            ):
-                if plot_path:
-                    plot_paths.append(plot_path)
+                for plot_path in _iter_wan21_t2v_parallel_results(
+                    tasks=head_specific_candidate_viz_tasks,
+                    worker_fn=_trajectory_consensus_render_head_specific_candidate_viz_task,
+                    num_workers=int(effective_num_workers),
+                ):
+                    if plot_path:
+                        plot_paths.append(plot_path)
+                    if head_viz_progress_bar is not None:
+                        head_viz_progress_bar.update(1)
+            finally:
                 if head_viz_progress_bar is not None:
-                    head_viz_progress_bar.update(1)
-        finally:
-            if head_viz_progress_bar is not None:
-                head_viz_progress_bar.close()
+                    head_viz_progress_bar.close()
 
     head_contribution_rows_by_method: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     scatter_rows_by_method: Dict[str, List[Dict[str, object]]] = defaultdict(list)
@@ -6824,6 +8109,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
             plot_paths.extend(
                 _render_wan21_t2v_self_attention_coupling_plots(
                     output_dir=output_dir,
+                    frame_num=int(frame_num),
                     pairwise_rows=self_attention_coupling_pairwise_rows,
                     candidate_feature_rows=self_attention_coupling_candidate_feature_rows,
                     feature_summary_rows=self_attention_coupling_feature_summary_rows,
@@ -7018,6 +8304,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
             plot_paths.extend(
                 _render_wan21_t2v_self_attention_coupling_plots(
                     output_dir=output_dir,
+                    frame_num=int(frame_num),
                     pairwise_rows=self_attention_coupling_pairwise_rows,
                     candidate_feature_rows=self_attention_coupling_candidate_feature_rows,
                     feature_summary_rows=self_attention_coupling_feature_summary_rows,
@@ -7098,7 +8385,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                         method_output_dir,
                         head_contribution_rows_by_method[str(analysis_method)],
                         scatter_rows_by_method[str(analysis_method)],
-                        scatter_outlier_heads=scatter_outlier_heads,
+                        scatter_outlier_heads_by_module=scatter_outlier_heads_by_module,
                         skip_existing_plots=bool(trajectory_consensus_skip_existing_plots),
                     )
                 )
@@ -7229,8 +8516,6 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                 for step in selected_steps:
                     step_latent_state = None
                     branch_context = None
-                    taylor_metrics_by_layer_module: Dict[Tuple[int, str], Dict[str, torch.Tensor]] = {}
-                    all_proxy_metrics: Dict[Tuple[int, str], Dict[str, torch.Tensor]] = {}
                     if int(step) in step_latent_cache:
                         step_latent_state = step_latent_cache[int(step)]
                         branch_context = (
@@ -7239,8 +8524,23 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                             else step_latent_state["context_null"]
                         )
 
-                    if do_ablation and contribution_method == "taylor_approx":
-                        if selected_targets:
+                    for module_name in selected_modules:
+                        specs_in_scope = module_to_specs.get(module_name, [])
+                        if not specs_in_scope:
+                            continue
+                        module_selected_targets = {
+                            int(layer): (str(module_name),)
+                            for layer in sorted(set(int(layer) for layer, _ in specs_in_scope))
+                        }
+                        taylor_metrics_by_layer_module: Dict[Tuple[int, str], Dict[str, torch.Tensor]] = {}
+                        all_proxy_metrics: Dict[Tuple[int, str], Dict[str, torch.Tensor]] = {}
+                        if (
+                            do_ablation
+                            and contribution_method == "taylor_approx"
+                            and module_selected_targets
+                        ):
+                            if step_latent_state is None or branch_context is None:
+                                raise RuntimeError(f"Missing cached step latent for Taylor attribution at step={step}.")
                             global_attribution_state = _run_wan21_t2v_global_attribution_clean_forward(
                                 pipeline=pipeline,
                                 latent_input=step_latent_state["latent_input"],
@@ -7249,14 +8549,16 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                 context=branch_context,
                                 branch=str(contribution_branch),
                                 target_step=1,
-                                selected_targets=selected_targets,
+                                selected_targets=module_selected_targets,
                                 attribution_position=str(ablate_position),
                                 token_indices=taylor_token_indices if taylor_object_only else None,
                                 use_gradient_checkpointing=bool(taylor_use_gradient_checkpointing),
                                 offload_model=offload_model,
                             )
                             if global_attribution_state.captured_clean_vpred is None:
-                                raise RuntimeError(f"Failed to capture global attribution clean v_pred for step={step}.")
+                                raise RuntimeError(
+                                    f"Failed to capture global attribution clean v_pred for step={step}, module={module_name}."
+                                )
                             clean_vpred_device = global_attribution_state.captured_clean_vpred
                             metric_mask_vpred = object_mask_vpred if str(taylor_metric_scope) == "obj" else None
                             target_model.zero_grad(set_to_none=True)
@@ -7273,47 +8575,54 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                 grad_obj = global_attribution_state.captured_head_writes_grad_obj.get(key, None)
                                 if grad_obj is None:
                                     raise RuntimeError(
-                                        f"Missing global object attribution gradient for step={step}, layer={key[0]}, module={key[1]}."
+                                        "Missing global attribution gradient for "
+                                        f"step={step}, layer={key[0]}, module={key[1]}."
                                     )
                                 taylor_metrics_by_layer_module[key] = _compute_wan21_t2v_taylor_contribution_metrics(
                                     head_writes=head_writes,
                                     head_writes_grad=grad_obj,
                                 )
+                            global_attribution_state.captured_clean_vpred = None
+                            global_attribution_state.captured_head_writes.clear()
+                            global_attribution_state.captured_head_writes_grad_obj.clear()
+                            del scalar_metric
+                            del clean_vpred_device
+                            del global_attribution_state
+                            target_model.zero_grad(set_to_none=True)
+                            gc.collect()
                             if offload_model:
                                 pipeline.model.cpu()
                                 torch.cuda.empty_cache()
-
-                    if do_direct_proxy and selected_targets:
-                        global_proxy_state = _run_wan21_t2v_global_direct_proxy_clean_forward(
-                            pipeline=pipeline,
-                            latent_input=step_latent_state["latent_input"],
-                            timestep_value=step_latent_state["timestep"],
-                            seq_len=int(step_latent_state["seq_len"]),
-                            context=branch_context,
-                            branch=str(contribution_branch),
-                            target_step=1,
-                            selected_targets=selected_targets,
-                            offload_model=offload_model,
-                        )
-                        if (
-                            global_proxy_state.captured_clean_vpred is None
-                            or global_proxy_state.captured_head_e is None
-                            or global_proxy_state.captured_grid_sizes is None
-                        ):
-                            raise RuntimeError(f"Failed to capture global direct proxy state for step={step}.")
-                        all_proxy_metrics = _compute_wan21_t2v_global_direct_proxy_metrics(
-                            pipeline=pipeline,
-                            clean_vpred=global_proxy_state.captured_clean_vpred,
-                            post_o_head_writes=global_proxy_state.captured_post_o_head_writes,
-                            head_e=global_proxy_state.captured_head_e,
-                            grid_sizes=global_proxy_state.captured_grid_sizes,
-                            object_mask_fhw=object_mask_vpred,
-                        )
-
-                    for module_name in selected_modules:
-                        specs_in_scope = module_to_specs.get(module_name, [])
-                        if not specs_in_scope:
-                            continue
+                        if do_direct_proxy and module_selected_targets:
+                            if step_latent_state is None or branch_context is None:
+                                raise RuntimeError(f"Missing cached step latent for direct proxy at step={step}.")
+                            global_proxy_state = _run_wan21_t2v_global_direct_proxy_clean_forward(
+                                pipeline=pipeline,
+                                latent_input=step_latent_state["latent_input"],
+                                timestep_value=step_latent_state["timestep"],
+                                seq_len=int(step_latent_state["seq_len"]),
+                                context=branch_context,
+                                branch=str(contribution_branch),
+                                target_step=1,
+                                selected_targets=module_selected_targets,
+                                offload_model=offload_model,
+                            )
+                            if (
+                                global_proxy_state.captured_clean_vpred is None
+                                or global_proxy_state.captured_head_e is None
+                                or global_proxy_state.captured_grid_sizes is None
+                            ):
+                                raise RuntimeError(
+                                    f"Failed to capture global direct proxy state for step={step}, module={module_name}."
+                                )
+                            all_proxy_metrics = _compute_wan21_t2v_global_direct_proxy_metrics(
+                                pipeline=pipeline,
+                                clean_vpred=global_proxy_state.captured_clean_vpred,
+                                post_o_head_writes=global_proxy_state.captured_post_o_head_writes,
+                                head_e=global_proxy_state.captured_head_e,
+                                grid_sizes=global_proxy_state.captured_grid_sizes,
+                                object_mask_fhw=object_mask_vpred,
+                            )
                         layers_in_scope = sorted(set(int(layer) for layer, _ in specs_in_scope))
                         for layer in layers_in_scope:
                             layer_head_specs = [(int(l), int(h)) for l, h in specs_in_scope if int(l) == int(layer)]
@@ -7394,7 +8703,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                         "proj_share_obj": "",
                                     }
                                     _apply_wan21_t2v_abs_to_ablation_contribution_row(row)
-                                    if alignment_key in early_alignment_summary and str(module_name) == "cross":
+                                    if str(module_name) == "cross":
                                         for alignment_metric_name, early_alignment_summary in early_alignment_summaries.items():
                                             if alignment_key not in early_alignment_summary:
                                                 continue
@@ -7448,7 +8757,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                         "proj_share_obj": "",
                                     }
                                     _apply_wan21_t2v_abs_to_ablation_contribution_row(row)
-                                    if alignment_key in early_alignment_summary and str(module_name) == "cross":
+                                    if str(module_name) == "cross":
                                         for alignment_metric_name, early_alignment_summary in early_alignment_summaries.items():
                                             if alignment_key not in early_alignment_summary:
                                                 continue
@@ -7499,7 +8808,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                         "proj_share_full": "",
                                         "proj_share_obj": "",
                                     }
-                                    if alignment_key in early_alignment_summary and str(module_name) == "cross":
+                                    if str(module_name) == "cross":
                                         for alignment_metric_name, early_alignment_summary in early_alignment_summaries.items():
                                             if alignment_key not in early_alignment_summary:
                                                 continue
@@ -7554,7 +8863,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                     method_output_dir,
                     method_rows,
                     scatter_rows_by_method.get(str(analysis_method), []),
-                    scatter_outlier_heads=scatter_outlier_heads,
+                    scatter_outlier_heads_by_module=scatter_outlier_heads_by_module,
                     skip_existing_plots=bool(trajectory_consensus_skip_existing_plots),
                 )
             )
