@@ -5,10 +5,11 @@
 `rope_modification` studies how to modify Wan2.1 T2V self-attention RoPE without editing the official model source code.
 All changes are applied through runtime monkey patching.
 
-The experiment currently contains two schemes:
+The experiment currently contains three RoPE-side schemes:
 
 1. `manual`: a training-free scheme with manually chosen axis-wise scales.
-2. `timestep_conditioned`: a training-oriented scale-learning scheme with `global` and `head_aware` modes.
+2. `spatial_temporal_reweight`: a training-free scheme that reweights temporal and spatial channel groups after RoPE and before attention.
+3. `timestep_conditioned`: a training-oriented scale-learning scheme with `global` and `head_aware` modes.
 
 Both schemes preserve one joint attention softmax over the full token sequence.
 This experiment does **not** split attention into separate spatial and temporal softmax branches.
@@ -190,7 +191,219 @@ This means that outside the selected steps, the model falls back to the original
 
 In the current implementation, the step index is tracked from the model forward pass, and the step window is applied inside the monkey-patched RoPE function.
 
-## 6. Scheme 2: Timestep-Conditioned Scale Learning
+## 6. Scheme 1B: `spatial_temporal_reweight`
+
+### 6.1 Motivation
+
+The manual \(\lambda\)-scaling scheme changes the RoPE phase itself.
+That is useful when we want to alter how fast positional phase grows along each axis.
+
+However, there is an even lighter intervention that does not touch the phase at all.
+Instead, it changes the relative contribution of temporal channels and spatial channels **after** RoPE has already been applied.
+
+This is useful when the hypothesis is:
+
+- the original 3D RoPE geometry is still basically correct,
+- but the final dot product may over-emphasize spatial alignment relative to temporal alignment,
+- so we want to rebalance temporal and spatial evidence with minimal extra computation.
+
+This leads to the `spatial_temporal_reweight` scheme.
+
+### 6.2 Channel partition
+
+For one head, after RoPE, write the query and key as
+
+\[
+\widetilde q_i
+=
+\big[
+\widetilde q_i^{f},
+\widetilde q_i^{h},
+\widetilde q_i^{w}
+\big]
+\in
+\mathbb{R}^{d},
+\qquad
+\widetilde k_j
+=
+\big[
+\widetilde k_j^{f},
+\widetilde k_j^{h},
+\widetilde k_j^{w}
+\big]
+\in
+\mathbb{R}^{d},
+\]
+
+where:
+
+- \(\widetilde q_i^{f}, \widetilde k_j^{f} \in \mathbb{R}^{d_f}\) are the frame-axis channels,
+- \(\widetilde q_i^{h}, \widetilde k_j^{h} \in \mathbb{R}^{d_h}\) are the height-axis channels,
+- \(\widetilde q_i^{w}, \widetilde k_j^{w} \in \mathbb{R}^{d_w}\) are the width-axis channels,
+- \(d_f + d_h + d_w = d\).
+
+Define the combined spatial block
+
+\[
+\widetilde q_i^{s}
+=
+\big[
+\widetilde q_i^{h},
+\widetilde q_i^{w}
+\big]
+\in
+\mathbb{R}^{d_s},
+\qquad
+\widetilde k_j^{s}
+=
+\big[
+\widetilde k_j^{h},
+\widetilde k_j^{w}
+\big]
+\in
+\mathbb{R}^{d_s},
+\]
+
+where \(d_s = d_h + d_w\).
+
+For Wan2.1 `t2v-1.3B`, one head uses
+
+\[
+d_f = 44,\qquad d_h = 42,\qquad d_w = 42,\qquad d_s = 84.
+\]
+
+The partition is still the original consecutive axis split from the official model.
+No interleaving is introduced.
+
+### 6.3 Reweight definition
+
+Let
+
+\[
+\alpha \in [0, 1]
+\]
+
+be the temporal reweight parameter.
+
+Define the reweighted query and key by
+
+\[
+\widehat q_i
+=
+\big[
+\sqrt{\alpha}\,\widetilde q_i^{f},
+\sqrt{1-\alpha}\,\widetilde q_i^{h},
+\sqrt{1-\alpha}\,\widetilde q_i^{w}
+\big],
+\]
+
+\[
+\widehat k_j
+=
+\big[
+\sqrt{\alpha}\,\widetilde k_j^{f},
+\sqrt{1-\alpha}\,\widetilde k_j^{h},
+\sqrt{1-\alpha}\,\widetilde k_j^{w}
+\big].
+\]
+
+Equivalently, in spatial-vs-temporal notation,
+
+\[
+\widehat q_i
+=
+\big[
+\sqrt{\alpha}\,\widetilde q_i^{f},
+\sqrt{1-\alpha}\,\widetilde q_i^{s}
+\big],
+\qquad
+\widehat k_j
+=
+\big[
+\sqrt{\alpha}\,\widetilde k_j^{f},
+\sqrt{1-\alpha}\,\widetilde k_j^{s}
+\big].
+\]
+
+### 6.4 Resulting attention logit
+
+The modified attention logit is
+
+\[
+\widehat s_{ij}
+=
+\frac{
+\langle \widehat q_i, \widehat k_j \rangle
+}{
+\sqrt d
+}.
+\]
+
+By direct expansion,
+
+\[
+\widehat s_{ij}
+=
+\frac{
+\alpha \langle \widetilde q_i^{f}, \widetilde k_j^{f} \rangle
++
+(1-\alpha)\langle \widetilde q_i^{h}, \widetilde k_j^{h} \rangle
++
+(1-\alpha)\langle \widetilde q_i^{w}, \widetilde k_j^{w} \rangle
+}{
+\sqrt d
+}.
+\]
+
+If we use the combined spatial block, the same formula can be written as
+
+\[
+\widehat s_{ij}
+=
+\frac{
+\alpha \langle \widetilde q_i^{f}, \widetilde k_j^{f} \rangle
++
+(1-\alpha)\langle \widetilde q_i^{s}, \widetilde k_j^{s} \rangle
+}{
+\sqrt d
+}.
+\]
+
+So this scheme does **not** change the RoPE phase.
+It changes only the relative energy of temporal and spatial channel groups inside the final dot product.
+
+### 6.5 Difference from axis-wise \(\lambda\) scaling
+
+The difference between Scheme 1 and `spatial_temporal_reweight` is fundamental:
+
+- Scheme 1 changes the phase growth rate before the query-key dot product is computed,
+- `spatial_temporal_reweight` keeps the original phase and changes only the channel-group weighting after RoPE.
+
+So Scheme 1 modifies the positional geometry, while Scheme 1B modifies the final temporal-vs-spatial balance given that geometry.
+
+### 6.6 Complexity and engineering advantage
+
+This scheme is computationally cheap.
+It does not create a second attention branch and it does not create a second softmax.
+
+The implementation cost is only:
+
+- split the last channel dimension into \((f, h, w)\),
+- multiply the frame block by \(\sqrt{\alpha}\),
+- multiply the height and width blocks by \(\sqrt{1-\alpha}\),
+- concatenate the blocks back.
+
+So the asymptotic attention complexity is unchanged.
+Compared with semantic residual attention, this scheme adds almost no extra cost.
+
+### 6.7 Step control
+
+The same diffusion-step window from Section 5 is used here.
+If the current diffusion step is outside the selected step set, the reweight is not applied and the model falls back to the original RoPE-based attention.
+
+This is especially useful when we only want to bias the early motion-planning steps.
+
+## 7. Scheme 2: Timestep-Conditioned Scale Learning
 
 Scheme 2 is the unified training-oriented formulation of axis-wise RoPE scaling.
 
@@ -208,7 +421,7 @@ Instead, the model is allowed to learn:
 
 Under this view, the old manual scheme becomes a special case in which the base scale is fixed and the timestep-dependent correction is removed.
 
-### 6.1 Learnable base scale
+### 7.1 Learnable base scale
 
 Define the log-scale base parameter
 
@@ -250,7 +463,7 @@ If one wants to recover the manual scheme, one can simply freeze \(\mu\) at
 So Scheme 1 is not a different family.
 It is the fixed-base special case of Scheme 2.
 
-### 6.2 Timestep embedding
+### 7.2 Timestep embedding
 
 Let
 
@@ -262,7 +475,7 @@ be the timestep embedding for diffusion step \(t\), where \(d_e\) is the timeste
 
 In the implementation, \(e_t\) is produced by the same sinusoidal timestep embedding used by Wan2.1.
 
-### 6.3 Global timestep-conditioned mode
+### 7.3 Global timestep-conditioned mode
 
 In the simplest learned variant, the model predicts one axis-wise correction vector for each timestep:
 
@@ -301,7 +514,7 @@ Then:
 Conceptually, if diffusion had only a finite set of timesteps and we tabulated these values directly, this mode would correspond to one learned \(3\)-vector per timestep.
 So its role is exactly the global step-wise scale controller.
 
-### 6.4 Effective scale under step gating
+### 7.4 Effective scale under step gating
 
 If a diffusion-step window \(S\) is also specified, then the actually used scale is
 
@@ -317,7 +530,7 @@ If a diffusion-step window \(S\) is also specified, then the actually used scale
 
 So outside the selected steps, the model falls back to the original Wan2.1 RoPE.
 
-### 6.5 Why this formulation is preferable
+### 7.5 Why this formulation is preferable
 
 This unified view is preferable to "manual \(\lambda\) times learned multiplier" as a primary formulation.
 
@@ -331,7 +544,7 @@ So the cleanest training-oriented parameterization is:
 - manual mode: fix \(\mu\) and remove \(g(e_t)\),
 - learned global mode: learn both \(\mu\) and \(g(e_t)\).
 
-## 7. Why We Do Not Split the Softmax
+## 8. Why We Do Not Split the Softmax
 
 The experiment deliberately keeps one joint attention softmax.
 We do **not** compute one spatial softmax and one temporal softmax inside the same head.
@@ -344,9 +557,9 @@ For example:
 
 So the current experiment changes the RoPE phase but preserves the original joint attention probability.
 
-## 8. Scheme 2B: Head-Aware Timestep-Conditioned Scaling
+## 9. Scheme 2B: Head-Aware Timestep-Conditioned Scaling
 
-The global timestep-conditioned mode in Section 6 uses one scale vector for all heads.
+The global timestep-conditioned mode in Section 7 uses one scale vector for all heads.
 That is the cleanest starting point, but it may still be too restrictive.
 
 The natural refinement is not a completely different scheme.
@@ -357,7 +570,7 @@ It is simply a different mode of the same timestep-conditioned family:
 
 This is why the head-aware design should be treated as a mode choice inside Scheme 2 rather than as a separate family.
 
-### 8.1 Head-aware correction tensor
+### 9.1 Head-aware correction tensor
 
 For self-attention layer \(\ell\), head \(m\), and diffusion step \(t\), define
 
@@ -381,7 +594,7 @@ So the correction now depends on:
 
 Conceptually, if these values were tabulated directly for discrete timesteps, this mode would correspond to a head-resolved family of timestep-specific scale factors rather than a single shared \(3\)-vector.
 
-### 8.2 Effective head-aware scale
+### 9.2 Effective head-aware scale
 
 The head-aware scale vector is
 
@@ -414,9 +627,9 @@ Then:
 These three scales are inserted into the same RoPE phase definition from Section 4.
 The attention operator itself is unchanged.
 
-### 8.3 Relationship to the global mode
+### 9.3 Relationship to the global mode
 
-The global timestep-conditioned mode from Section 6 is a special case of the head-aware mode.
+The global timestep-conditioned mode from Section 7 is a special case of the head-aware mode.
 
 If all heads share the same correction,
 
@@ -435,7 +648,7 @@ for all heads.
 So the difference between the two modes is not conceptual.
 It is only the resolution at which the timestep-conditioned correction is applied.
 
-### 8.4 Why this unification is cleaner
+### 9.4 Why this unification is cleaner
 
 This unification avoids the previous duplication in which:
 
@@ -454,7 +667,7 @@ That resolution can be:
 - global across all heads,
 - or head-aware.
 
-### 8.5 Engineering interpretation
+### 9.5 Engineering interpretation
 
 Under this unified view, the mode switch should control which tensor shape is predicted by the timestep-conditioned module:
 
@@ -464,7 +677,7 @@ Under this unified view, the mode switch should control which tensor shape is pr
 So the two modes differ only in output shape and parameter sharing pattern.
 They do not need to be presented as unrelated mechanisms.
 
-## 9. Semantic Residual Self-Attention as a Compatible Extension
+## 10. Semantic Residual Self-Attention as a Compatible Extension
 
 This section describes another compatible extension.
 It is implemented in the current code as an optional self-attention logit correction.
@@ -475,7 +688,7 @@ Semantic residual self-attention adds a content-based correction term on top of 
 
 The two ideas are therefore compatible.
 
-### 9.1 Motivation
+### 10.1 Motivation
 
 In video self-attention, a query token from a moving object may attend strongly to the same spatial coordinate in other frames, instead of attending to the new location of the same object.
 
@@ -490,7 +703,7 @@ The model may over-read features from a static coordinate and under-read feature
 The goal of semantic residual self-attention is therefore not to remove the positional prior.
 The goal is to add a controlled semantic correction for cross-frame token matching.
 
-### 9.2 Standard RoPE logit
+### 10.2 Standard RoPE logit
 
 For layer \(\ell\), head \(m\), query token \(i\), and key token \(j\), let
 
@@ -513,7 +726,7 @@ s_{ij}^{\mathrm{rope},(\ell,m)}
 \mathbb{R}.
 \]
 
-### 9.3 Semantic residual logit
+### 10.3 Semantic residual logit
 
 Define a pure semantic logit by using the pre-RoPE query and key:
 
@@ -546,7 +759,7 @@ where \(f_i\) and \(f_j\) are the frame indices of tokens \(i\) and \(j\).
 
 So \(M_{ij}\) activates the residual term only for cross-frame token pairs.
 
-### 9.4 Final attention logit
+### 10.4 Final attention logit
 
 Let
 
@@ -585,23 +798,23 @@ A_{ij}^{(\ell,m)}
 This construction preserves a single attention matrix and a single softmax.
 It does **not** split the head into separate spatial and temporal branches.
 
-### 9.5 Relation to the RoPE scale schemes
+### 10.5 Relation to the RoPE scale schemes
 
 The role of the RoPE scale schemes is to modify the positional prior through the phase.
 The role of the semantic residual term is to modify cross-frame content matching at the logit level.
 
 So the two mechanisms act at different places:
 
-- Schemes 1, 2, and 8 change how \(\widetilde q\) and \(\widetilde k\) are formed,
-- Scheme 9 changes the final logit after the RoPE term has already been computed.
+- manual \(\lambda\) scaling, `spatial_temporal_reweight`, and timestep-conditioned scaling change how \(\widetilde q\) and \(\widetilde k\) are formed or weighted,
+- semantic residual attention changes the final logit after the RoPE term has already been computed.
 
-This is why Scheme 9 is compatible with axis-wise \(\lambda\) scaling.
+This is why Scheme 10 is compatible with axis-wise \(\lambda\) scaling and with `spatial_temporal_reweight`.
 One can use both at the same time:
 
 - the RoPE term keeps geometric structure and positional stability,
 - the semantic residual term helps cross-frame semantic correspondence.
 
-### 9.6 Step control
+### 10.6 Step control
 
 The semantic residual term can use the same diffusion-step window idea from Section 5.
 Let \(S \subseteq \{1, 2, \dots, K\}\) be the active step set.
@@ -629,15 +842,16 @@ s_{ij}^{\mathrm{rope},(\ell,m)}
 
 This makes the extension especially suitable for early denoising steps, where global layout and rough motion planning are most strongly formed.
 
-## 10. Current Code Path
+## 11. Current Code Path
 
 The current code implements:
 
 - Scheme 1: manual axis-wise \(\lambda_f, \lambda_h, \lambda_w\),
+- Scheme 1B: `spatial_temporal_reweight`,
 - diffusion-step gating,
 - Scheme 2, `global` mode: a timestep-conditioned scale head with checkpoint-loading support,
 - Scheme 2B, `head_aware` mode: a head-aware timestep-conditioned scaling module with runtime attachment and checkpoint-loading support,
-- Scheme 9: Semantic Residual Self-Attention with cross-frame masking, step gating, and optional timestep-conditioned \(\alpha(t)\).
+- Scheme 10: Semantic Residual Self-Attention with cross-frame masking, step gating, and optional timestep-conditioned \(\alpha(t)\).
 
 In the current implementation, the global and head-aware modes are still exposed through separate switches.
 The unified presentation in Sections 6 and 8 is the cleaner mathematical view of the same scale-learning family.
@@ -648,7 +862,7 @@ The main files are:
 - [wan21_t2v_experiment_patch.py](/home/liyueyan/Interpretability/physics/wan21_t2v_experiments/wan21_t2v_experiment_patch.py)
 - [run_wan21_t2v_experiments.py](/home/liyueyan/Interpretability/physics/wan21_t2v_experiments/run_wan21_t2v_experiments.py)
 
-## 11. Recommended Evaluation
+## 12. Recommended Evaluation
 
 The most relevant existing experiments for evaluating this proposal are:
 

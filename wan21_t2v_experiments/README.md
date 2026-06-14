@@ -67,10 +67,11 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - see detailed note: `docs/rope_decay_curve.md`
 
 ### 1c) `rope_modification`
-- Motivation: modify Wan2.1 T2V self-attention RoPE with axis-wise lambda scaling, optional diffusion-step gating, and an optional timestep-conditioned scale head.
-- 动机：通过轴向 lambda 缩放、可选的扩散步窗口控制、以及可选的 timestep-conditioned scale head 改造 Wan2.1 T2V 的 self-attention RoPE。
+- Motivation: modify Wan2.1 T2V self-attention RoPE with axis-wise lambda scaling, a lightweight spatial-temporal post-RoPE reweight, optional diffusion-step gating, and an optional timestep-conditioned scale head.
+- 动机：通过轴向 lambda 缩放、轻量的时空后重加权、可选的扩散步窗口控制、以及可选的 timestep-conditioned scale head 改造 Wan2.1 T2V 的 self-attention RoPE。
 - Modes:
   - `manual`: training-free manual `lambda_f/lambda_h/lambda_w`
+  - `spatial_temporal_reweight`: training-free temporal/spatial channel reweight after RoPE and before attention
   - `timestep_conditioned`: unified timestep-conditioned scale learner with `global` and `head_aware` modes, attached by monkey patch
 - See detailed note: `docs/rope_modification.md`
 

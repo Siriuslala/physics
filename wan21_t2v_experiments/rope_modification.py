@@ -3,9 +3,11 @@
 Main entry:
 - run_wan21_t2v_rope_modification
 
-This experiment studies RoPE modification for Wan2.1 T2V with two modes:
+This experiment studies RoPE modification for Wan2.1 T2V with three modes:
 1. `manual`: training-free axis-wise lambda scaling.
-2. `timestep_conditioned`: a trainable scale learner with `global` and
+2. `spatial_temporal_reweight`: training-free post-RoPE temporal/spatial
+   channel reweighting before self-attention.
+3. `timestep_conditioned`: a trainable scale learner with `global` and
    `head_aware` sub-modes, attached by monkey patching so its parameters can
    later join a training pipeline and appear in `state_dict`.
 """
@@ -53,6 +55,7 @@ def _build_rope_modification_video_filename(
     rope_modification_lambda_h: float,
     rope_modification_lambda_w: float,
     rope_modification_steps: Sequence[int],
+    rope_modification_spatial_temporal_reweight_alpha: float,
     rope_modification_timestep_conditioned_resolution: str,
     rope_modification_semantic_residual_enabled: bool,
     rope_modification_semantic_residual_alpha: float,
@@ -71,13 +74,21 @@ def _build_rope_modification_video_filename(
                 f"lambda_steps_{_format_value_list_tag(rope_modification_steps)}",
             ]
         )
+    elif rope_modification_mode == "spatial_temporal_reweight":
+        tags.extend(
+            [
+                f"spatial_temporal_reweight_alpha_{rope_modification_spatial_temporal_reweight_alpha}",
+                f"spatial_temporal_reweight_steps_{_format_value_list_tag(rope_modification_steps)}",
+            ]
+        )
     elif rope_modification_mode == "timestep_conditioned":
         tags.append(
             f"lambda_timestep_condition_mode_{rope_modification_timestep_conditioned_resolution}"
         )
     else:
         raise ValueError(
-            "rope_modification_mode must be one of {'manual', 'timestep_conditioned'}, "
+            "rope_modification_mode must be one of "
+            "{'manual', 'spatial_temporal_reweight', 'timestep_conditioned'}, "
             f"got {rope_modification_mode!r}."
         )
 
@@ -118,6 +129,7 @@ def run_wan21_t2v_rope_modification(
     rope_modification_lambda_h: float = 1.0,
     rope_modification_lambda_w: float = 1.0,
     rope_modification_steps: Sequence[int] = (),
+    rope_modification_spatial_temporal_reweight_alpha: float = 0.5,
     rope_modification_timestep_conditioned_resolution: str = "global",
     rope_modification_timestep_conditioned_hidden_dim: int = 128,
     rope_modification_timestep_conditioned_checkpoint: str = "",
@@ -131,15 +143,21 @@ def run_wan21_t2v_rope_modification(
     rope_modification_semantic_residual_timestep_conditioned_checkpoint: str = "",
     parallel_cfg: Optional[Wan21T2VParallelConfig] = None,
 ):
-    """Run RoPE modification with manual or timestep-conditioned scaling."""
+    """Run RoPE modification with manual, reweight, or timestep-conditioned scaling."""
     parallel_cfg = parallel_cfg or Wan21T2VParallelConfig()
     runtime = _init_wan21_t2v_runtime(parallel_cfg, explicit_device_id=device_id)
     seed = _broadcast_seed_if_needed(seed, runtime)
 
-    if rope_modification_mode not in {"manual", "timestep_conditioned"}:
+    if rope_modification_mode not in {"manual", "spatial_temporal_reweight", "timestep_conditioned"}:
         raise ValueError(
-            "rope_modification_mode must be one of {'manual', 'timestep_conditioned'}, "
+            "rope_modification_mode must be one of "
+            "{'manual', 'spatial_temporal_reweight', 'timestep_conditioned'}, "
             f"got {rope_modification_mode!r}."
+        )
+    if not (0.0 <= float(rope_modification_spatial_temporal_reweight_alpha) <= 1.0):
+        raise ValueError(
+            "rope_modification_spatial_temporal_reweight_alpha must lie in [0, 1], "
+            f"got {rope_modification_spatial_temporal_reweight_alpha}."
         )
     if rope_modification_timestep_conditioned_resolution not in {"global", "head_aware"}:
         raise ValueError(
@@ -172,6 +190,7 @@ def run_wan21_t2v_rope_modification(
             lambda_w=float(rope_modification_lambda_w),
             apply_steps=tuple(int(v) for v in rope_modification_steps),
             scale_mode=str(rope_modification_mode),
+            spatial_temporal_reweight_alpha=float(rope_modification_spatial_temporal_reweight_alpha),
             timestep_conditioned_resolution=str(rope_modification_timestep_conditioned_resolution),
             timestep_conditioned_hidden_dim=int(rope_modification_timestep_conditioned_hidden_dim),
             timestep_conditioned_checkpoint=str(rope_modification_timestep_conditioned_checkpoint).strip(),
@@ -219,6 +238,7 @@ def run_wan21_t2v_rope_modification(
             rope_modification_lambda_h=rope_modification_lambda_h,
             rope_modification_lambda_w=rope_modification_lambda_w,
             rope_modification_steps=rope_modification_steps,
+            rope_modification_spatial_temporal_reweight_alpha=rope_modification_spatial_temporal_reweight_alpha,
             rope_modification_timestep_conditioned_resolution=rope_modification_timestep_conditioned_resolution,
             rope_modification_semantic_residual_enabled=rope_modification_semantic_residual_enabled,
             rope_modification_semantic_residual_alpha=rope_modification_semantic_residual_alpha,

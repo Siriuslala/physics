@@ -149,12 +149,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--rope_modification_mode",
         type=str,
         default="manual",
-        choices=["manual", "timestep_conditioned"],
-        help="RoPE modification mode: training-free manual scaling or unified timestep-conditioned scale learning.",
+        choices=["manual", "spatial_temporal_reweight", "timestep_conditioned"],
+        help=(
+            "RoPE modification mode: training-free manual scaling, "
+            "training-free spatial-temporal reweight, or unified "
+            "timestep-conditioned scale learning."
+        ),
     )
     parser.add_argument("--rope_modification_lambda_f", type=float, default=1.0)
     parser.add_argument("--rope_modification_lambda_h", type=float, default=1.0)
     parser.add_argument("--rope_modification_lambda_w", type=float, default=1.0)
+    parser.add_argument(
+        "--rope_modification_spatial_temporal_reweight_alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "Temporal channel weight alpha for spatial_temporal_reweight mode. "
+            "Temporal channels receive sqrt(alpha); spatial channels receive sqrt(1-alpha)."
+        ),
+    )
     parser.add_argument(
         "--rope_modification_steps",
         type=str,
@@ -1511,6 +1524,9 @@ def main():
             rope_modification_lambda_h=args.rope_modification_lambda_h,
             rope_modification_lambda_w=args.rope_modification_lambda_w,
             rope_modification_steps=rope_modification_steps,
+            rope_modification_spatial_temporal_reweight_alpha=(
+                args.rope_modification_spatial_temporal_reweight_alpha
+            ),
             rope_modification_timestep_conditioned_resolution=args.rope_modification_timestep_conditioned_resolution,
             rope_modification_timestep_conditioned_hidden_dim=args.rope_modification_timestep_conditioned_hidden_dim,
             rope_modification_timestep_conditioned_checkpoint=args.rope_modification_timestep_conditioned_checkpoint,

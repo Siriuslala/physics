@@ -46,7 +46,8 @@ class Wan21T2VRopePatchConfig:
     lambda_h: float = 1.0
     lambda_w: float = 1.0
     apply_steps: Tuple[int, ...] = tuple()
-    scale_mode: str = "manual"  # manual, timestep_conditioned
+    scale_mode: str = "manual"  # manual, timestep_conditioned, spatial_temporal_reweight
+    spatial_temporal_reweight_alpha: float = 0.5
     timestep_conditioned_resolution: str = "global"  # global, head_aware
     timestep_conditioned_hidden_dim: int = 128
     timestep_conditioned_module_name: str = "rope_timestep_conditioned_scale_net"
@@ -1537,6 +1538,69 @@ def _resolve_rope_manual_scales(rope_cfg: Wan21T2VRopePatchConfig) -> Tuple[floa
     return float(rope_cfg.f_scale), float(rope_cfg.h_scale), float(rope_cfg.w_scale)
 
 
+def _maybe_get_spatial_temporal_reweight_alpha(
+    rope_cfg: Wan21T2VRopePatchConfig,
+    state: Optional["Wan21T2VProbeState"],
+) -> Optional[float]:
+    """Return the active spatial-temporal reweight alpha for the current step."""
+    if rope_cfg.scale_mode != "spatial_temporal_reweight":
+        return None
+    if rope_cfg.apply_steps and (state is None or int(state.current_step) not in {int(v) for v in rope_cfg.apply_steps}):
+        return None
+    alpha = float(rope_cfg.spatial_temporal_reweight_alpha)
+    if alpha < 0.0 or alpha > 1.0:
+        raise ValueError(
+            "spatial_temporal_reweight_alpha must lie in [0, 1], "
+            f"got {alpha}."
+        )
+    return alpha
+
+
+def _apply_spatial_temporal_reweight(
+    x: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    """Reweight RoPE-rotated temporal and spatial channel groups in-place-safe form.
+
+    Args:
+        x: Tensor of shape [B, S, N, D] after RoPE, where D is the real head dim.
+        alpha: Temporal weight in [0, 1]. Temporal channels receive sqrt(alpha),
+            while both spatial channel groups receive sqrt(1 - alpha).
+
+    Returns:
+        Tensor with the same shape as `x`.
+    """
+    if x.ndim != 4:
+        raise ValueError(
+            "_apply_spatial_temporal_reweight expects x with shape [B, S, N, D], "
+            f"got {tuple(x.shape)}."
+        )
+
+    d = int(x.size(-1))
+    if d % 2 != 0:
+        raise ValueError(f"RoPE head dimension must be even, got D={d}.")
+    c = d // 2
+    c_f = c - 2 * (c // 3)
+    c_h = c // 3
+    c_w = c // 3
+    d_f = 2 * c_f
+    d_h = 2 * c_h
+    d_w = 2 * c_w
+
+    time_gain = math.sqrt(float(alpha))
+    space_gain = math.sqrt(1.0 - float(alpha))
+
+    x_f, x_h, x_w = x.split([d_f, d_h, d_w], dim=-1)
+    return torch.cat(
+        [
+            x_f * time_gain,
+            x_h * space_gain,
+            x_w * space_gain,
+        ],
+        dim=-1,
+    )
+
+
 def _maybe_get_timestep_conditioned_scales(
     rope_cfg: Wan21T2VRopePatchConfig,
     num_heads: int,
@@ -2057,6 +2121,7 @@ def _rope_cfg_is_identity(rope_cfg: Wan21T2VRopePatchConfig) -> bool:
         and rope_cfg.lambda_w == 1.0
         and not rope_cfg.apply_steps
         and rope_cfg.scale_mode == "manual"
+        and rope_cfg.spatial_temporal_reweight_alpha == 0.5
     )
 
 
@@ -2101,10 +2166,14 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
     )
     restore_items = []
     semantic_is_identity = _semantic_cfg_is_identity(patch_cfg.semantic)
+    spatial_temporal_reweight_active = (
+        patch_cfg.rope.scale_mode == "spatial_temporal_reweight"
+    )
     needs_custom_attn = (
         patch_cfg.probe.enabled
         or patch_cfg.causal.enabled
         or not semantic_is_identity
+        or spatial_temporal_reweight_active
     )
     rope_is_identity = _rope_cfg_is_identity(patch_cfg.rope)
     needs_rope_step_tracking = (
@@ -2257,6 +2326,13 @@ def install_wan21_t2v_dit_patch_stack(model, patch_cfg: Wan21T2VPatchBundleConfi
                 state=state,
                 layer_idx=layer_idx,
             )
+            reweight_alpha = _maybe_get_spatial_temporal_reweight_alpha(
+                rope_cfg=patch_cfg.rope,
+                state=state,
+            )
+            if reweight_alpha is not None:
+                q_rope = _apply_spatial_temporal_reweight(q_rope, reweight_alpha)
+                k_rope = _apply_spatial_temporal_reweight(k_rope, reweight_alpha)
 
             state.collect(layer_idx=layer_idx, q=q_rope, k=k_rope, seq_lens=seq_lens, grid_sizes=grid_sizes)
 

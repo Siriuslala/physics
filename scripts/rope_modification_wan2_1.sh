@@ -8,7 +8,7 @@ conda activate video
 # t2v-14B: '720*1280', '1280*720', '480*832', '832*480'
 # t2v-1.3B: '480*832', '832*480'
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=2
 
 build_prompt_tag() {
     local prompt="$1"
@@ -51,6 +51,9 @@ build_rope_output_filename() {
         tags+=("lambdah_${ROPE_MODIFICATION_LAMBDA_H}")
         tags+=("lambdaw_${ROPE_MODIFICATION_LAMBDA_W}")
         tags+=("lambda_steps_$(format_step_tag "$ROPE_MODIFICATION_STEPS")")
+    elif [ "$ROPE_MODIFICATION_MODE" = "spatial_temporal_reweight" ]; then
+        tags+=("spatial_temporal_reweight_alpha_${ROPE_MODIFICATION_SPATIAL_TEMPORAL_REWEIGHT_ALPHA}")
+        tags+=("spatial_temporal_reweight_steps_$(format_step_tag "$ROPE_MODIFICATION_STEPS")")
     elif [ "$ROPE_MODIFICATION_MODE" = "timestep_conditioned" ]; then
         tags+=("lambda_timestep_condition_mode_${ROPE_MODIFICATION_TIMESTEP_CONDITIONED_RESOLUTION}")
     fi
@@ -101,25 +104,34 @@ PROMPTS=(
     "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times."
 )
 
+# ==============================
+# RoPE based modification
+# Apply the modification only to the first five denoising steps.
+ROPE_MODIFICATION_STEPS="1,2,3,4"
+
 # Manual mode: training-free axis-wise scaling.
 ROPE_MODIFICATION_MODE="manual"
-ROPE_MODIFICATION_LAMBDA_F=0.45  # 0.75
-ROPE_MODIFICATION_LAMBDA_H=1.00
-ROPE_MODIFICATION_LAMBDA_W=1.00
-
-# Apply the modification only to the first five denoising steps.
-ROPE_MODIFICATION_STEPS="1,2,3,4,5"
+ROPE_MODIFICATION_LAMBDA_F=1.00  # 0.75
+ROPE_MODIFICATION_LAMBDA_H=0.45  # 0.50, 0.75
+ROPE_MODIFICATION_LAMBDA_W=0.45
 
 # Timestep-conditioned mode (need training):
 # params to train: lambda & timestep conditions
 # - `global`: one 3-vector for all heads at each timestep
 # - `head_aware`: one 3-vector per head at each timestep
 # ROPE_MODIFICATION_MODE="timestep_conditioned"
+
+# ==============================
+# Spatial-temporal reweight: apply post-RoPE channel reweight before
+# self-attention. Temporal channels receive sqrt(alpha); spatial channels
+# receive sqrt(1-alpha).
+# ROPE_MODIFICATION_MODE="spatial_temporal_reweight"
+ROPE_MODIFICATION_SPATIAL_TEMPORAL_REWEIGHT_ALPHA=0.80
 ROPE_MODIFICATION_TIMESTEP_CONDITIONED_RESOLUTION="global"
 ROPE_MODIFICATION_TIMESTEP_CONDITIONED_HIDDEN_DIM=128
 ROPE_MODIFICATION_TIMESTEP_CONDITIONED_CHECKPOINT=""
 
-# ==============================
+# ============================================================
 # Semantic Residual Self-Attention: add a cross-frame semantic logit on top of the RoPE logit.
 ROPE_MODIFICATION_SEMANTIC_RESIDUAL_ENABLED=False
 ROPE_MODIFICATION_SEMANTIC_RESIDUAL_ALPHA=0.5
@@ -134,6 +146,8 @@ ROPE_MODIFICATION_SEMANTIC_RESIDUAL_TIMESTEP_CONDITIONED_RESOLUTION="global"
 ROPE_MODIFICATION_SEMANTIC_RESIDUAL_TIMESTEP_CONDITIONED_HIDDEN_DIM=128
 ROPE_MODIFICATION_SEMANTIC_RESIDUAL_TIMESTEP_CONDITIONED_CHECKPOINT=""
 
+
+# ==============================
 for PROMPT in "${PROMPTS[@]}"; do
 for SEED in "${SEEDS[@]}"; do
     echo "=================================================================================="
@@ -172,6 +186,7 @@ for SEED in "${SEEDS[@]}"; do
         --rope_modification_lambda_f $ROPE_MODIFICATION_LAMBDA_F \
         --rope_modification_lambda_h $ROPE_MODIFICATION_LAMBDA_H \
         --rope_modification_lambda_w $ROPE_MODIFICATION_LAMBDA_W \
+        --rope_modification_spatial_temporal_reweight_alpha $ROPE_MODIFICATION_SPATIAL_TEMPORAL_REWEIGHT_ALPHA \
         --rope_modification_steps "$ROPE_MODIFICATION_STEPS" \
         --rope_modification_timestep_conditioned_resolution $ROPE_MODIFICATION_TIMESTEP_CONDITIONED_RESOLUTION \
         --rope_modification_timestep_conditioned_hidden_dim $ROPE_MODIFICATION_TIMESTEP_CONDITIONED_HIDDEN_DIM \
