@@ -32,6 +32,7 @@ ENABLE_CACHE_TIMING=1  # print text/video/VAE timing during MODE=cache
 VIDEO_OUTPUT_FORMAT=tensor_uint8  # pil | tensor_uint8
 CACHE_PREFETCH_BATCHES=2  # overlap video preprocessing with VAE/cache saving; 0 disables it
 CACHE_RESUME=1  # single-process only: skip existing continuous cache files
+CACHE_SKIP_MISMATCHED_SHAPES=1  # skip decoded videos whose shape is not NUM_FRAMES x HEIGHT x WIDTH
 VAE_ENCODE_BATCH_SIZE=2  # 0 means encode the full cache batch at once
 MODEL_SIZE=1.3B         # 1.3B | 14B
 NUM_PROCESSES=1
@@ -73,6 +74,13 @@ MAX_GRAD_NORM=1.0
 NUM_EPOCHS=1
 MAX_TRAIN_STEPS=
 SAVE_STEPS=500
+
+# Timestep sampling settings ==============================
+MIN_TIMESTEP_BOUNDARY=0.0
+MAX_TIMESTEP_BOUNDARY=1.0
+TIMESTEP_SAMPLING_STRATEGY=uniform  # uniform | early_rest_mixture
+TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.12
+TIMESTEP_MIXTURE_EARLY_PROB=0.5
 
 ENABLE_WANDB=0
 WANDB_PROJECT=wan21-physics-full
@@ -139,6 +147,11 @@ TRAIN_ARGS=(
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
   --save_steps "$SAVE_STEPS"
   --output_path "$OUTPUT_PATH"
+  --min_timestep_boundary "$MIN_TIMESTEP_BOUNDARY"
+  --max_timestep_boundary "$MAX_TIMESTEP_BOUNDARY"
+  --timestep_sampling_strategy "$TIMESTEP_SAMPLING_STRATEGY"
+  --timestep_mixture_early_boundary "$TIMESTEP_MIXTURE_EARLY_BOUNDARY"
+  --timestep_mixture_early_prob "$TIMESTEP_MIXTURE_EARLY_PROB"
   --trainable_models "dit"
 )
 if [[ -n "$MAX_TRAIN_STEPS" ]]; then
@@ -167,6 +180,9 @@ if [[ "$ENABLE_CACHE_TIMING" == "1" ]]; then
 fi
 if [[ "$CACHE_RESUME" == "1" ]]; then
   CACHE_ARGS+=(--cache_resume)
+fi
+if [[ "$CACHE_SKIP_MISMATCHED_SHAPES" == "1" ]]; then
+  CACHE_ARGS+=(--cache_skip_mismatched_shapes)
 fi
 
 launch_train() {

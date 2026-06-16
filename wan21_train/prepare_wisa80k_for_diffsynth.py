@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import posixpath
 import random
@@ -40,6 +41,8 @@ DEFAULT_META_JSON = Path(
 )
 DEFAULT_METADATA_OUT = DEFAULT_EXTRACT_DIR / "metadata.csv"
 DEFAULT_MANIFEST_OUT = DEFAULT_EXTRACT_DIR / "extraction_manifest.csv"
+DEFAULT_CLIP_SECONDS = 5.0
+DEFAULT_TARGET_NUM_FRAMES = 81
 
 
 DYNAMIC_LABELS = {
@@ -580,6 +583,16 @@ def safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def estimated_clip_frame_count(
+    duration: float,
+    fps: float,
+    clip_seconds: float = DEFAULT_CLIP_SECONDS,
+) -> int:
+    """Estimate how many raw frames are available in the first training clip."""
+
+    return int(math.floor(min(duration, clip_seconds) * fps)) + 1
+
+
 def get_annotation(item: Dict[str, Any]) -> Dict[str, Any]:
     annotation = item.get("physical_annotation") or {}
     if not isinstance(annotation, dict):
@@ -693,8 +706,8 @@ def basic_rejection_reason(
     fps = safe_float(item.get("fps"))
     if fps is None:
         return "fps_invalid"
-    if duration * fps < 81:
-        return "duration_fps_lt_81"
+    if estimated_clip_frame_count(duration, fps) < DEFAULT_TARGET_NUM_FRAMES:
+        return f"first_{DEFAULT_CLIP_SECONDS:.0f}s_frames_lt_{DEFAULT_TARGET_NUM_FRAMES}"
     if not video_relpath:
         return "video_missing"
     if openable_videos is None:
@@ -936,8 +949,10 @@ def build_category_metadata(args: argparse.Namespace) -> None:
         if fps is None:
             reject_counters[category]["basic:fps_invalid"] += 1
             continue
-        if duration * fps < 81:
-            reject_counters[category]["basic:duration_fps_lt_81"] += 1
+        if estimated_clip_frame_count(duration, fps) < DEFAULT_TARGET_NUM_FRAMES:
+            reject_counters[category][
+                f"basic:first_{DEFAULT_CLIP_SECONDS:.0f}s_frames_lt_{DEFAULT_TARGET_NUM_FRAMES}"
+            ] += 1
             continue
         if not video_relpath:
             reject_counters[category]["basic:video_missing"] += 1
