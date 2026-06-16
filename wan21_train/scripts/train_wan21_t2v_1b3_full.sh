@@ -42,6 +42,8 @@ else
   LAUNCH_MODE=single
 fi
 MIXED_PRECISION=bf16
+SEED=42
+DETERMINISTIC=0  # 1 enables deterministic PyTorch algorithms when available; slower and may warn.
 
 DATASET_BASE_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data
 DATASET_METADATA_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata/metadata_physics_merged_reflection4000.csv
@@ -115,7 +117,7 @@ if [[ -n "$MAX_TRAIN_STEPS" ]]; then
 else
   TRAIN_TOKEN="epochs_${NUM_EPOCHS}"
 fi
-EXP_NAME="bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}"
+EXP_NAME="bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-timestep_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}-seed_${SEED}"
 OUTPUT_PATH=$TRAIN_ROOT/$EXP_NAME
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 
@@ -130,7 +132,9 @@ COMMON_ARGS=(
   --tokenizer_path "$TOKENIZER_PATH"
   --remove_prefix_in_ckpt "pipe.dit."
   --use_gradient_checkpointing
+  --seed "$SEED"
 )
+if [[ "$DETERMINISTIC" == "1" ]]; then COMMON_ARGS+=(--deterministic); fi
 
 TRAIN_ARGS=(
   --dataset_batch_size "$DATASET_BATCH_SIZE"

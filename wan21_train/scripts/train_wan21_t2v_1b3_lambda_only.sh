@@ -19,29 +19,41 @@ fi
 export DIFFSYNTH_MODEL_BASE_PATH=/
 export DIFFSYNTH_SKIP_DOWNLOAD=true
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
-NUM_PROCESSES=${NUM_PROCESSES:-1}
+
+# GPU settings ==============================
+export CUDA_VISIBLE_DEVICES=1
+NUM_PROCESSES=1
+
+# export CUDA_VISIBLE_DEVICES=0,1
+# NUM_PROCESSES=2
+
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then LAUNCH_MODE=multi; else LAUNCH_MODE=single; fi
 
+# General settings ==============================
 USE_CACHE=1
 MODEL_SIZE=1.3B
 MIXED_PRECISION=bf16
+SEED=42
+DETERMINISTIC=0  # 1 enables deterministic PyTorch algorithms when available; slower and may warn.
+
 DATASET_BASE_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data
 DATASET_METADATA_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata_new/metadata_physics_merged_reflection4000.csv
 DATASET_NUM_WORKERS=12
 DATASET_REPEAT=1
+
 HEIGHT=480
 WIDTH=832
 NUM_FRAMES=81
 VIDEO_CLIP_SECONDS=5.0
 
+# Hyper-params settings ==============================
 GLOBAL_BATCH_SIZE=16
-DATASET_BATCH_SIZE=4
+DATASET_BATCH_SIZE=1
 ENABLE_BATCHED_SFT=1
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then WORLD_SIZE=$NUM_PROCESSES; else WORLD_SIZE=1; fi
 GRADIENT_ACCUMULATION_STEPS=$(( (GLOBAL_BATCH_SIZE + DATASET_BATCH_SIZE * WORLD_SIZE - 1) / (DATASET_BATCH_SIZE * WORLD_SIZE) ))
 
-LEARNING_RATE=1e-3
+LEARNING_RATE=1e-3  # Unused. lambda-only has no main trainable params, so LAMBDA_LR is the effective LR.
 LR_SCHEDULER=constant_with_warmup
 WARMUP_RATIO=0.03
 ADAM_BETA1=0.9
@@ -67,11 +79,11 @@ LAMBDA_TIMESTEP_CONDITIONED=1
 LAMBDA_HIDDEN_DIM=128
 LAMBDA_CHECKPOINT=
 
-
-
+# Tensorboard settings ==============================
 ENABLE_WANDB=1
 WANDB_PROJECT=wan21-physics-lambda-only
 
+# Model path, Cache path & Output settings ==============================
 if [[ "$MODEL_SIZE" == "1.3B" || "$MODEL_SIZE" == "1B3" ]]; then
   PRETRAINED_MODEL_DIR="${MODEL_DIR%/}/Wan2.1-T2V-1.3B"
   CKPT_ROOT="$WORK_TRAIN_DIR/Wan2.1-T2V-1B3"
@@ -94,11 +106,12 @@ print(len(pd.read_csv('$DATASET_METADATA_PATH')))
 PY2
 )
 if [[ -n "$MAX_TRAIN_STEPS" ]]; then TRAIN_TOKEN="steps_${MAX_TRAIN_STEPS}"; else TRAIN_TOKEN="epochs_${NUM_EPOCHS}"; fi
-EXP_NAME="lambda_only-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lambda_scope_${LAMBDA_SCOPE}-lambda_lr_${LAMBDA_LR}-lambda_beta_${LAMBDA_BETA}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-timestep_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}"
+EXP_NAME="lambda_only-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lambda_scope_${LAMBDA_SCOPE}-lambda_lr_${LAMBDA_LR}-lambda_beta_${LAMBDA_BETA}-lambda_tcond_${LAMBDA_TIMESTEP_CONDITIONED}-lambda_hidden_${LAMBDA_HIDDEN_DIM}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-timestep_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}-seed_${SEED}"
 OUTPUT_PATH="$TRAIN_ROOT/$EXP_NAME"
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 WANDB_NAME="$EXP_NAME"
 
+# Prepare args ==============================
 COMMON_ARGS=(
   --height "$HEIGHT"
   --width "$WIDTH"
@@ -110,7 +123,9 @@ COMMON_ARGS=(
   --tokenizer_path "$TOKENIZER_PATH"
   --remove_prefix_in_ckpt "pipe.dit."
   --use_gradient_checkpointing
+  --seed "$SEED"
 )
+if [[ "$DETERMINISTIC" == "1" ]]; then COMMON_ARGS+=(--deterministic); fi
 
 TRAIN_ARGS=(
   --dataset_batch_size "$DATASET_BATCH_SIZE"

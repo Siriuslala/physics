@@ -1,4 +1,4 @@
-import os, math, json, torch, importlib, time, threading, queue
+import os, math, json, torch, importlib, time, threading, queue, random
 from tqdm import tqdm
 from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
@@ -57,6 +57,34 @@ def compute_total_update_steps(dataset, dataset_batch_size, gradient_accumulatio
     return max(1, total_steps)
 
 
+def build_seeded_dataloader_kwargs(seed, process_index=0):
+    if seed is None:
+        return {}
+    seed = int(seed)
+    process_seed = seed + int(process_index) * 100003
+    random.seed(process_seed)
+    try:
+        import numpy as np
+        np.random.seed(process_seed % (2 ** 32))
+    except Exception:
+        np = None
+    torch.manual_seed(process_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(process_seed)
+
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    def seed_worker(worker_id):
+        worker_seed = seed + int(process_index) * 100003 + int(worker_id)
+        random.seed(worker_seed)
+        if np is not None:
+            np.random.seed(worker_seed % (2 ** 32))
+        torch.manual_seed(worker_seed)
+
+    return {"generator": generator, "worker_init_fn": seed_worker}
+
+
 def launch_training_task(
     accelerator: Accelerator,
     dataset: torch.utils.data.Dataset,
@@ -85,6 +113,7 @@ def launch_training_task(
     adam_epsilon = 1e-8
     max_grad_norm = 1.0
     enable_batched_sft = False
+    seed = None
     if args is not None:
         learning_rate = args.learning_rate
         weight_decay = args.weight_decay
@@ -105,6 +134,7 @@ def launch_training_task(
         enable_optimizer_cpu_offload = args.enable_optimizer_cpu_offload
         cpu_offload_split_threshold = args.cpu_offload_split_threshold
         customized_optimizer = args.customized_optimizer
+        seed = args.seed
 
     total_update_steps = compute_total_update_steps(
         dataset, dataset_batch_size, gradient_accumulation_steps, num_epochs, max_train_steps,
@@ -126,7 +156,15 @@ def launch_training_task(
         eps=adam_epsilon,
     )
     scheduler = get_scheduler(optimizer, lr_scheduler, warmup_steps, total_update_steps)
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, batch_size=dataset_batch_size, collate_fn=collate_training_batch, num_workers=num_workers)
+    dataloader_seed_kwargs = build_seeded_dataloader_kwargs(seed, accelerator.process_index)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        shuffle=True,
+        batch_size=dataset_batch_size,
+        collate_fn=collate_training_batch,
+        num_workers=num_workers,
+        **dataloader_seed_kwargs,
+    )
 
     if enable_model_cpu_offload:
         optimizer, dataloader, scheduler = accelerator.prepare(optimizer, dataloader, scheduler)
@@ -333,6 +371,7 @@ def launch_data_process_task(
     enable_model_cpu_offload = False
     enable_optimizer_cpu_offload = False
     cpu_offload_split_threshold = None
+    seed = None
     if args is not None:
         num_workers = args.dataset_num_workers
         dataset_batch_size = args.dataset_batch_size
@@ -342,6 +381,7 @@ def launch_data_process_task(
         enable_model_cpu_offload = args.enable_model_cpu_offload
         enable_optimizer_cpu_offload = args.enable_optimizer_cpu_offload
         cpu_offload_split_threshold = args.cpu_offload_split_threshold
+        seed = args.seed
 
     folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
     os.makedirs(folder, exist_ok=True)
@@ -374,12 +414,14 @@ def launch_data_process_task(
     # dozens of frames; sending a DataLoader batch of many such samples through
     # multiprocessing queues can block for a long time. We accumulate samples after
     # DataLoader and still run the model with dataset_batch_size samples at once.
+    dataloader_seed_kwargs = build_seeded_dataloader_kwargs(seed, accelerator.process_index)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         shuffle=False,
         batch_size=1,
         collate_fn=lambda x: x[0],
         num_workers=num_workers,
+        **dataloader_seed_kwargs,
     )
     if enable_model_cpu_offload:
         dataloader = accelerator.prepare(dataloader)

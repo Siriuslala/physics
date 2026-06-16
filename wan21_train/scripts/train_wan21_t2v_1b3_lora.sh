@@ -2,11 +2,9 @@
 set -euo pipefail
 trap 'stty sane 2>/dev/null || true' EXIT INT TERM
 
-
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ../../scripts/env.sh
 cd "$ROOT_DIR"
-
 
 set +u
 source ~/miniforge3/etc/profile.d/conda.sh
@@ -26,7 +24,7 @@ export DIFFSYNTH_SKIP_DOWNLOAD=true
 export CUDA_VISIBLE_DEVICES=1
 NUM_PROCESSES=1
 
-# export CUDA_VISIBLE_DEVICES=6,7
+# export CUDA_VISIBLE_DEVICES=0,1
 # NUM_PROCESSES=2
 
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then
@@ -53,10 +51,16 @@ CACHE_SKIP_MISMATCHED_SHAPES=1  # skip decoded videos whose shape is not NUM_FRA
 USE_CACHE=1  # 0: online video/text encoding; 1: train from cached .pth files
 MODEL_SIZE=1.3B  # 1.3B | 14B
 MIXED_PRECISION=bf16
+SEED=42
+DETERMINISTIC=0  # 1 enables deterministic PyTorch algorithms when available; slower and may warn.
+USE_GRADIENT_CHECKPOINTING=1
+USE_GRADIENT_CHECKPOINTING_OFFLOAD=0  # use gradient checkpointing, but whether to offload it to CPU
+NUM_CPU_THREADS_PER_PROCESS=8
+ENABLE_CPU_AFFINITY=0  # Set to 1 to let accelerate bind CPU cores per process when supported.
 
 DATASET_BASE_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data
 DATASET_METADATA_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata_new/metadata_physics_merged_reflection4000.csv
-DATASET_NUM_WORKERS=12
+DATASET_NUM_WORKERS=4
 DATASET_REPEAT=1
 
 HEIGHT=480
@@ -68,7 +72,7 @@ VIDEO_CLIP_SECONDS=5.0
 # With ENABLE_BATCHED_SFT=1, standard Wan T2V SFT uses DATASET_BATCH_SIZE as real per-process batch size.
 # Effective global batch = DATASET_BATCH_SIZE * NUM_PROCESSES * GRADIENT_ACCUMULATION_STEPS.
 GLOBAL_BATCH_SIZE=16
-DATASET_BATCH_SIZE=8  # batchsize per forward
+DATASET_BATCH_SIZE=1  # batchsize per forward
 ENABLE_BATCHED_SFT=1
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then
   WORLD_SIZE=$NUM_PROCESSES
@@ -106,9 +110,16 @@ case "$LORA_MODULE_PRESET" in
   *) echo "Unsupported LORA_MODULE_PRESET: $LORA_MODULE_PRESET" >&2; exit 1 ;;
 esac
 
+# CPU offload settings ==============================
+# Formal training does not use CPU offload unless this is enabled.
+ENABLE_MODEL_CPU_OFFLOAD=0
+ENABLE_OPTIMIZER_CPU_OFFLOAD=0
+CPU_OFFLOAD_SPLIT_THRESHOLD=""  # empty means DiffSynth default
+
+# Tensorboard settings ==============================
 ENABLE_WANDB=1
-WANDB_PROJECT=wan21-physics-lora
-WANDB_NAME="bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lora_rank_${LORA_RANK}-lora_alpha_${LORA_ALPHA}-lora_modules_${LORA_MODULE_PRESET}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}"
+WANDB_PROJECT=wan21-physics-lora-test
+WANDB_NAME="bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lora_rank_${LORA_RANK}-lora_alpha_${LORA_ALPHA}-lora_modules_${LORA_MODULE_PRESET}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-timestep_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}-seed_${SEED}"
 
 # Model path, Cache path & Output settings ==============================
 if [[ "$MODEL_SIZE" == "1.3B" || "$MODEL_SIZE" == "1B3" ]]; then
@@ -140,7 +151,7 @@ if [[ -n "$MAX_TRAIN_STEPS" ]]; then
 else
   TRAIN_TOKEN="epochs_${NUM_EPOCHS}"
 fi
-EXP_NAME="bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lora_rank_${LORA_RANK}-lora_alpha_${LORA_ALPHA}-lora_modules_${LORA_MODULE_PRESET}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}"
+EXP_NAME="bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lora_rank_${LORA_RANK}-lora_alpha_${LORA_ALPHA}-lora_modules_${LORA_MODULE_PRESET}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-timestep_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}-seed_${SEED}"
 OUTPUT_PATH=$TRAIN_ROOT/$EXP_NAME
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 
@@ -159,8 +170,15 @@ COMMON_ARGS=(
   --lora_target_modules "$LORA_TARGET_MODULES"
   --lora_rank "$LORA_RANK"
   --lora_alpha "$LORA_ALPHA"
-  --use_gradient_checkpointing
+  --seed "$SEED"
 )
+if [[ "$USE_GRADIENT_CHECKPOINTING" == "1" ]]; then
+  COMMON_ARGS+=(--use_gradient_checkpointing)
+fi
+if [[ "$USE_GRADIENT_CHECKPOINTING_OFFLOAD" == "1" ]]; then
+  COMMON_ARGS+=(--use_gradient_checkpointing_offload)
+fi
+if [[ "$DETERMINISTIC" == "1" ]]; then COMMON_ARGS+=(--deterministic); fi
 
 TRAIN_ARGS=(
   --dataset_batch_size "$DATASET_BATCH_SIZE"
@@ -189,6 +207,15 @@ fi
 if [[ "$ENABLE_BATCHED_SFT" == "1" ]]; then
   TRAIN_ARGS+=(--enable_batched_sft)
 fi
+if [[ "$ENABLE_MODEL_CPU_OFFLOAD" == "1" ]]; then
+  TRAIN_ARGS+=(--enable_model_cpu_offload)
+fi
+if [[ "$ENABLE_OPTIMIZER_CPU_OFFLOAD" == "1" ]]; then
+  TRAIN_ARGS+=(--enable_optimizer_cpu_offload)
+fi
+if [[ -n "$CPU_OFFLOAD_SPLIT_THRESHOLD" ]]; then
+  TRAIN_ARGS+=(--cpu_offload_split_threshold "$CPU_OFFLOAD_SPLIT_THRESHOLD")
+fi
 if [[ "$ENABLE_WANDB" == "1" ]]; then
   export WANDB_PROJECT
   if [[ -n "$WANDB_NAME" ]]; then export WANDB_NAME; fi
@@ -213,13 +240,33 @@ fi
 if [[ "$CACHE_SKIP_MISMATCHED_SHAPES" == "1" ]]; then
   CACHE_ARGS+=(--cache_skip_mismatched_shapes)
 fi
+if [[ "$ENABLE_MODEL_CPU_OFFLOAD" == "1" ]]; then
+  CACHE_ARGS+=(--enable_model_cpu_offload)
+fi
+if [[ "$ENABLE_OPTIMIZER_CPU_OFFLOAD" == "1" ]]; then
+  CACHE_ARGS+=(--enable_optimizer_cpu_offload)
+fi
+if [[ -n "$CPU_OFFLOAD_SPLIT_THRESHOLD" ]]; then
+  CACHE_ARGS+=(--cpu_offload_split_threshold "$CPU_OFFLOAD_SPLIT_THRESHOLD")
+fi
 
 # Prepare commands ============================== 
 launch_train() {
+  ACCELERATE_COMMON_ARGS=(
+    --num_machines 1
+    --mixed_precision "$MIXED_PRECISION"
+    --dynamo_backend no
+    --main_process_port 0
+    --num_cpu_threads_per_process "$NUM_CPU_THREADS_PER_PROCESS"
+  )
+  if [[ "$ENABLE_CPU_AFFINITY" == "1" ]]; then
+    ACCELERATE_COMMON_ARGS+=(--enable_cpu_affinity)
+  fi
+
   if [[ "$LAUNCH_MODE" == "multi" ]]; then
-    accelerate launch --num_processes "$NUM_PROCESSES" --num_machines 1 --mixed_precision "$MIXED_PRECISION" --dynamo_backend no DiffSynth-Studio/examples/wanvideo/model_training/train.py "$@"
+    accelerate launch --multi_gpu --num_processes "$NUM_PROCESSES" "${ACCELERATE_COMMON_ARGS[@]}" DiffSynth-Studio/examples/wanvideo/model_training/train.py "$@"
   else
-    accelerate launch --num_processes 1 --num_machines 1 --mixed_precision "$MIXED_PRECISION" --dynamo_backend no DiffSynth-Studio/examples/wanvideo/model_training/train.py "$@"
+    accelerate launch --num_processes 1 "${ACCELERATE_COMMON_ARGS[@]}" DiffSynth-Studio/examples/wanvideo/model_training/train.py "$@"
   fi
 }
 

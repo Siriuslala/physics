@@ -49,6 +49,8 @@ def add_training_config(parser: argparse.ArgumentParser):
     parser.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
     parser.add_argument("--customized_optimizer", type=str, default=None, help="Customized optimizer, e.g., `bitsandbytes.optim.Adam8bit` and `torch.optim.Adam`. The default optimizer is `torch.optim.AdamW`.")
     parser.add_argument("--enable_batched_sft", default=False, action="store_true", help="Enable a Wan T2V SFT fast path that forwards each dataloader batch as one batched model call instead of sequential micro-batches.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for model initialization, dataloader shuffle, timestep sampling, and training noise.")
+    parser.add_argument("--deterministic", default=False, action="store_true", help="Enable deterministic PyTorch algorithms when available. This can reduce speed and may warn for unsupported ops.")
     return parser
 
 def add_output_config(parser: argparse.ArgumentParser):

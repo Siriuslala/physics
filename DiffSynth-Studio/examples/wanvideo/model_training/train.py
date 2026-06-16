@@ -1,4 +1,4 @@
-import torch, os, argparse, accelerate, warnings, time, json
+import torch, os, argparse, accelerate, warnings, time, json, random
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
@@ -6,6 +6,27 @@ from diffsynth.core import load_state_dict
 from diffsynth.models.wan_video_dit import WanSpatialRopeLambda
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def set_reproducibility_seed(seed, deterministic=False):
+    if seed is None:
+        return
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except Exception:
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 class WanTrainingModule(DiffusionTrainingModule):
@@ -42,10 +63,9 @@ class WanTrainingModule(DiffusionTrainingModule):
         timestep_mixture_early_prob=0.5,
     ):
         super().__init__()
-        # Warning
-        if not use_gradient_checkpointing:
-            warnings.warn("Gradient checkpointing is detected as disabled. To prevent out-of-memory errors, the training framework will forcibly enable gradient checkpointing.")
-            use_gradient_checkpointing = True
+        # Honor the user-provided gradient checkpointing setting.
+        # Wan video training can OOM without checkpointing, but the script should
+        # remain the source of truth for controlled experiments.
 
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
@@ -431,6 +451,15 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs = self.merge_cached_training_batch(batch)
         return self.forward({}, inputs=inputs)
 
+    def override_runtime_training_flags(self, inputs):
+        if not self.is_cached_training_inputs(inputs):
+            return inputs
+        inputs_shared, inputs_posi, inputs_nega = inputs
+        inputs_shared = dict(inputs_shared)
+        inputs_shared["use_gradient_checkpointing"] = self.use_gradient_checkpointing
+        inputs_shared["use_gradient_checkpointing_offload"] = self.use_gradient_checkpointing_offload
+        return inputs_shared, inputs_posi, inputs_nega
+
     def split_batched_t2v_cache_inputs(self, inputs, group_size):
         """Split batched Wan T2V inputs into per-sample compact cache tuples."""
         cache_items = []
@@ -497,6 +526,7 @@ class WanTrainingModule(DiffusionTrainingModule):
                 return [self.forward(item) for item in data]
             return self.forward_batched_t2v_sft(data)
         if inputs is None: inputs = self.get_pipeline_inputs(data)
+        inputs = self.override_runtime_training_flags(inputs)
         inputs = self.inject_timestep_sampling_inputs(inputs)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
@@ -552,6 +582,7 @@ def wan_parser():
 if __name__ == "__main__":
     parser = wan_parser()
     args = parser.parse_args()
+    set_reproducibility_seed(args.seed, deterministic=args.deterministic)
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],

@@ -26,6 +26,8 @@ if [[ "$NUM_PROCESSES" -gt 1 ]]; then LAUNCH_MODE=multi; else LAUNCH_MODE=single
 USE_CACHE=1
 MODEL_SIZE=1.3B
 MIXED_PRECISION=bf16
+SEED=42
+DETERMINISTIC=0  # 1 enables deterministic PyTorch algorithms when available; slower and may warn.
 DATASET_BASE_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data
 DATASET_METADATA_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata_new/metadata_physics_merged_reflection4000.csv
 DATASET_NUM_WORKERS=12
@@ -94,7 +96,7 @@ print(len(pd.read_csv('$DATASET_METADATA_PATH')))
 PY2
 )
 if [[ -n "$MAX_TRAIN_STEPS" ]]; then TRAIN_TOKEN="steps_${MAX_TRAIN_STEPS}"; else TRAIN_TOKEN="epochs_${NUM_EPOCHS}"; fi
-EXP_NAME="lambda_full-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lambda_scope_${LAMBDA_SCOPE}-lambda_lr_${LAMBDA_LR}-lambda_beta_${LAMBDA_BETA}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-timestep_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}"
+EXP_NAME="lambda_full-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lambda_scope_${LAMBDA_SCOPE}-lambda_lr_${LAMBDA_LR}-lambda_beta_${LAMBDA_BETA}-lambda_tcond_${LAMBDA_TIMESTEP_CONDITIONED}-lambda_hidden_${LAMBDA_HIDDEN_DIM}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-timestep_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}-seed_${SEED}"
 OUTPUT_PATH="$TRAIN_ROOT/$EXP_NAME"
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 WANDB_NAME="$EXP_NAME"
@@ -110,7 +112,9 @@ COMMON_ARGS=(
   --tokenizer_path "$TOKENIZER_PATH"
   --remove_prefix_in_ckpt "pipe.dit."
   --use_gradient_checkpointing
+  --seed "$SEED"
 )
+if [[ "$DETERMINISTIC" == "1" ]]; then COMMON_ARGS+=(--deterministic); fi
 
 TRAIN_ARGS=(
   --dataset_batch_size "$DATASET_BATCH_SIZE"
