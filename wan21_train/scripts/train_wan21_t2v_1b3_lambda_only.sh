@@ -21,7 +21,7 @@ export DIFFSYNTH_SKIP_DOWNLOAD=true
 
 
 # GPU settings ==============================
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=4
 NUM_PROCESSES=1
 
 # export CUDA_VISIBLE_DEVICES=0,1
@@ -35,11 +35,14 @@ MODEL_SIZE=1.3B
 MIXED_PRECISION=bf16
 SEED=42
 DETERMINISTIC=0  # 1 enables deterministic PyTorch algorithms when available; slower and may warn.
+FIND_UNUSED_PARAMETERS=1  # Recommended for DDP with lambda/LoRA/gradient checkpointing.
 
 DATASET_BASE_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data
 DATASET_METADATA_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata_new/metadata_physics_merged_reflection4000.csv
 DATASET_NUM_WORKERS=12
 DATASET_REPEAT=1
+CACHE_FILTER_INVALID_LATENTS=1
+CACHE_FILTER_INVALID_LATENTS_REBUILD_INDEX=0
 
 HEIGHT=480
 WIDTH=832
@@ -63,7 +66,7 @@ WEIGHT_DECAY=0.0
 MAX_GRAD_NORM=1.0
 NUM_EPOCHS=3
 MAX_TRAIN_STEPS=3000
-SAVE_STEPS=200
+SAVE_STEPS=100
 
 # Full-range training is [0.0, 1.0]. Do not set min=max; DiffSynth requires min < max.
 MIN_TIMESTEP_BOUNDARY=0.0
@@ -80,8 +83,14 @@ LAMBDA_HIDDEN_DIM=128
 LAMBDA_CHECKPOINT=
 
 # Tensorboard settings ==============================
+WANDB_MODE=offline  # offline | online | disabled. Offline is syncable later and never depends on api.wandb.ai.
+WANDB_ALLOW_ONLINE=0  # set to 1 together with WANDB_MODE=online if online streaming is explicitly needed
+WANDB_INIT_TIMEOUT=15
+export WANDB_INIT_TIMEOUT
+export WANDB_MODE
+export WANDB_ALLOW_ONLINE
 ENABLE_WANDB=1
-WANDB_PROJECT=wan21-physics-lambda-only
+WANDB_PROJECT=wan21-physics-lambda-lora
 
 # Model path, Cache path & Output settings ==============================
 if [[ "$MODEL_SIZE" == "1.3B" || "$MODEL_SIZE" == "1B3" ]]; then
@@ -106,7 +115,19 @@ print(len(pd.read_csv('$DATASET_METADATA_PATH')))
 PY2
 )
 if [[ -n "$MAX_TRAIN_STEPS" ]]; then TRAIN_TOKEN="steps_${MAX_TRAIN_STEPS}"; else TRAIN_TOKEN="epochs_${NUM_EPOCHS}"; fi
-EXP_NAME="lambda_only-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lambda_scope_${LAMBDA_SCOPE}-lambda_lr_${LAMBDA_LR}-lambda_beta_${LAMBDA_BETA}-lambda_tcond_${LAMBDA_TIMESTEP_CONDITIONED}-lambda_hidden_${LAMBDA_HIDDEN_DIM}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-timestep_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}-seed_${SEED}"
+case "$TIMESTEP_SAMPLING_STRATEGY" in
+  uniform)
+    TIMESTEP_TOKEN="timestep_uniform_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}"
+    ;;
+  early_rest_mixture)
+    TIMESTEP_TOKEN="timestep_mixed_early_${TIMESTEP_MIXTURE_EARLY_BOUNDARY}_prob_${TIMESTEP_MIXTURE_EARLY_PROB}"
+    ;;
+  *)
+    echo "Unsupported TIMESTEP_SAMPLING_STRATEGY: $TIMESTEP_SAMPLING_STRATEGY" >&2
+    exit 1
+    ;;
+esac
+EXP_NAME="lambda_only-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lambda_scope_${LAMBDA_SCOPE}-lambda_lr_${LAMBDA_LR}-lambda_beta_${LAMBDA_BETA}-lambda_tcond_${LAMBDA_TIMESTEP_CONDITIONED}-lambda_hidden_${LAMBDA_HIDDEN_DIM}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-${TIMESTEP_TOKEN}-seed_${SEED}"
 OUTPUT_PATH="$TRAIN_ROOT/$EXP_NAME"
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 WANDB_NAME="$EXP_NAME"
@@ -157,6 +178,7 @@ if [[ "$LAMBDA_TIMESTEP_CONDITIONED" == "1" ]]; then TRAIN_ARGS+=(--wan_spatial_
 if [[ -n "$LAMBDA_CHECKPOINT" ]]; then TRAIN_ARGS+=(--wan_spatial_rope_lambda_checkpoint "$LAMBDA_CHECKPOINT"); fi
 if [[ -n "$MAX_TRAIN_STEPS" ]]; then TRAIN_ARGS+=(--max_train_steps "$MAX_TRAIN_STEPS"); fi
 if [[ "$ENABLE_BATCHED_SFT" == "1" ]]; then TRAIN_ARGS+=(--enable_batched_sft); fi
+if [[ "$FIND_UNUSED_PARAMETERS" == "1" ]]; then TRAIN_ARGS+=(--find_unused_parameters); fi
 
 if [[ "$ENABLE_WANDB" == "1" ]]; then
   export WANDB_PROJECT WANDB_NAME
@@ -165,7 +187,7 @@ fi
 
 launch_train() {
   if [[ "$LAUNCH_MODE" == "multi" ]]; then
-    accelerate launch --num_processes "$NUM_PROCESSES" --num_machines 1 --mixed_precision "$MIXED_PRECISION" --dynamo_backend no DiffSynth-Studio/examples/wanvideo/model_training/train.py "$@"
+    accelerate launch --multi_gpu --num_processes "$NUM_PROCESSES" --num_machines 1 --mixed_precision "$MIXED_PRECISION" --dynamo_backend no DiffSynth-Studio/examples/wanvideo/model_training/train.py "$@"
   else
     accelerate launch --num_processes 1 --num_machines 1 --mixed_precision "$MIXED_PRECISION" --dynamo_backend no DiffSynth-Studio/examples/wanvideo/model_training/train.py "$@"
   fi

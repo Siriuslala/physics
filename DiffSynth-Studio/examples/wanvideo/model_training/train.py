@@ -576,6 +576,8 @@ def wan_parser():
     parser.add_argument("--cache_prefetch_batches", type=int, default=0, help="Number of preprocessed cache batches to keep in a background prefetch queue during data_process. 0 disables it.")
     parser.add_argument("--cache_resume", default=False, action="store_true", help="Resume single-process cache generation by skipping existing continuous 0.pth..N.pth files.")
     parser.add_argument("--cache_skip_mismatched_shapes", default=False, action="store_true", help="During data_process, skip samples whose decoded video shape does not match --num_frames/--height/--width and log them to jsonl.")
+    parser.add_argument("--cache_filter_invalid_latents", default=True, action=argparse.BooleanOptionalAction, help="During cache training, filter cached samples whose input_latents shape does not match --num_frames/--height/--width before building the DataLoader.")
+    parser.add_argument("--cache_filter_invalid_latents_rebuild_index", default=False, action="store_true", help="Force rebuilding the cache input_latents validity index before training.")
     return parser
 
 

@@ -44,6 +44,7 @@ fi
 MIXED_PRECISION=bf16
 SEED=42
 DETERMINISTIC=0  # 1 enables deterministic PyTorch algorithms when available; slower and may warn.
+FIND_UNUSED_PARAMETERS=0  # Set to 1 if DDP reports unused trainable parameters.
 
 DATASET_BASE_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data
 DATASET_METADATA_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata/metadata_physics_merged_reflection4000.csv
@@ -117,7 +118,19 @@ if [[ -n "$MAX_TRAIN_STEPS" ]]; then
 else
   TRAIN_TOKEN="epochs_${NUM_EPOCHS}"
 fi
-EXP_NAME="bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-timestep_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}-seed_${SEED}"
+case "$TIMESTEP_SAMPLING_STRATEGY" in
+  uniform)
+    TIMESTEP_TOKEN="timestep_uniform_${MIN_TIMESTEP_BOUNDARY}_${MAX_TIMESTEP_BOUNDARY}"
+    ;;
+  early_rest_mixture)
+    TIMESTEP_TOKEN="timestep_mixed_early_${TIMESTEP_MIXTURE_EARLY_BOUNDARY}_prob_${TIMESTEP_MIXTURE_EARLY_PROB}"
+    ;;
+  *)
+    echo "Unsupported TIMESTEP_SAMPLING_STRATEGY: $TIMESTEP_SAMPLING_STRATEGY" >&2
+    exit 1
+    ;;
+esac
+EXP_NAME="bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-${TIMESTEP_TOKEN}-seed_${SEED}"
 OUTPUT_PATH=$TRAIN_ROOT/$EXP_NAME
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 
@@ -164,6 +177,9 @@ fi
 if [[ "$ENABLE_BATCHED_SFT" == "1" ]]; then
   TRAIN_ARGS+=(--enable_batched_sft)
 fi
+if [[ "$FIND_UNUSED_PARAMETERS" == "1" ]]; then
+  TRAIN_ARGS+=(--find_unused_parameters)
+fi
 if [[ "$ENABLE_WANDB" == "1" ]]; then
   export WANDB_PROJECT
   if [[ -n "$WANDB_NAME" ]]; then export WANDB_NAME; fi
@@ -191,7 +207,7 @@ fi
 
 launch_train() {
   if [[ "$LAUNCH_MODE" == "multi" ]]; then
-    accelerate launch --num_processes "$NUM_PROCESSES" --num_machines 1 --mixed_precision "$MIXED_PRECISION" --dynamo_backend no DiffSynth-Studio/examples/wanvideo/model_training/train.py "$@"
+    accelerate launch --multi_gpu --num_processes "$NUM_PROCESSES" --num_machines 1 --mixed_precision "$MIXED_PRECISION" --dynamo_backend no DiffSynth-Studio/examples/wanvideo/model_training/train.py "$@"
   else
     accelerate launch --num_processes 1 --num_machines 1 --mixed_precision "$MIXED_PRECISION" --dynamo_backend no DiffSynth-Studio/examples/wanvideo/model_training/train.py "$@"
   fi

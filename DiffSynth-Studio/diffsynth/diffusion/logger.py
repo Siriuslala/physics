@@ -1,4 +1,4 @@
-import os, torch
+import json, os, signal, threading, torch
 from accelerate import Accelerator
 
 
@@ -31,19 +31,149 @@ class SwanLabLogger:
         self.swanlab.finish()
 
 
-class WandbLogger:
-    def __init__(self, project_name="DiffSynth-Studio", log_dir=None):
-        import wandb
-        project_name = os.environ.get("WANDB_PROJECT", project_name)
-        self.wandb = wandb
-        self.run = self.wandb.init(project=project_name, dir=log_dir)
-        print(f"Wandb is enabled. Project: {project_name}")
+class LocalJSONMetricsLogger:
+    def __init__(self, log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+        self.path = os.path.join(log_dir, "metrics.jsonl")
+        self.file = open(self.path, "a", buffering=1)
+        print(f"Local metrics logging is enabled: {self.path}", flush=True)
 
     def log(self, key, value, step):
-        self.wandb.log({key: value}, step=step)
+        self.file.write(json.dumps({"step": int(step), key: value}, ensure_ascii=True) + "\n")
 
     def close(self):
-        self.wandb.finish()
+        self.file.close()
+
+
+class WandbLogger:
+    def __init__(self, project_name="DiffSynth-Studio", log_dir=None):
+        project_name = os.environ.get("WANDB_PROJECT", project_name)
+        timeout = int(os.environ.get("WANDB_INIT_TIMEOUT", "15"))
+        requested_mode = os.environ.get("WANDB_MODE", "offline").strip().lower()
+        allow_online = os.environ.get("WANDB_ALLOW_ONLINE", "0") == "1"
+
+        self.wandb = None
+        self.run = None
+        self.disabled = False
+        self.local_logger = None
+        self.log_dir = log_dir
+        if log_dir is not None:
+            os.makedirs(log_dir, exist_ok=True)
+
+        if requested_mode == "online" and not allow_online:
+            print(
+                "Warning: WANDB_MODE=online is ignored because WANDB_ALLOW_ONLINE is not 1. "
+                "Using offline mode to avoid blocking training.",
+                flush=True,
+            )
+            requested_mode = "offline"
+
+        if requested_mode == "disabled":
+            self.disabled = True
+            print("Wandb is disabled.", flush=True)
+            return
+
+        if requested_mode in ("offline", "dryrun"):
+            os.environ["WANDB_MODE"] = "offline"
+        elif requested_mode == "online":
+            os.environ["WANDB_MODE"] = "online"
+        else:
+            print(f"Warning: unsupported WANDB_MODE={requested_mode}; using offline mode.", flush=True)
+            requested_mode = "offline"
+            os.environ["WANDB_MODE"] = "offline"
+
+        self._clear_stale_wandb_service_env()
+
+        try:
+            import wandb
+            self.wandb = wandb
+            settings = self.wandb.Settings(init_timeout=timeout)
+            self.run = self._call_with_hard_timeout(
+                lambda: self.wandb.init(project=project_name, dir=log_dir, mode=requested_mode, settings=settings),
+                timeout,
+                f"wandb {requested_mode} init",
+            )
+            if requested_mode == "offline":
+                print(
+                    f"Wandb is enabled offline. Project: {project_name}. "
+                    f"Sync later with: wandb sync {log_dir}/wandb/offline-run-*",
+                    flush=True,
+                )
+            else:
+                print(f"Wandb is enabled online. Project: {project_name}. Init timeout: {timeout}s", flush=True)
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            self._fallback_to_local_json(
+                f"Warning: wandb {requested_mode} init failed or timed out after {timeout}s: {exc}. "
+                "Falling back to local metrics.jsonl and continuing training."
+            )
+
+    def _clear_stale_wandb_service_env(self):
+        for key in (
+            "WANDB_SERVICE",
+            "WANDB_SERVICE_HOST",
+            "WANDB_SERVICE_PORT",
+            "WANDB_SERVICE_TRANSPORT",
+            "WANDB_SERVICE_PID",
+        ):
+            os.environ.pop(key, None)
+
+    def _call_with_hard_timeout(self, fn, timeout, label):
+        if timeout <= 0 or threading.current_thread() is not threading.main_thread() or not hasattr(signal, "SIGALRM"):
+            return fn()
+
+        class WandbTimeout(TimeoutError):
+            pass
+
+        def timeout_handler(signum, frame):
+            raise WandbTimeout(f"{label} exceeded {timeout}s")
+
+        old_handler = signal.getsignal(signal.SIGALRM)
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        try:
+            return fn()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+    def _fallback_to_local_json(self, message):
+        self.disabled = False
+        self.run = None
+        print(message, flush=True)
+        if self.log_dir is not None:
+            self.local_logger = LocalJSONMetricsLogger(self.log_dir)
+        else:
+            self.disabled = True
+
+    def log(self, key, value, step):
+        if self.local_logger is not None:
+            self.local_logger.log(key, value, step)
+            return
+        if self.disabled or self.run is None:
+            return
+        timeout = int(os.environ.get("WANDB_LOG_TIMEOUT", os.environ.get("WANDB_INIT_TIMEOUT", "15")))
+        try:
+            self._call_with_hard_timeout(lambda: self.wandb.log({key: value}, step=step), timeout, "wandb log")
+        except Exception as exc:
+            self._fallback_to_local_json(f"Warning: wandb log failed or timed out at step {step}: {exc}. Switching to local metrics.jsonl.")
+            if self.local_logger is not None:
+                self.local_logger.log(key, value, step)
+
+    def close(self):
+        if self.local_logger is not None:
+            self.local_logger.close()
+            return
+        if self.disabled or self.run is None:
+            return
+        timeout = int(os.environ.get("WANDB_FINISH_TIMEOUT", os.environ.get("WANDB_INIT_TIMEOUT", "15")))
+        try:
+            self._call_with_hard_timeout(lambda: self.wandb.finish(), timeout, "wandb finish")
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            print(f"Warning: wandb finish failed or timed out after {timeout}s: {exc}", flush=True)
 
 
 class ModelLogger:

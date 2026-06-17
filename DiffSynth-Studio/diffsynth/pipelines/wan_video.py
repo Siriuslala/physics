@@ -1435,6 +1435,9 @@ def model_fn_wan_video(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
+    rope_lambda_module = getattr(dit, "spatial_rope_lambda", None)
+    rope_lambda_scales_all = rope_lambda_module(timestep) if rope_lambda_module is not None else None
+
     # VAP 
     if vap is not None:
         # hidden state
@@ -1538,6 +1541,12 @@ def model_fn_wan_video(
         
         # Block
         for block_id, block in enumerate(dit.blocks):
+            rope_lambda_scales = None
+            if rope_lambda_scales_all is not None:
+                if rope_lambda_scales_all.ndim == 1:
+                    rope_lambda_scales = rope_lambda_scales_all
+                else:
+                    rope_lambda_scales = rope_lambda_scales_all[block_id]
             if skip_9th_layer:
                 # This is only used in WanToDance
                 if block_id == 9:
@@ -1563,7 +1572,7 @@ def model_fn_wan_video(
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    x, context, t_mod, freqs, rope_lambda_scales
                 )
               
             

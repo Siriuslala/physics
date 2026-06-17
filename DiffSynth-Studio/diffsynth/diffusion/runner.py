@@ -85,6 +85,190 @@ def build_seeded_dataloader_kwargs(seed, process_index=0):
     return {"generator": generator, "worker_init_fn": seed_worker}
 
 
+
+def get_expected_cache_input_latents_shape(args):
+    """Return the expected compact Wan cache latent shape and frame count.
+
+    Compact Wan T2V cache stores one sample as inputs_shared["input_latents"]
+    with shape (1, z_dim, latent_frames, latent_h, latent_w). For 81 video
+    frames at 480x832, this should be (1, 16, 21, 60, 104).
+    """
+    if args is None or getattr(args, "num_frames", None) is None:
+        return None, None
+    latent_frames = (int(args.num_frames) - 1) // 4 + 1
+    height = getattr(args, "height", None)
+    width = getattr(args, "width", None)
+    if height is None or width is None:
+        return None, latent_frames
+    return (1, 16, latent_frames, int(height) // 8, int(width) // 8), latent_frames
+
+
+def get_cached_input_latents_shape(data):
+    if not (isinstance(data, tuple) and len(data) == 3 and isinstance(data[0], dict)):
+        return None, "not_cached_training_tuple"
+    latents = data[0].get("input_latents")
+    if latents is None:
+        return None, "missing_input_latents"
+    if not torch.is_tensor(latents):
+        return None, f"input_latents_is_{type(latents).__name__}"
+    return tuple(int(dim) for dim in latents.shape), None
+
+
+def validate_cached_input_latents(data, expected_shape, expected_frames):
+    actual_shape, reason = get_cached_input_latents_shape(data)
+    if reason is not None:
+        return False, actual_shape, reason
+    if len(actual_shape) != 5:
+        return False, actual_shape, "input_latents_rank_mismatch"
+    if expected_shape is not None and tuple(actual_shape) != tuple(expected_shape):
+        return False, actual_shape, "input_latents_shape_mismatch"
+    if expected_frames is not None and int(actual_shape[2]) != int(expected_frames):
+        return False, actual_shape, "input_latents_frame_mismatch"
+    return True, actual_shape, None
+
+
+def build_cache_file_signature(paths):
+    total_size = 0
+    max_mtime_ns = 0
+    for path in paths:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        total_size += int(stat.st_size)
+        max_mtime_ns = max(max_mtime_ns, int(stat.st_mtime_ns))
+    return {
+        "count": len(paths),
+        "total_size": total_size,
+        "max_mtime_ns": max_mtime_ns,
+        "first_path": paths[0] if paths else None,
+        "last_path": paths[-1] if paths else None,
+    }
+
+
+def get_cache_latent_filter_index_path(dataset, expected_shape, expected_frames):
+    base_path = getattr(dataset, "base_path", None) or "."
+    if expected_shape is not None:
+        shape_token = "shape_" + "x".join(str(dim) for dim in expected_shape)
+    else:
+        shape_token = f"frames_{expected_frames}"
+    return os.path.join(base_path, f"_valid_cache_input_latents_{shape_token}.json")
+
+
+def read_cache_latent_filter_index(index_path, expected_shape, expected_frames, signature):
+    if not os.path.exists(index_path):
+        return None
+    try:
+        with open(index_path, "r") as f:
+            index = json.load(f)
+    except Exception as exc:
+        print(f"Warning: failed to read cache latent filter index {index_path}: {exc}", flush=True)
+        return None
+    if index.get("expected_shape") != (list(expected_shape) if expected_shape is not None else None):
+        return None
+    if index.get("expected_frames") != expected_frames:
+        return None
+    if index.get("source_signature") != signature:
+        return None
+    return index
+
+
+def write_cache_latent_filter_index(index_path, index):
+    os.makedirs(os.path.dirname(index_path), exist_ok=True)
+    tmp_path = f"{index_path}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, index_path)
+
+
+def scan_cache_input_latents(paths, expected_shape, expected_frames, index_path):
+    valid_files = []
+    invalid_records = []
+    invalid_jsonl_path = f"{index_path}.invalid.jsonl"
+    with open(invalid_jsonl_path, "w") as invalid_file:
+        for path in tqdm(paths, desc="Validate cache latents"):
+            data = None
+            try:
+                data = torch.load(path, map_location="cpu", weights_only=False)
+                is_valid, actual_shape, reason = validate_cached_input_latents(data, expected_shape, expected_frames)
+            except Exception as exc:
+                is_valid, actual_shape, reason = False, None, f"load_failed: {exc}"
+            finally:
+                del data
+            if is_valid:
+                valid_files.append(path)
+            else:
+                record = {
+                    "path": path,
+                    "reason": reason,
+                    "expected_shape": list(expected_shape) if expected_shape is not None else None,
+                    "expected_frames": expected_frames,
+                    "actual_shape": list(actual_shape) if actual_shape is not None else None,
+                }
+                invalid_records.append(record)
+                invalid_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return valid_files, invalid_records, invalid_jsonl_path
+
+
+def filter_cached_dataset_by_input_latents(dataset, args, accelerator):
+    if args is None or not getattr(args, "cache_filter_invalid_latents", True):
+        return dataset
+    if not getattr(dataset, "load_from_cache", False):
+        return dataset
+    if not hasattr(dataset, "cached_data"):
+        return dataset
+
+    cached_files = list(dataset.cached_data)
+    expected_shape, expected_frames = get_expected_cache_input_latents_shape(args)
+    if expected_frames is None:
+        return dataset
+    signature = build_cache_file_signature(cached_files)
+    index_path = get_cache_latent_filter_index_path(dataset, expected_shape, expected_frames)
+    rebuild_index = bool(getattr(args, "cache_filter_invalid_latents_rebuild_index", False))
+
+    if accelerator.is_main_process:
+        index = None if rebuild_index else read_cache_latent_filter_index(index_path, expected_shape, expected_frames, signature)
+        if index is None:
+            print(
+                "Validating cached Wan input_latents before training: "
+                f"expected_shape={expected_shape}, expected_frames={expected_frames}, files={len(cached_files)}.",
+                flush=True,
+            )
+            valid_files, invalid_records, invalid_jsonl_path = scan_cache_input_latents(cached_files, expected_shape, expected_frames, index_path)
+            index = {
+                "expected_shape": list(expected_shape) if expected_shape is not None else None,
+                "expected_frames": expected_frames,
+                "source_signature": signature,
+                "valid_files": valid_files,
+                "invalid_count": len(invalid_records),
+                "invalid_jsonl_path": invalid_jsonl_path,
+            }
+            write_cache_latent_filter_index(index_path, index)
+        else:
+            print(f"Using cached latent filter index: {index_path}", flush=True)
+    accelerator.wait_for_everyone()
+
+    index = read_cache_latent_filter_index(index_path, expected_shape, expected_frames, signature)
+    if index is None:
+        raise RuntimeError(f"Cache latent filter index is missing or stale after synchronization: {index_path}")
+    valid_files = index.get("valid_files", [])
+    invalid_count = int(index.get("invalid_count", max(0, len(cached_files) - len(valid_files))))
+    if len(valid_files) == 0:
+        raise ValueError(
+            "No valid cache files remain after input_latents filtering. "
+            f"Expected shape={expected_shape}, expected_frames={expected_frames}. "
+            f"Invalid records: {index.get('invalid_jsonl_path')}"
+        )
+    dataset.cached_data = valid_files
+    if accelerator.is_main_process:
+        print(
+            "Cache latent filter active: "
+            f"valid={len(valid_files)}, invalid={invalid_count}, total={len(cached_files)}, "
+            f"index={index_path}, invalid_log={index.get('invalid_jsonl_path')}",
+            flush=True,
+        )
+    return dataset
+
 def launch_training_task(
     accelerator: Accelerator,
     dataset: torch.utils.data.Dataset,
@@ -136,12 +320,24 @@ def launch_training_task(
         customized_optimizer = args.customized_optimizer
         seed = args.seed
 
+    dataset = filter_cached_dataset_by_input_latents(dataset, args, accelerator)
+
     total_update_steps = compute_total_update_steps(
         dataset, dataset_batch_size, gradient_accumulation_steps, num_epochs, max_train_steps,
         num_processes=accelerator.num_processes,
     )
     if warmup_steps <= 0 and warmup_ratio > 0:
         warmup_steps = int(total_update_steps * warmup_ratio)
+    if accelerator.is_main_process:
+        effective_global_batch = max(1, dataset_batch_size) * max(1, accelerator.num_processes) * max(1, gradient_accumulation_steps)
+        print(
+            "Training schedule: "
+            f"dataset_size={len(dataset)}, dataset_batch_size={dataset_batch_size}, "
+            f"num_processes={accelerator.num_processes}, gradient_accumulation_steps={gradient_accumulation_steps}, "
+            f"effective_global_batch={effective_global_batch}, total_update_steps={total_update_steps}, "
+            f"warmup_steps={warmup_steps}, lr_scheduler={lr_scheduler}.",
+            flush=True,
+        )
 
     optimizer_class = get_optimizer_class(customized_optimizer)
     if hasattr(model, "get_optimizer_param_groups"):
@@ -166,13 +362,18 @@ def launch_training_task(
         **dataloader_seed_kwargs,
     )
 
+    # Keep the LR scheduler outside accelerator.prepare(). Accelerate's
+    # AcceleratedScheduler advances the wrapped scheduler num_processes times
+    # when split_batches=False, while warmup_steps/total_update_steps here are
+    # already defined in global optimizer-update steps. We therefore step the
+    # raw scheduler manually exactly once per real optimizer update.
     if enable_model_cpu_offload:
-        optimizer, dataloader, scheduler = accelerator.prepare(optimizer, dataloader, scheduler)
+        optimizer, dataloader = accelerator.prepare(optimizer, dataloader)
         model.pipe.device = accelerator.device
         offload_manager = OffloadTrainingManager(model, accelerator.device, enable_optimizer_cpu_offload, cpu_offload_split_threshold)
     else:
         model.to(device=accelerator.device)
-        model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+        model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
     stop_training = False
@@ -206,7 +407,10 @@ def launch_training_task(
                 if accelerator.sync_gradients and max_grad_norm is not None and max_grad_norm > 0:
                     accelerator.clip_grad_norm_(accelerator.unwrap_model(model).trainable_modules(), max_grad_norm)
                 optimizer.step()
-                scheduler.step()
+                if accelerator.sync_gradients:
+                    step_was_skipped = bool(getattr(optimizer, "step_was_skipped", False))
+                    if not step_was_skipped:
+                        scheduler.step()
                 optimizer.zero_grad()
                 if accelerator.sync_gradients:
                     metrics = {"lr": float(optimizer.param_groups[0]["lr"])}
