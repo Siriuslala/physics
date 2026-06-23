@@ -1,4 +1,4 @@
-import os, math, json, torch, importlib, time, threading, queue, random
+import os, math, json, torch, importlib, time, threading, queue, random, shutil
 from tqdm import tqdm
 from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
@@ -83,6 +83,156 @@ def build_seeded_dataloader_kwargs(seed, process_index=0):
         torch.manual_seed(worker_seed)
 
     return {"generator": generator, "worker_init_fn": seed_worker}
+
+
+RESUME_STRICT_KEYS = (
+    "dataset_base_path", "dataset_metadata_path", "dataset_repeat", "dataset_num_workers",
+    "dataset_batch_size", "data_file_keys", "height", "width", "max_pixels", "num_frames",
+    "model_paths", "model_id_with_origin_paths", "tokenizer_path", "audio_processor_path",
+    "extra_inputs", "fp8_models", "task", "output_path", "remove_prefix_in_ckpt", "save_steps",
+    "learning_rate", "num_epochs", "max_train_steps", "lr_scheduler", "warmup_ratio",
+    "warmup_steps", "trainable_models", "find_unused_parameters", "weight_decay", "adam_beta1",
+    "adam_beta2", "adam_epsilon", "max_grad_norm", "customized_optimizer",
+    "enable_batched_sft", "seed", "deterministic", "lora_base_model", "lora_target_modules",
+    "lora_rank", "lora_alpha", "lora_checkpoint", "preset_lora_path", "preset_lora_model",
+    "use_gradient_checkpointing", "use_gradient_checkpointing_offload", "gradient_accumulation_steps",
+    "enable_model_cpu_offload", "enable_optimizer_cpu_offload", "cpu_offload_split_threshold",
+    "min_timestep_boundary", "max_timestep_boundary", "timestep_sampling_strategy",
+    "timestep_mixture_early_boundary", "timestep_mixture_early_prob", "video_sampling_mode",
+    "video_clip_seconds", "video_output_format", "cache_filter_invalid_latents",
+    "cache_filter_invalid_latents_rebuild_index", "wan_spatial_rope_lambda_enabled",
+    "wan_spatial_rope_lambda_scope", "wan_spatial_rope_lambda_learn_f",
+    "wan_spatial_rope_lambda_timestep_conditioned", "wan_spatial_rope_lambda_hidden_dim",
+    "wan_spatial_rope_lambda_lr", "wan_spatial_rope_lambda_beta",
+)
+
+
+def get_latest_training_state_dir(output_path):
+    return os.path.join(output_path, "training_state_latest")
+
+
+def resolve_resume_training_state(args):
+    if args is None:
+        return None
+    if getattr(args, "resume_from_latest_state", False):
+        return get_latest_training_state_dir(args.output_path)
+    path = getattr(args, "resume_training_state", None)
+    return path if path else None
+
+
+def load_trainer_state(state_dir):
+    path = os.path.join(state_dir, "trainer_state.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing trainer_state.json in resume state: {state_dir}")
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def read_saved_wandb_run_id(output_path):
+    path = os.path.join(output_path, "wandb_log", "wandb_run_id.txt")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            run_id = f.read().strip()
+    except OSError:
+        return None
+    return run_id or None
+
+
+def get_current_wandb_run_id(output_path):
+    return os.environ.get("WANDB_RUN_ID") or read_saved_wandb_run_id(output_path)
+
+
+def find_saved_wandb_run_dir(output_path, run_id=None):
+    explicit_path = os.path.join(output_path, "wandb_log", "wandb_run_dir.txt")
+    if os.path.exists(explicit_path):
+        try:
+            with open(explicit_path, "r") as f:
+                path = f.read().strip()
+        except OSError:
+            path = None
+        if path and os.path.isdir(path):
+            return path
+
+    wandb_dir = os.path.join(output_path, "wandb_log", "wandb")
+    if not os.path.isdir(wandb_dir):
+        return None
+    candidates = []
+    for name in os.listdir(wandb_dir):
+        if not name.startswith("offline-run-"):
+            continue
+        if run_id and not name.endswith(str(run_id)):
+            continue
+        path = os.path.join(wandb_dir, name)
+        if os.path.isdir(path):
+            candidates.append(path)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: os.path.getmtime(path))
+    return candidates[0]
+
+
+def comparable_args(args):
+    raw = vars(args) if args is not None else {}
+    return {key: raw.get(key) for key in RESUME_STRICT_KEYS}
+
+
+def skip_first_dataloader_batches(accelerator, dataloader, num_batches):
+    if num_batches <= 0:
+        return dataloader
+    if hasattr(accelerator, "skip_first_batches"):
+        return accelerator.skip_first_batches(dataloader, num_batches)
+
+    def iterator():
+        for batch_id, batch in enumerate(dataloader):
+            if batch_id >= num_batches:
+                yield batch
+    return iterator()
+
+
+def validate_resume_args(args, trainer_state, num_processes):
+    saved_args = trainer_state.get("training_args", {})
+    current_args = comparable_args(args)
+    mismatches = []
+    for key in RESUME_STRICT_KEYS:
+        if saved_args.get(key) != current_args.get(key):
+            mismatches.append((key, saved_args.get(key), current_args.get(key)))
+    saved_processes = trainer_state.get("num_processes")
+    if saved_processes != num_processes:
+        mismatches.append(("num_processes", saved_processes, num_processes))
+    if mismatches:
+        lines = ["Resume parameter mismatch detected. Keep these parameters unchanged when resuming:"]
+        for key, old, new in mismatches:
+            lines.append(f"  {key}: checkpoint={old!r}, current={new!r}")
+        raise ValueError("\n".join(lines))
+
+
+def save_training_state(accelerator, output_path, step, epoch_id, dataloader_batches_seen, args, total_update_steps):
+    if args is None or not getattr(args, "save_training_state", False):
+        return
+    state_dir = get_latest_training_state_dir(output_path)
+    if accelerator.is_main_process and os.path.isdir(state_dir):
+        shutil.rmtree(state_dir)
+    accelerator.wait_for_everyone()
+    accelerator.save_state(state_dir)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        trainer_state = {
+            "global_step": int(step),
+            "epoch_id": int(epoch_id),
+            "dataloader_batches_seen": int(dataloader_batches_seen),
+            "gradient_accumulation_steps": int(getattr(args, "gradient_accumulation_steps", 1)),
+            "dataset_batch_size": int(getattr(args, "dataset_batch_size", 1)),
+            "num_processes": int(accelerator.num_processes),
+            "total_update_steps": int(total_update_steps),
+            "wandb_run_id": get_current_wandb_run_id(output_path),
+            "training_args": comparable_args(args),
+        }
+        with open(os.path.join(state_dir, "trainer_state.json"), "w") as f:
+            json.dump(trainer_state, f, indent=2, sort_keys=True)
+        with open(os.path.join(state_dir, "training_args.json"), "w") as f:
+            json.dump(vars(args), f, indent=2, sort_keys=True)
 
 
 
@@ -298,6 +448,25 @@ def launch_training_task(
     max_grad_norm = 1.0
     enable_batched_sft = False
     seed = None
+    resume_state_dir = resolve_resume_training_state(args)
+    resume_trainer_state = None
+    resume_batches_to_skip = 0
+    dataloader_batches_seen = 0
+    if resume_state_dir is not None:
+        if not os.path.isdir(resume_state_dir):
+            raise FileNotFoundError(f"Resume training state not found: {resume_state_dir}")
+        resume_trainer_state = load_trainer_state(resume_state_dir)
+        wandb_run_id = os.environ.get("WANDB_RUN_ID") or resume_trainer_state.get("wandb_run_id")
+        if not wandb_run_id and args is not None:
+            wandb_run_id = read_saved_wandb_run_id(args.output_path)
+        if wandb_run_id:
+            os.environ["WANDB_RUN_ID"] = str(wandb_run_id)
+        if args is not None:
+            wandb_run_dir = find_saved_wandb_run_dir(args.output_path, wandb_run_id)
+            if wandb_run_dir:
+                os.environ["WANDB_OFFLINE_RUN_DIR"] = str(wandb_run_dir)
+        dataloader_batches_seen = int(resume_trainer_state.get("dataloader_batches_seen", 0))
+        resume_batches_to_skip = dataloader_batches_seen
     if args is not None:
         learning_rate = args.learning_rate
         weight_decay = args.weight_decay
@@ -319,6 +488,11 @@ def launch_training_task(
         cpu_offload_split_threshold = args.cpu_offload_split_threshold
         customized_optimizer = args.customized_optimizer
         seed = args.seed
+
+    if resume_trainer_state is not None:
+        validate_resume_args(args, resume_trainer_state, accelerator.num_processes)
+        if accelerator.is_main_process:
+            print(f"Resuming full training state from {resume_state_dir}", flush=True)
 
     dataset = filter_cached_dataset_by_input_latents(dataset, args, accelerator)
 
@@ -352,6 +526,7 @@ def launch_training_task(
         eps=adam_epsilon,
     )
     scheduler = get_scheduler(optimizer, lr_scheduler, warmup_steps, total_update_steps)
+    accelerator.register_for_checkpointing(scheduler)
     dataloader_seed_kwargs = build_seeded_dataloader_kwargs(seed, accelerator.process_index)
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -375,22 +550,56 @@ def launch_training_task(
         model.to(device=accelerator.device)
         model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
+    if resume_state_dir is not None:
+        accelerator.load_state(resume_state_dir)
+        model_logger.num_steps = int(resume_trainer_state.get("global_step", 0))
+        if accelerator.is_main_process:
+            print(
+                f"Loaded training state: global_step={model_logger.num_steps}, "
+                f"dataloader_batches_seen={dataloader_batches_seen}.",
+                flush=True,
+            )
+
     initialize_deepspeed_gradient_checkpointing(accelerator)
     stop_training = False
+    last_epoch_id = int(resume_trainer_state.get("epoch_id", 0)) if resume_trainer_state is not None else 0
     progress_bar = tqdm(
         total=total_update_steps,
         initial=model_logger.num_steps,
         disable=not accelerator.is_main_process,
         desc="Train steps",
     )
+    if max_train_steps is not None and max_train_steps > 0 and model_logger.num_steps >= max_train_steps:
+        stop_training = True
+        if accelerator.is_main_process:
+            print(f"Resume state already reached max_train_steps={max_train_steps}; no extra optimizer step is run.", flush=True)
     for epoch_id in range(num_epochs):
-        for batch in dataloader:
+        last_epoch_id = epoch_id
+        if stop_training:
+            break
+        if resume_batches_to_skip > 0:
+            epoch_batches = len(dataloader)
+            if resume_batches_to_skip >= epoch_batches:
+                for _ in dataloader:
+                    pass
+                resume_batches_to_skip -= epoch_batches
+                continue
+            epoch_dataloader = skip_first_dataloader_batches(accelerator, dataloader, resume_batches_to_skip)
+            resume_batches_to_skip = 0
+        else:
+            epoch_dataloader = dataloader
+        for batch in epoch_dataloader:
+            dataloader_batches_seen += 1
             with accelerator.accumulate(model):
                 loss = None
+                logging_loss = None
                 if enable_batched_sft:
                     loss = model(batch)
                     accelerator.backward(loss)
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    logging_loss = unwrapped_model.get_logging_loss(loss) if hasattr(unwrapped_model, "get_logging_loss") else loss
                     loss = loss.detach()
+                    logging_loss = logging_loss.detach() if torch.is_tensor(logging_loss) else logging_loss
                 else:
                     micro_batches = iter_micro_batches(batch)
                     micro_batch_count = max(1, len(micro_batches))
@@ -399,9 +608,13 @@ def launch_training_task(
                             micro_loss = model({}, inputs=data)
                         else:
                             micro_loss = model(data)
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        micro_logging_loss = unwrapped_model.get_logging_loss(micro_loss) if hasattr(unwrapped_model, "get_logging_loss") else micro_loss
                         micro_loss = micro_loss / micro_batch_count
+                        micro_logging_loss = micro_logging_loss / micro_batch_count
                         accelerator.backward(micro_loss)
                         loss = micro_loss.detach() if loss is None else loss + micro_loss.detach()
+                        logging_loss = micro_logging_loss.detach() if logging_loss is None else logging_loss + micro_logging_loss.detach()
                 if enable_model_cpu_offload:
                     offload_manager.after_backward()
                 if accelerator.sync_gradients and max_grad_norm is not None and max_grad_norm > 0:
@@ -420,7 +633,9 @@ def launch_training_task(
                     unwrapped_model = accelerator.unwrap_model(model)
                     if hasattr(unwrapped_model, "get_training_metrics"):
                         metrics.update(unwrapped_model.get_training_metrics())
-                    model_logger.on_step_end(accelerator, model, save_steps, loss=loss, metrics=metrics)
+                    model_logger.on_step_end(accelerator, model, save_steps, loss=logging_loss, metrics=metrics)
+                    if save_steps is not None and model_logger.num_steps % save_steps == 0:
+                        save_training_state(accelerator, model_logger.output_path, model_logger.num_steps, epoch_id, dataloader_batches_seen, args, total_update_steps)
                     progress_bar.update(1)
                     progress_bar.set_postfix(loss=float(loss.detach().float().cpu()) if loss is not None else None)
                     if max_train_steps is not None and max_train_steps > 0 and model_logger.num_steps >= max_train_steps:
@@ -428,11 +643,13 @@ def launch_training_task(
                         break
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
+            save_training_state(accelerator, model_logger.output_path, model_logger.num_steps, epoch_id, dataloader_batches_seen, args, total_update_steps)
         if stop_training:
             break
 
     progress_bar.close()
     model_logger.on_training_end(accelerator, model, save_steps)
+    save_training_state(accelerator, model_logger.output_path, model_logger.num_steps, last_epoch_id, dataloader_batches_seen, args, total_update_steps)
 
 
 

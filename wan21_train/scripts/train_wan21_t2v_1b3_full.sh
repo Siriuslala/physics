@@ -77,6 +77,8 @@ MAX_GRAD_NORM=1.0
 NUM_EPOCHS=1
 MAX_TRAIN_STEPS=
 SAVE_STEPS=500
+SAVE_TRAINING_STATE=1
+RESUME_TRAINING=0  # 0 | auto | /path/to/training_state_latest
 
 # Timestep sampling settings ==============================
 MIN_TIMESTEP_BOUNDARY=0.0
@@ -131,6 +133,11 @@ case "$TIMESTEP_SAMPLING_STRATEGY" in
     ;;
 esac
 EXP_NAME="bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-${TIMESTEP_TOKEN}-seed_${SEED}"
+WANDB_NAME="$EXP_NAME"
+WANDB_RUN_ID=
+WANDB_RESUME=allow
+if [[ -n "$WANDB_RUN_ID" ]]; then export WANDB_RUN_ID; else unset WANDB_RUN_ID; fi
+export WANDB_RESUME
 OUTPUT_PATH=$TRAIN_ROOT/$EXP_NAME
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 
@@ -177,6 +184,14 @@ fi
 if [[ "$ENABLE_BATCHED_SFT" == "1" ]]; then
   TRAIN_ARGS+=(--enable_batched_sft)
 fi
+if [[ "$SAVE_TRAINING_STATE" == "1" ]]; then
+  TRAIN_ARGS+=(--save_training_state)
+fi
+case "$RESUME_TRAINING" in
+  0|""|none) ;;
+  auto) TRAIN_ARGS+=(--resume_from_latest_state) ;;
+  *) TRAIN_ARGS+=(--resume_training_state "$RESUME_TRAINING") ;;
+esac
 if [[ "$FIND_UNUSED_PARAMETERS" == "1" ]]; then
   TRAIN_ARGS+=(--find_unused_parameters)
 fi

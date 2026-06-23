@@ -179,7 +179,23 @@ class WanTrainingModule(DiffusionTrainingModule):
             return {}
         metrics = module.summary()
         metrics["lambda/beta"] = float(self.wan_spatial_rope_lambda_beta)
+        lambda_reg_loss = getattr(self, "_last_lambda_reg_loss", None)
+        if lambda_reg_loss is not None:
+            metrics["lambda_reg_loss"] = lambda_reg_loss
         return metrics
+
+    def get_logging_loss(self, fallback_loss=None):
+        flow_loss = getattr(self, "_last_flow_matching_loss", None)
+        return fallback_loss if flow_loss is None else flow_loss
+
+    def add_wan_spatial_rope_lambda_regularization(self, flow_matching_loss):
+        self._last_flow_matching_loss = flow_matching_loss.detach() if torch.is_tensor(flow_matching_loss) else None
+        self._last_lambda_reg_loss = None
+        reg_loss = self.get_wan_spatial_rope_lambda_regularization()
+        if reg_loss is None:
+            return flow_matching_loss
+        self._last_lambda_reg_loss = float(reg_loss.detach().float().cpu())
+        return flow_matching_loss + reg_loss
 
     def get_wan_spatial_rope_lambda_regularization(self):
         if not self.wan_spatial_rope_lambda_enabled or self.wan_spatial_rope_lambda_beta <= 0:
@@ -391,7 +407,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             group_loss = FlowMatchSFTLoss(self.pipe, **inputs)
             group_loss = group_loss * (len(group) / total_size)
             loss = group_loss if loss is None else loss + group_loss
-        return loss
+        return self.add_wan_spatial_rope_lambda_regularization(loss)
 
     def is_cached_training_inputs(self, inputs):
         return (
@@ -532,9 +548,8 @@ class WanTrainingModule(DiffusionTrainingModule):
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         loss = self.task_to_loss[self.task](self.pipe, *inputs)
-        reg_loss = self.get_wan_spatial_rope_lambda_regularization()
-        if reg_loss is not None:
-            loss = loss + reg_loss
+        if torch.is_tensor(loss):
+            loss = self.add_wan_spatial_rope_lambda_regularization(loss)
         if self.compact_cache and self.task == "sft:data_process":
             loss = self.compact_wan_t2v_sft_cache(loss)
         return loss
@@ -664,8 +679,9 @@ if __name__ == "__main__":
     )
     if accelerator.is_main_process:
         os.makedirs(args.output_path, exist_ok=True)
-        with open(os.path.join(args.output_path, "training_args.json"), "w") as f:
-            json.dump(vars(args), f, indent=2, sort_keys=True)
+        if not (args.resume_from_latest_state or args.resume_training_state):
+            with open(os.path.join(args.output_path, "training_args.json"), "w") as f:
+                json.dump(vars(args), f, indent=2, sort_keys=True)
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,

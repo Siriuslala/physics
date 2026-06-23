@@ -24,8 +24,8 @@ export DIFFSYNTH_SKIP_DOWNLOAD=true
 export CUDA_VISIBLE_DEVICES=3
 NUM_PROCESSES=1
 
-# export CUDA_VISIBLE_DEVICES=0,1
-# NUM_PROCESSES=2
+export CUDA_VISIBLE_DEVICES=5,6
+NUM_PROCESSES=2
 
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then LAUNCH_MODE=multi; else LAUNCH_MODE=single; fi
 
@@ -71,7 +71,7 @@ VIDEO_CLIP_SECONDS=5.0
 # With ENABLE_BATCHED_SFT=1, standard Wan T2V SFT uses DATASET_BATCH_SIZE as real per-process batch size.
 # Effective global batch = DATASET_BATCH_SIZE * NUM_PROCESSES * GRADIENT_ACCUMULATION_STEPS.
 GLOBAL_BATCH_SIZE=16
-DATASET_BATCH_SIZE=8  # batchsize per forward
+DATASET_BATCH_SIZE=1  # batchsize per forward
 ENABLE_BATCHED_SFT=1
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then WORLD_SIZE=$NUM_PROCESSES; else WORLD_SIZE=1; fi
 GRADIENT_ACCUMULATION_STEPS=$(( (GLOBAL_BATCH_SIZE + DATASET_BATCH_SIZE * WORLD_SIZE - 1) / (DATASET_BATCH_SIZE * WORLD_SIZE) ))
@@ -87,15 +87,17 @@ MAX_GRAD_NORM=1.0
 NUM_EPOCHS=3
 MAX_TRAIN_STEPS=3000
 SAVE_STEPS=100
+SAVE_TRAINING_STATE=1
+RESUME_TRAINING=0  # 0 | auto | /path/to/training_state_latest
 
 # Timestep sampling settings ==============================
 MIN_TIMESTEP_BOUNDARY=0.0
 MAX_TIMESTEP_BOUNDARY=1.0
-TIMESTEP_SAMPLING_STRATEGY=uniform  # uniform | early_rest_mixture
-TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.12
-TIMESTEP_MIXTURE_EARLY_PROB=0.5
+TIMESTEP_SAMPLING_STRATEGY=early_rest_mixture  # uniform | early_rest_mixture
+TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.10
+TIMESTEP_MIXTURE_EARLY_PROB=0.8
 
-LORA_RANK=32
+LORA_RANK=64
 LORA_ALPHA=32
 LORA_MODULE_PRESET=attn  # attn | ffn | attn_ffn
 case "$LORA_MODULE_PRESET" in
@@ -166,6 +168,10 @@ case "$TIMESTEP_SAMPLING_STRATEGY" in
 esac
 EXP_NAME="bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lora_rank_${LORA_RANK}-lora_alpha_${LORA_ALPHA}-lora_modules_${LORA_MODULE_PRESET}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-${TIMESTEP_TOKEN}-seed_${SEED}"
 WANDB_NAME="$EXP_NAME"
+WANDB_RUN_ID=
+WANDB_RESUME=allow
+if [[ -n "$WANDB_RUN_ID" ]]; then export WANDB_RUN_ID; else unset WANDB_RUN_ID; fi
+export WANDB_RESUME
 OUTPUT_PATH=$TRAIN_ROOT/$EXP_NAME
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 
@@ -221,6 +227,14 @@ fi
 if [[ "$ENABLE_BATCHED_SFT" == "1" ]]; then
   TRAIN_ARGS+=(--enable_batched_sft)
 fi
+if [[ "$SAVE_TRAINING_STATE" == "1" ]]; then
+  TRAIN_ARGS+=(--save_training_state)
+fi
+case "$RESUME_TRAINING" in
+  0|""|none) ;;
+  auto) TRAIN_ARGS+=(--resume_from_latest_state) ;;
+  *) TRAIN_ARGS+=(--resume_training_state "$RESUME_TRAINING") ;;
+esac
 if [[ "$FIND_UNUSED_PARAMETERS" == "1" ]]; then
   TRAIN_ARGS+=(--find_unused_parameters)
 fi

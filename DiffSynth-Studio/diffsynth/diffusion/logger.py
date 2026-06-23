@@ -1,5 +1,57 @@
-import json, os, signal, threading, torch
+import json, os, re, signal, threading, time, torch
 from accelerate import Accelerator
+
+
+def parse_wandb_offline_run_dir(path):
+    """Return (timespec, run_id) for an offline-run directory name."""
+    if not path:
+        return None, None
+    name = os.path.basename(os.path.normpath(path))
+    match = re.match(r"^offline-run-(\d{8}_\d{6})-(.+?)(?:-\d+)?$", name)
+    if match is None:
+        return None, None
+    return match.group(1), match.group(2)
+
+
+def wandb_timespec_to_timestamp(timespec):
+    if not timespec:
+        return None
+    try:
+        return time.mktime(time.strptime(timespec, "%Y%m%d_%H%M%S"))
+    except ValueError:
+        return None
+
+
+def read_wandb_max_logged_step(run_dir, run_id=None):
+    if not run_dir or not os.path.isdir(run_dir):
+        return -1
+    files = []
+    if run_id:
+        candidate = os.path.join(run_dir, f"run-{run_id}.wandb")
+        if os.path.exists(candidate):
+            files.append(candidate)
+    if not files:
+        for name in os.listdir(run_dir):
+            if name.startswith("run-") and name.endswith(".wandb"):
+                files.append(os.path.join(run_dir, name))
+    max_step = -1
+    for file_path in files:
+        try:
+            from wandb.proto import wandb_internal_pb2 as pb
+            from wandb.sdk.internal.datastore import DataStore
+            store = DataStore()
+            store.open_for_scan(file_path)
+            while True:
+                data = store.scan_data()
+                if data is None:
+                    break
+                record = pb.Record()
+                record.ParseFromString(data)
+                if record.history.item:
+                    max_step = max(max_step, int(record.history.step.num))
+        except Exception as exc:
+            print(f"Warning: failed to scan wandb history from {file_path}: {exc}", flush=True)
+    return max_step
 
 
 class TensorBoardLogger:
@@ -57,6 +109,8 @@ class WandbLogger:
         self.disabled = False
         self.local_logger = None
         self.log_dir = log_dir
+        self.offline_run_dir = os.environ.get("WANDB_OFFLINE_RUN_DIR") or None
+        self.max_logged_step = -1
         if log_dir is not None:
             os.makedirs(log_dir, exist_ok=True)
 
@@ -88,11 +142,47 @@ class WandbLogger:
             import wandb
             self.wandb = wandb
             settings = self.wandb.Settings(init_timeout=timeout)
-            self.run = self._call_with_hard_timeout(
-                lambda: self.wandb.init(project=project_name, dir=log_dir, mode=requested_mode, settings=settings),
-                timeout,
-                f"wandb {requested_mode} init",
+            offline_timespec, offline_run_id = parse_wandb_offline_run_dir(self.offline_run_dir)
+            offline_start_time = wandb_timespec_to_timestamp(offline_timespec)
+            raw_run_id = os.environ.get("WANDB_RUN_ID")
+            if raw_run_id is not None and raw_run_id.strip() == "":
+                os.environ.pop("WANDB_RUN_ID", None)
+                raw_run_id = None
+            run_id = raw_run_id or offline_run_id or None
+            run_name = os.environ.get("WANDB_NAME") or None
+            resume = os.environ.get("WANDB_RESUME", "allow") if run_id is not None else None
+            init_fn = lambda: self.wandb.init(
+                project=project_name,
+                dir=log_dir,
+                mode=requested_mode,
+                settings=settings,
+                id=run_id,
+                name=run_name,
+                resume=resume,
             )
+            if requested_mode in ("offline", "dryrun") and self.offline_run_dir and offline_start_time is not None:
+                self.run = self._call_with_hard_timeout(
+                    lambda: self._init_existing_offline_run(init_fn, offline_start_time),
+                    timeout,
+                    f"wandb {requested_mode} init",
+                )
+            else:
+                self.run = self._call_with_hard_timeout(
+                    init_fn,
+                    timeout,
+                    f"wandb {requested_mode} init",
+                )
+            if self.run is not None and log_dir is not None:
+                with open(os.path.join(log_dir, "wandb_run_id.txt"), "w") as f:
+                    f.write(str(self.run.id))
+                run_dir = getattr(getattr(self.run, "_settings", None), "sync_dir", None)
+                if run_dir:
+                    with open(os.path.join(log_dir, "wandb_run_dir.txt"), "w") as f:
+                        f.write(str(run_dir))
+                    if self.offline_run_dir:
+                        self.max_logged_step = read_wandb_max_logged_step(run_dir, str(self.run.id))
+                        if self.max_logged_step >= 0:
+                            print(f"Wandb offline resume will skip existing logged steps <= {self.max_logged_step} in {run_dir}.", flush=True)
             if requested_mode == "offline":
                 print(
                     f"Wandb is enabled offline. Project: {project_name}. "
@@ -108,6 +198,34 @@ class WandbLogger:
                 f"Warning: wandb {requested_mode} init failed or timed out after {timeout}s: {exc}. "
                 "Falling back to local metrics.jsonl and continuing training."
             )
+
+
+    def _init_existing_offline_run(self, init_fn, offline_start_time):
+        """Force wandb offline resume to reuse the original offline-run directory.
+
+        wandb 0.27 ignores resume=... in offline mode and appends a numeric
+        suffix when the sync directory already exists. For checkpoint resume we
+        want the local run directory to remain stable, so we temporarily fix the
+        run start time and disable the suffix bump only for this init call.
+        """
+        from wandb.sdk import wandb_init
+
+        original_time = wandb_init.time.time
+        original_set_suffix = wandb_init._WandbInit.set_sync_dir_suffix
+
+        def fixed_time():
+            return offline_start_time
+
+        def no_sync_dir_suffix(self, settings):
+            return None
+
+        try:
+            wandb_init.time.time = fixed_time
+            wandb_init._WandbInit.set_sync_dir_suffix = no_sync_dir_suffix
+            return init_fn()
+        finally:
+            wandb_init.time.time = original_time
+            wandb_init._WandbInit.set_sync_dir_suffix = original_set_suffix
 
     def _clear_stale_wandb_service_env(self):
         for key in (
@@ -148,6 +266,8 @@ class WandbLogger:
             self.disabled = True
 
     def log(self, key, value, step):
+        if int(step) <= self.max_logged_step:
+            return
         if self.local_logger is not None:
             self.local_logger.log(key, value, step)
             return

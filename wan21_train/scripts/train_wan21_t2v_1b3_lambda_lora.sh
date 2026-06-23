@@ -21,7 +21,7 @@ export DIFFSYNTH_SKIP_DOWNLOAD=true
 
 
 # GPU settings ==============================
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=3
 NUM_PROCESSES=1
 
 # export CUDA_VISIBLE_DEVICES=5,6
@@ -51,7 +51,7 @@ VIDEO_CLIP_SECONDS=5.0
 
 # Hyper-params settings ==============================
 GLOBAL_BATCH_SIZE=16
-DATASET_BATCH_SIZE=1
+DATASET_BATCH_SIZE=4
 ENABLE_BATCHED_SFT=1
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then WORLD_SIZE=$NUM_PROCESSES; else WORLD_SIZE=1; fi
 GRADIENT_ACCUMULATION_STEPS=$(( (GLOBAL_BATCH_SIZE + DATASET_BATCH_SIZE * WORLD_SIZE - 1) / (DATASET_BATCH_SIZE * WORLD_SIZE) ))
@@ -67,13 +67,15 @@ MAX_GRAD_NORM=1.0
 NUM_EPOCHS=3
 MAX_TRAIN_STEPS=3000
 SAVE_STEPS=100
+SAVE_TRAINING_STATE=1
+RESUME_TRAINING=0  # 0 | auto | /path/to/training_state_latest
 
 # Full-range training is [0.0, 1.0]. Do not set min=max; DiffSynth requires min < max.
 MIN_TIMESTEP_BOUNDARY=0.0
 MAX_TIMESTEP_BOUNDARY=1.0
 TIMESTEP_SAMPLING_STRATEGY=early_rest_mixture  # uniform | early_rest_mixture
-TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.14
-TIMESTEP_MIXTURE_EARLY_PROB=0.60
+TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.10
+TIMESTEP_MIXTURE_EARLY_PROB=0.80
 
 LAMBDA_SCOPE=head  # model | layer | head
 LAMBDA_LR=5e-4
@@ -82,7 +84,7 @@ LAMBDA_TIMESTEP_CONDITIONED=1
 LAMBDA_HIDDEN_DIM=128  # for timestep conditioning
 LAMBDA_CHECKPOINT=
 
-LORA_RANK=32
+LORA_RANK=64
 LORA_ALPHA=32
 LORA_MODULE_PRESET=attn  # attn | ffn | attn_ffn
 case "$LORA_MODULE_PRESET" in
@@ -141,6 +143,10 @@ EXP_NAME="lambda_lora-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lora_rank_${L
 OUTPUT_PATH="$TRAIN_ROOT/$EXP_NAME"
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 WANDB_NAME="$EXP_NAME"
+WANDB_RUN_ID=
+WANDB_RESUME=allow
+if [[ -n "$WANDB_RUN_ID" ]]; then export WANDB_RUN_ID; else unset WANDB_RUN_ID; fi
+export WANDB_RESUME
 
 # Prepare args ============================== 
 COMMON_ARGS=(
@@ -188,6 +194,12 @@ if [[ "$LAMBDA_TIMESTEP_CONDITIONED" == "1" ]]; then TRAIN_ARGS+=(--wan_spatial_
 if [[ -n "$LAMBDA_CHECKPOINT" ]]; then TRAIN_ARGS+=(--wan_spatial_rope_lambda_checkpoint "$LAMBDA_CHECKPOINT"); fi
 if [[ -n "$MAX_TRAIN_STEPS" ]]; then TRAIN_ARGS+=(--max_train_steps "$MAX_TRAIN_STEPS"); fi
 if [[ "$ENABLE_BATCHED_SFT" == "1" ]]; then TRAIN_ARGS+=(--enable_batched_sft); fi
+if [[ "$SAVE_TRAINING_STATE" == "1" ]]; then TRAIN_ARGS+=(--save_training_state); fi
+case "$RESUME_TRAINING" in
+  0|""|none) ;;
+  auto) TRAIN_ARGS+=(--resume_from_latest_state) ;;
+  *) TRAIN_ARGS+=(--resume_training_state "$RESUME_TRAINING") ;;
+esac
 if [[ "$FIND_UNUSED_PARAMETERS" == "1" ]]; then TRAIN_ARGS+=(--find_unused_parameters); fi
 TRAIN_ARGS+=(--lora_base_model "dit" --lora_target_modules "$LORA_TARGET_MODULES" --lora_rank "$LORA_RANK" --lora_alpha "$LORA_ALPHA")
 if [[ "$ENABLE_WANDB" == "1" ]]; then

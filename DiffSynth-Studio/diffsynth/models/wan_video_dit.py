@@ -247,6 +247,28 @@ class WanSpatialRopeLambda(nn.Module):
             z = self.base_log_scale
         return z.float().square().mean()
 
+    def _spatial_log_scale_for_summary(self, timestep=None, update_last=False):
+        base = self.base_log_scale
+        if self.timestep_mlp is None or timestep is None:
+            z = base
+        else:
+            timestep = torch.as_tensor(timestep, device=base.device, dtype=torch.float32).flatten()[:1]
+            emb = sinusoidal_embedding_1d(self.freq_dim, timestep).to(device=base.device, dtype=torch.float32)
+            z = base + self.timestep_mlp(emb).view_as(base)
+        if update_last:
+            self._last_effective_log_scale = z
+        return z
+
+    @staticmethod
+    def _add_hw_min_max_mean(summary, prefix, lam):
+        flat = lam.reshape(-1, 2)
+        summary[f"{prefix}/h_min"] = float(flat[:, 0].min().cpu())
+        summary[f"{prefix}/w_min"] = float(flat[:, 1].min().cpu())
+        summary[f"{prefix}/h_max"] = float(flat[:, 0].max().cpu())
+        summary[f"{prefix}/w_max"] = float(flat[:, 1].max().cpu())
+        summary[f"{prefix}/h_mean"] = float(flat[:, 0].mean().cpu())
+        summary[f"{prefix}/w_mean"] = float(flat[:, 1].mean().cpu())
+
     @torch.no_grad()
     def summary(self):
         z = self._last_effective_log_scale
@@ -266,6 +288,17 @@ class WanSpatialRopeLambda(nn.Module):
             "lambda/w_max": float(flat[:, 1].max().cpu()),
             "lambda/log_abs_mean": float(z.abs().mean().cpu()),
         }
+
+        base_lam = torch.exp(self.base_log_scale.detach().float())
+        base_flat = base_lam.reshape(-1, 2)
+        summary["lambda_base/h_min"] = float(base_flat[:, 0].min().cpu())
+        summary["lambda_base/w_min"] = float(base_flat[:, 1].min().cpu())
+
+        for timestep in (0, 50, 100, 500, 900):
+            eff_z = self._spatial_log_scale_for_summary(timestep=timestep, update_last=False).detach().float()
+            eff_lam = torch.exp(eff_z)
+            self._add_hw_min_max_mean(summary, f"lambda_eff/t{timestep}", eff_lam)
+
         if self.scope in {"layer", "head"}:
             layer_lam = lam.mean(dim=1) if self.scope == "head" else lam
             summary["lambda/layer0_h"] = float(layer_lam[0, 0].cpu())
