@@ -15,23 +15,27 @@ GPU_IDS=2
 export CUDA_VISIBLE_DEVICES=$GPU_IDS
 GPU_TAG=a800
 
-# SEEDS=(1 8 20 23 29)
-SEEDS=(42)
-BATCH_SIZE=4
+SEEDS=(1 8 20 23 29)
+BENCHMARK_NAME=test
+BATCH_SIZE=1
 
-BENCHMARK_NAME=videophy2_rewrite  # test | videophy2 | videophy2_rewrite | phygenbench
+# SEEDS=(42)
+# BENCHMARK_NAME=videophy2_rewrite  # test | videophy2 | videophy2_rewrite | phygenbench
+# BATCH_SIZE=4
+
 MODEL_TYPE=1.3B
-MODEL_PATH=/work/liyueyan/Interpretability/physics_train/Wan2.1-T2V-1B3/lambda_lora/lambda_lora-bsz_16-lr_1e-4-lora_rank_32-lora_alpha_32-lora_modules_attn-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.14_prob_0.60-seed_42
-CKPT_STEP=2000
-MODEL_PATH=
-CKPT_STEP=
+MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_lora/lambda_lora-bsz_16-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_0.80-seed_42
+CKPT_STEP=1000
+# MODEL_PATH=
+# CKPT_STEP=
 
 # dir
-# /work/liyueyan/Interpretability/physics_train/Wan2.1-T2V-1B3/lora
-# /work/liyueyan/Interpretability/physics_train/Wan2.1-T2V-1B3/lambda_lora
+# $WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lora
+# $WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_lora
 # model_path
 # bsz_16-lr_1e-4-lora_rank_32-lora_alpha_32-lora_modules_attn-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_0.0_1.0-seed_42
 # lambda_lora-bsz_16-lr_1e-4-lora_rank_32-lora_alpha_32-lora_modules_attn-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.14_prob_0.60-seed_42
+# lambda_lora-bsz_16-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_0.80-seed_42
 
 
 SIZE=832*480

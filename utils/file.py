@@ -3,6 +3,18 @@ import csv
 import json
 import jsonlines
 
+import os
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from dotenv import load_dotenv
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+root_dir = Path(os.getenv("ROOT_DIR", PROJECT_ROOT.as_posix()))
+work_dir = Path(os.getenv("WORK_DIR", PROJECT_ROOT.as_posix()))
+
 
 def read_video(video_path):
     """Read video frames from a video file.
@@ -77,25 +89,25 @@ def match_jsonl(full_path, subset_path, output_path):
 if __name__ == "__main__":
     pass
 
-    # video_path = "/home/liyueyan/Interpretability/physics/ti2v-5B_1280*704_A man running in a desert.mp4"
+    # video_path = ""
     # frames, sample_rate, height, width = read_video(video_path)
     # print(f"Number of frames: {len(frames)}\nSample rate: {sample_rate}\nHeight: {height}\nWidth: {width}")
 
-    # csv_path = "/home/liyueyan/Interpretability/physics/wan_eval/datasets/videophy2/prompt-upsampled-test.csv"
-    # jsonl_path = "/home/liyueyan/Interpretability/physics/wan_eval/datasets/videophy2/prompt-upsampled-test.jsonl"
+    # csv_path = str(work_dir / "wan_eval/datasets/videophy/videophy_test_public.csv")
+    # jsonl_path = str(work_dir / "wan_eval/datasets/videophy/videophy_test_public.jsonl")
     # csv_to_jsonl(csv_path, jsonl_path)
 
-    # json_path = "/home/liyueyan/Interpretability/physics/wan_eval/datasets/phygenbench/prompts.json"
-    # jsonl_path = "/home/liyueyan/Interpretability/physics/wan_eval/datasets/phygenbench/prompts.jsonl"
+    # json_path = str(work_dir / "wan_eval/datasets/phygenbench/prompts.json")
+    # jsonl_path = str(work_dir / "wan_eval/datasets/phygenbench/prompts.jsonl")
     # json_to_jsonl(json_path, jsonl_path)
 
-    # full_path = "/home/liyueyan/Interpretability/physics/wan_eval/datasets/videophy2/videophy2_test.jsonl"
-    # test_path = "/home/liyueyan/Interpretability/physics/wan_eval/datasets/videophy2/prompt-upsampled-test.jsonl"
-    # output_path = "/home/liyueyan/Interpretability/physics/wan_eval/datasets/videophy2/prompt-upsampled-test-w_meta.jsonl"
+    # full_path = str(work_dir / "wan_eval/datasets/videophy2/videophy2_test.jsonl")
+    # test_path = str(work_dir / "wan_eval/datasets/videophy2/prompt-upsampled-test.jsonl")
+    # output_path = str(work_dir / "wan_eval/datasets/videophy2/prompt-upsampled-test-w_meta.jsonl")
     # match_jsonl(full_path, test_path, output_path)
 
-    old_jsonl_path = "/home/liyueyan/Interpretability/physics/wan_eval/datasets/videophy2/prompt-upsampled-test-w_meta.jsonl"
-    new_jsonl_path = "/home/liyueyan/Interpretability/physics/wan_eval/datasets/videophy2_rewrite/prompts.jsonl"
-    condition_key = "upsampled_caption"
+    old_jsonl_path = str(work_dir / "wan_eval/datasets/videophy/videophy_test_public.jsonl")
+    new_jsonl_path = str(work_dir / "wan_eval/datasets/videophy/prompts.jsonl")
+    condition_key = "caption"
     format_jsonl_line_vid_gen(old_jsonl_path, new_jsonl_path, condition_key)
     

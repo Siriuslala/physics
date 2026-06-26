@@ -1,6 +1,7 @@
 import os, math, json, torch, importlib, time, threading, queue, random, shutil
 from tqdm import tqdm
 from accelerate import Accelerator
+from safetensors.torch import load_file as load_safetensors
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
 from diffsynth.core import OffloadTrainingManager
@@ -111,6 +112,13 @@ def get_latest_training_state_dir(output_path):
     return os.path.join(output_path, "training_state_latest")
 
 
+TRAINABLE_TRAINING_STATE_FORMAT = "trainable_state_v1"
+TRAINABLE_MODEL_STATE_FILE = "trainable_model.safetensors"
+OPTIMIZER_STATE_FILE = "optimizer.pt"
+SCHEDULER_STATE_FILE = "scheduler.pt"
+RNG_STATE_FILE_PATTERN = "random_state_rank{rank}.pt"
+
+
 def resolve_resume_training_state(args):
     if args is None:
         return None
@@ -126,6 +134,134 @@ def load_trainer_state(state_dir):
         raise FileNotFoundError(f"Missing trainer_state.json in resume state: {state_dir}")
     with open(path, "r") as f:
         return json.load(f)
+
+
+def is_trainable_training_state(trainer_state):
+    return trainer_state.get("checkpoint_format") == TRAINABLE_TRAINING_STATE_FORMAT
+
+
+def collect_rng_state():
+    state = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    try:
+        import numpy as np
+        state["numpy"] = np.random.get_state()
+    except Exception:
+        state["numpy"] = None
+    return state
+
+
+def restore_rng_state(state):
+    if not state:
+        return
+    if state.get("python") is not None:
+        random.setstate(state["python"])
+    if state.get("torch") is not None:
+        torch.set_rng_state(state["torch"])
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+    if state.get("numpy") is not None:
+        try:
+            import numpy as np
+            np.random.set_state(state["numpy"])
+        except Exception:
+            pass
+
+
+def move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def save_trainable_training_state(accelerator, state_dir, model, optimizer, scheduler):
+    os.makedirs(state_dir, exist_ok=True)
+    rng_path = os.path.join(
+        state_dir,
+        RNG_STATE_FILE_PATTERN.format(rank=accelerator.process_index),
+    )
+    torch.save(collect_rng_state(), rng_path)
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        full_state_dict = accelerator.get_state_dict(model)
+        unwrapped_model = accelerator.unwrap_model(model)
+        trainable_state_dict = unwrapped_model.export_trainable_state_dict(
+            full_state_dict,
+            remove_prefix=None,
+        )
+        accelerator.save(
+            trainable_state_dict,
+            os.path.join(state_dir, TRAINABLE_MODEL_STATE_FILE),
+            safe_serialization=True,
+        )
+        accelerator.save(optimizer.state_dict(), os.path.join(state_dir, OPTIMIZER_STATE_FILE))
+        accelerator.save(scheduler.state_dict(), os.path.join(state_dir, SCHEDULER_STATE_FILE))
+    accelerator.wait_for_everyone()
+
+
+def load_trainable_training_state(accelerator, state_dir, model, optimizer, scheduler, trainer_state):
+    model_state_file = trainer_state.get("model_state_file", TRAINABLE_MODEL_STATE_FILE)
+    optimizer_state_file = trainer_state.get("optimizer_state_file", OPTIMIZER_STATE_FILE)
+    scheduler_state_file = trainer_state.get("scheduler_state_file", SCHEDULER_STATE_FILE)
+    rng_state_file_pattern = trainer_state.get("rng_state_file_pattern", RNG_STATE_FILE_PATTERN)
+
+    model_state_path = os.path.join(state_dir, model_state_file)
+    optimizer_state_path = os.path.join(state_dir, optimizer_state_file)
+    scheduler_state_path = os.path.join(state_dir, scheduler_state_file)
+    rng_state_path = os.path.join(
+        state_dir,
+        rng_state_file_pattern.format(rank=accelerator.process_index),
+    )
+
+    if not os.path.exists(model_state_path):
+        raise FileNotFoundError(f"Missing trainable model state for resume: {model_state_path}")
+    if not os.path.exists(optimizer_state_path):
+        raise FileNotFoundError(f"Missing optimizer state for resume: {optimizer_state_path}")
+    if not os.path.exists(scheduler_state_path):
+        raise FileNotFoundError(f"Missing scheduler state for resume: {scheduler_state_path}")
+    if not os.path.exists(rng_state_path):
+        raise FileNotFoundError(f"Missing RNG state for rank {accelerator.process_index}: {rng_state_path}")
+
+    trainable_state_dict = load_safetensors(model_state_path, device="cpu")
+    unwrapped_model = accelerator.unwrap_model(model)
+    current_trainable_names = unwrapped_model.trainable_param_names()
+    missing_trainable_keys = sorted(current_trainable_names - set(trainable_state_dict.keys()))
+    if missing_trainable_keys:
+        raise RuntimeError(
+            "Trainable keys are missing from resume checkpoint: "
+            + ", ".join(missing_trainable_keys[:20])
+            + (" ..." if len(missing_trainable_keys) > 20 else "")
+        )
+    missing_keys, unexpected_keys = unwrapped_model.load_state_dict(trainable_state_dict, strict=False)
+    if unexpected_keys:
+        raise RuntimeError(
+            "Unexpected keys found when loading trainable resume checkpoint: "
+            + ", ".join(unexpected_keys[:20])
+            + (" ..." if len(unexpected_keys) > 20 else "")
+        )
+    if accelerator.is_main_process:
+        print(
+            "Loaded trainable model state: "
+            f"{len(trainable_state_dict)} tensors, trainable_tensors={len(current_trainable_names)}, "
+            f"missing_non_trainable_or_frozen={len(missing_keys)}.",
+            flush=True,
+        )
+
+    optimizer_state = torch.load(optimizer_state_path, map_location="cpu", weights_only=False)
+    optimizer.load_state_dict(optimizer_state)
+    move_optimizer_state_to_device(optimizer, accelerator.device)
+
+    scheduler_state = torch.load(scheduler_state_path, map_location="cpu", weights_only=False)
+    scheduler.load_state_dict(scheduler_state)
+
+    rng_state = torch.load(rng_state_path, map_location="cpu", weights_only=False)
+    restore_rng_state(rng_state)
+    accelerator.wait_for_everyone()
 
 
 def read_saved_wandb_run_id(output_path):
@@ -208,17 +344,22 @@ def validate_resume_args(args, trainer_state, num_processes):
         raise ValueError("\n".join(lines))
 
 
-def save_training_state(accelerator, output_path, step, epoch_id, dataloader_batches_seen, args, total_update_steps):
+def save_training_state(accelerator, output_path, step, epoch_id, dataloader_batches_seen, args, total_update_steps, model, optimizer, scheduler):
     if args is None or not getattr(args, "save_training_state", False):
         return
     state_dir = get_latest_training_state_dir(output_path)
     if accelerator.is_main_process and os.path.isdir(state_dir):
         shutil.rmtree(state_dir)
     accelerator.wait_for_everyone()
-    accelerator.save_state(state_dir)
+    save_trainable_training_state(accelerator, state_dir, model, optimizer, scheduler)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         trainer_state = {
+            "checkpoint_format": TRAINABLE_TRAINING_STATE_FORMAT,
+            "model_state_file": TRAINABLE_MODEL_STATE_FILE,
+            "optimizer_state_file": OPTIMIZER_STATE_FILE,
+            "scheduler_state_file": SCHEDULER_STATE_FILE,
+            "rng_state_file_pattern": RNG_STATE_FILE_PATTERN,
             "global_step": int(step),
             "epoch_id": int(epoch_id),
             "dataloader_batches_seen": int(dataloader_batches_seen),
@@ -492,7 +633,8 @@ def launch_training_task(
     if resume_trainer_state is not None:
         validate_resume_args(args, resume_trainer_state, accelerator.num_processes)
         if accelerator.is_main_process:
-            print(f"Resuming full training state from {resume_state_dir}", flush=True)
+            checkpoint_format = resume_trainer_state.get("checkpoint_format", "accelerate_full_state_legacy")
+            print(f"Resuming training state from {resume_state_dir} (format={checkpoint_format})", flush=True)
 
     dataset = filter_cached_dataset_by_input_latents(dataset, args, accelerator)
 
@@ -551,7 +693,10 @@ def launch_training_task(
         model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     if resume_state_dir is not None:
-        accelerator.load_state(resume_state_dir)
+        if is_trainable_training_state(resume_trainer_state):
+            load_trainable_training_state(accelerator, resume_state_dir, model, optimizer, scheduler, resume_trainer_state)
+        else:
+            accelerator.load_state(resume_state_dir)
         model_logger.num_steps = int(resume_trainer_state.get("global_step", 0))
         if accelerator.is_main_process:
             print(
@@ -635,7 +780,7 @@ def launch_training_task(
                         metrics.update(unwrapped_model.get_training_metrics())
                     model_logger.on_step_end(accelerator, model, save_steps, loss=logging_loss, metrics=metrics)
                     if save_steps is not None and model_logger.num_steps % save_steps == 0:
-                        save_training_state(accelerator, model_logger.output_path, model_logger.num_steps, epoch_id, dataloader_batches_seen, args, total_update_steps)
+                        save_training_state(accelerator, model_logger.output_path, model_logger.num_steps, epoch_id, dataloader_batches_seen, args, total_update_steps, model, optimizer, scheduler)
                     progress_bar.update(1)
                     progress_bar.set_postfix(loss=float(loss.detach().float().cpu()) if loss is not None else None)
                     if max_train_steps is not None and max_train_steps > 0 and model_logger.num_steps >= max_train_steps:
@@ -643,13 +788,13 @@ def launch_training_task(
                         break
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
-            save_training_state(accelerator, model_logger.output_path, model_logger.num_steps, epoch_id, dataloader_batches_seen, args, total_update_steps)
+            save_training_state(accelerator, model_logger.output_path, model_logger.num_steps, epoch_id, dataloader_batches_seen, args, total_update_steps, model, optimizer, scheduler)
         if stop_training:
             break
 
     progress_bar.close()
     model_logger.on_training_end(accelerator, model, save_steps)
-    save_training_state(accelerator, model_logger.output_path, model_logger.num_steps, last_epoch_id, dataloader_batches_seen, args, total_update_steps)
+    save_training_state(accelerator, model_logger.output_path, model_logger.num_steps, last_epoch_id, dataloader_batches_seen, args, total_update_steps, model, optimizer, scheduler)
 
 
 

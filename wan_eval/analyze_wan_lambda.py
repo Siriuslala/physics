@@ -449,7 +449,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str, required=True, help="Experiment directory or checkpoint path used to resolve the lambda checkpoint.")
     parser.add_argument("--task", type=str, default="t2v-1.3B", choices=("t2v-1.3B", "t2v-14B"), help="Wan task used to determine num_layers and num_heads.")
     parser.add_argument("--ckpt_step", type=int, default=None, help="Optional step or epoch id used to resolve step-{ckpt_step}_lambda.safetensors from an experiment directory.")
-    parser.add_argument("--output_dir", type=str, default="/work/liyueyan/Interpretability/physics/wan_eval/lambda_analysis", help="Directory to store visualizations and metadata.")
+    parser.add_argument("--output_dir", type=str, default="./", help="Directory to store visualizations and metadata.")
     parser.add_argument("--sample_solver", type=str, default="unipc", choices=("unipc", "dpm++"), help="Inference solver used to generate the 50-step timestep sequence.")
     parser.add_argument("--sample_steps", type=int, default=50, help="Number of inference denoising steps used for phase analysis.")
     parser.add_argument("--sample_shift", type=float, default=5.0, help="Wan inference shift parameter.")

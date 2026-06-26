@@ -10,10 +10,13 @@ source ~/miniforge3/etc/profile.d/conda.sh
 conda activate video
 set -u
 
-MODEL_PATH="/work/liyueyan/Interpretability/physics_train/Wan2.1-T2V-1B3/lambda_lora/lambda_lora-bsz_16-lr_1e-4-lora_rank_32-lora_alpha_32-lora_modules_attn-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.14_prob_0.60-seed_42"
-CKPT_STEP=2000
+MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_only/lambda_only-bsz_16-lr_1e-3-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_0.80-seed_42
+CKPT_STEP=600
+
+MODEL_NAME="$(basename "$MODEL_PATH")"
+OUTPUT_DIR=$WORK_DIR/wan_eval/lambda_analysis/${MODEL_NAME}/${CKPT_STEP}
+
 TASK=t2v-1.3B
-OUTPUT_DIR=/work/liyueyan/Interpretability/physics/wan_eval/lambda_analysis
 SAMPLE_SOLVER=unipc
 SAMPLE_STEPS=50
 SAMPLE_SHIFT=5.0

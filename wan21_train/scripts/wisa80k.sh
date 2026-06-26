@@ -1,5 +1,6 @@
 # data processing for wisa80k
 
+cd "$(dirname "${BASH_SOURCE[0]}")"
 source ../../scripts/env.sh
 cd $ROOT_DIR
 
@@ -25,29 +26,19 @@ conda activate video
 #   --video-check-workers 32
 
 # ============================================================ Jsonl for viz
-# SEED=25
-# python ${ROOT_DIR}/wan21_train/prepare_wisa80k_for_diffsynth.py \
-#   --sample-csv /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata/metadata_optics.csv \
-#   --sample-n 40 \
-#   --sample-random \
-#   --sample-seed $SEED \
-#   --sample-out /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/viz/wisa_sample_videos_seed${SEED}/metadata_sample.jsonl \
-#   --sample-copy-dir /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/viz/wisa_sample_videos_seed${SEED} \
-#   --sample-base-dir /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data
+SEED=28
+python ${ROOT_DIR}/wan21_train/prepare_wisa80k_for_diffsynth.py \
+  --sample-csv /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata_new/metadata_optics.csv \
+  --sample-n 40 \
+  --sample-random \
+  --sample-seed $SEED \
+  --sample-out /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/viz/wisa_sample_videos_seed${SEED}/metadata_sample.jsonl \
+  --sample-copy-dir /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/viz/wisa_sample_videos_seed${SEED} \
+  --sample-base-dir /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data
 
 # ============================================================ Merge 3 classes
-python ${ROOT_DIR}/wan21_train/prepare_wisa80k_for_diffsynth.py \
-  --merge-category-metadata /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata_new \
-  --merge-out /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata_new/metadata_physics_merged_reflection4000.csv \
-  --reflection-sample-n 4000 \
-  --merge-seed 0
-
-# data settings for training
-# --dataset_base_path /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data
-# --dataset_metadata_path /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata/metadata_physics_merged_reflection4000.csv
-# --data_file_keys "video"
-# --height 480
-# --width 832
-# --num_frames 81
-# --video_sampling_mode first_seconds_uniform \
-# --video_clip_seconds 5.0
+# python ${ROOT_DIR}/wan21_train/prepare_wisa80k_for_diffsynth.py \
+#   --merge-category-metadata /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata_new \
+#   --merge-out /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata_new/metadata_physics_merged_reflection4000.csv \
+#   --reflection-sample-n 4000 \
+#   --merge-seed 0

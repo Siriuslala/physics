@@ -24,8 +24,8 @@ export DIFFSYNTH_SKIP_DOWNLOAD=true
 export CUDA_VISIBLE_DEVICES=4
 NUM_PROCESSES=1
 
-# export CUDA_VISIBLE_DEVICES=0,1
-# NUM_PROCESSES=2
+export CUDA_VISIBLE_DEVICES=5,6
+NUM_PROCESSES=2
 
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then LAUNCH_MODE=multi; else LAUNCH_MODE=single; fi
 
@@ -35,7 +35,7 @@ MODEL_SIZE=1.3B
 MIXED_PRECISION=bf16
 SEED=42
 DETERMINISTIC=0  # 1 enables deterministic PyTorch algorithms when available; slower and may warn.
-FIND_UNUSED_PARAMETERS=1  # Recommended for DDP with lambda/LoRA/gradient checkpointing.
+FIND_UNUSED_PARAMETERS=0  # Recommended for DDP with lambda/LoRA/gradient checkpointing.
 
 DATASET_BASE_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data
 DATASET_METADATA_PATH=/datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata_new/metadata_physics_merged_reflection4000.csv
@@ -73,12 +73,12 @@ RESUME_TRAINING=0  # 0 | auto | /path/to/training_state_latest
 # Full-range training is [0.0, 1.0]. Do not set min=max; DiffSynth requires min < max.
 MIN_TIMESTEP_BOUNDARY=0.0
 MAX_TIMESTEP_BOUNDARY=1.0
-TIMESTEP_SAMPLING_STRATEGY=uniform  # uniform | early_rest_mixture
-TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.12
-TIMESTEP_MIXTURE_EARLY_PROB=0.5
+TIMESTEP_SAMPLING_STRATEGY=early_rest_mixture  # uniform | early_rest_mixture
+TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.10
+TIMESTEP_MIXTURE_EARLY_PROB=0.80
 
-LAMBDA_SCOPE=layer  # model | layer | head
-LAMBDA_LR=1e-3
+LAMBDA_SCOPE=head  # model | layer | head
+LAMBDA_LR=1e-4
 LAMBDA_BETA=1e-4
 LAMBDA_TIMESTEP_CONDITIONED=1
 LAMBDA_HIDDEN_DIM=128

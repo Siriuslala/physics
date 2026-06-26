@@ -21,7 +21,7 @@ export DIFFSYNTH_SKIP_DOWNLOAD=true
 
 
 # GPU settings ==============================
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=2
 NUM_PROCESSES=1
 
 # export CUDA_VISIBLE_DEVICES=5,6
@@ -84,9 +84,9 @@ LAMBDA_TIMESTEP_CONDITIONED=1
 LAMBDA_HIDDEN_DIM=128  # for timestep conditioning
 LAMBDA_CHECKPOINT=
 
-LORA_RANK=64
-LORA_ALPHA=32
-LORA_MODULE_PRESET=attn  # attn | ffn | attn_ffn
+LORA_RANK=128
+LORA_ALPHA=64
+LORA_MODULE_PRESET=attn_ffn  # attn | ffn | attn_ffn
 case "$LORA_MODULE_PRESET" in
   attn) LORA_TARGET_MODULES=q,k,v,o ;;
   ffn) LORA_TARGET_MODULES=ffn.0,ffn.2 ;;
