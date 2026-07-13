@@ -49,6 +49,9 @@ VAGUE_TRAJ_SELF_ATTN_HEADS=""
 #   `TRAJECTORY_CONSENSUS_SEED_INFLUENCE_MODE`.
 # - plot_candidate / plot_head:
 #   plot-only redraw modes from saved outputs.
+# - filter_heads:
+#   result-only utility mode that filters cached head_contribution outputs by
+#   support-quality-derived convergence speed and head contribution.
 # - plot_self:
 #   plot-only redraw for self_attention_coupling from saved CSV files.
 # - all:
@@ -85,7 +88,7 @@ SAMPLE_STEPS=50
 SAMPLE_SHIFT=5.0
 SAMPLE_GUIDE_SCALE=5.0
 
-SEEDS=(20)
+SEEDS=(26)
 PROMPTS=(
     "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times."
 )
@@ -127,15 +130,15 @@ else
 fi
 
 # Experiment mode
-# candidate_consensus | head_contribution | self_attention_coupling | seed_influence | plot_candidate | plot_head | plot_self | all
+# candidate_consensus | head_contribution | filter_heads | self_attention_coupling | seed_influence | plot_candidate | plot_head | plot_self | all
 # RUN_MODE="candidate_consensus"  # candidate_consensus | plot_candidate
-# RUN_MODE="plot_head"  # head_contribution | plot_head
-RUN_MODE="plot_self"  # self_attention_coupling | plot_self
+RUN_MODE="plot_head"  # head_contribution | plot_head | filter_heads
+# RUN_MODE="plot_self"  # self_attention_coupling | plot_self
 # RUN_MODE="seed_influence"  # 
 
 # Optional scope controls
 TRAJECTORY_CONSENSUS_CANDIDATE_STEPS=""  # candidate_consensus / plot_candidate；empty -> all available reused-map steps
-TRAJECTORY_CONSENSUS_HEAD_CONTRIBUTION_STEPS="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25"  # head_contribution / plot_head；empty -> all available reused-map steps
+TRAJECTORY_CONSENSUS_HEAD_CONTRIBUTION_STEPS="1,2,3,4,5"  # head_contribution / plot_head；empty -> all available reused-map steps
 TRAJECTORY_CONSENSUS_SELF_ATTENTION_COUPLING_STEPS="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25"  # self_attention_coupling / plot_self；empty -> all available reused-map steps
 TRAJECTORY_CONSENSUS_SEED_SENSITIVITY_STEPS="1,2,3,4,5"
 TRAJECTORY_CONSENSUS_ANCHOR_FRAME_STEPS="1,2,3,4,5,6,7,8,9,10"
@@ -165,12 +168,20 @@ TRAJECTORY_CONSENSUS_CONTRIBUTION_METHOD="taylor_approx"  # ! exact_ablation | t
 TRAJECTORY_CONSENSUS_DO_DIRECT_PROXY=False  # !
 TRAJECTORY_CONSENSUS_ABLATE_POSITION="post_o"  # ! pre_o | post_o
 TRAJECTORY_CONSENSUS_TAYLOR_OBJECT_ONLY=True  # ! only ablate object area
-TRAJECTORY_CONSENSUS_TAYLOR_METRIC_SCOPE="obj"  # ! patching metric: obj | global
+TRAJECTORY_CONSENSUS_TAYLOR_METRIC_SCOPE="obj"  # ! metric support: obj | global
+TRAJECTORY_CONSENSUS_TAYLOR_PATCHING_METRIC="sem_obj"  # ! v_sum | ref_dot | sem_obj
+TRAJECTORY_CONSENSUS_TAYLOR_ABLATION_MODE="mean_ablation"  # ! zero_ablation | mean_ablation
 TRAJECTORY_CONSENSUS_TAYLOR_NUM_LATENT_FRAMES=10  # !
 TRAJECTORY_CONSENSUS_TAYLOR_USE_GRADIENT_CHECKPOINTING=True
-TRAJECTORY_CONSENSUS_REFERENCE_DISTANCE_METRIC="center_l2,support_overlap,js,hellinger,wasserstein_map"  # !
+TRAJECTORY_CONSENSUS_REFERENCE_DISTANCE_METRIC="center_l2,support_overlap,js,hellinger,wasserstein_map,support_quality_video"  # !
+TRAJECTORY_CONSENSUS_ALIGNMENT_SUMMARY_STEPS=10  # ! summarize scatter horizontal-axis metrics over first N steps
 TRAJECTORY_CONSENSUS_SCATTER_OUTLIER_CROSS_HEADS="L0H4,"  # !
 TRAJECTORY_CONSENSUS_SCATTER_OUTLIER_SELF_HEADS=""  # !
+TRAJECTORY_CONSENSUS_FILTER_STEP=2
+TRAJECTORY_CONSENSUS_FILTER_CONVERGENCE_SPEED_RULE="gt_0.1"
+TRAJECTORY_CONSENSUS_FILTER_CONTRIBUTION_RULE="lt_0.1"
+TRAJECTORY_CONSENSUS_FILTER_CONTRIBUTION_METRIC=""  # empty -> infer from current method
+TRAJECTORY_CONSENSUS_FILTER_MODULE="cross"  # cross | self
 
 # Self-attention candidate coupling
 TRAJECTORY_CONSENSUS_SA_ANCHOR_STEP=49  # 49(seed26), 7(seed20)
@@ -197,6 +208,7 @@ run_once() {
     local plot_only_flag="$5"
     local reuse_cross_attention_dir="$6"
     local reuse_head_trajectory_dir="$7"
+    local reuse_head_evolution_dir="$8"
 
     mkdir -p "$save_dir"
 
@@ -239,6 +251,7 @@ run_once() {
         --target_verb_words "$TARGET_VERB_WORDS" \
         --reuse_cross_attention_dir "$reuse_cross_attention_dir" \
         --reuse_head_trajectory_dynamics_dir "$reuse_head_trajectory_dir" \
+        --reuse_head_evolution_dir "$reuse_head_evolution_dir" \
         --trajectory_consensus_stages "$stage_csv" \
         --trajectory_consensus_steps "$trajectory_consensus_steps" \
         --trajectory_consensus_layers "$TRAJECTORY_CONSENSUS_LAYERS" \
@@ -281,6 +294,7 @@ run_once() {
             --trajectory_consensus_modules "$TRAJECTORY_CONSENSUS_MODULES"
             --trajectory_consensus_branch $TRAJECTORY_CONSENSUS_BRANCH
             --trajectory_consensus_reference_distance_metric $TRAJECTORY_CONSENSUS_REFERENCE_DISTANCE_METRIC
+            --trajectory_consensus_alignment_summary_steps $TRAJECTORY_CONSENSUS_ALIGNMENT_SUMMARY_STEPS
             --trajectory_consensus_scatter_outlier_cross_heads "$TRAJECTORY_CONSENSUS_SCATTER_OUTLIER_CROSS_HEADS"
             --trajectory_consensus_scatter_outlier_self_heads "$TRAJECTORY_CONSENSUS_SCATTER_OUTLIER_SELF_HEADS"
             --trajectory_consensus_do_ablation $TRAJECTORY_CONSENSUS_DO_ABLATION
@@ -292,7 +306,15 @@ run_once() {
             --trajectory_consensus_taylor_object_only $TRAJECTORY_CONSENSUS_TAYLOR_OBJECT_ONLY
             --trajectory_consensus_taylor_num_latent_frames $TRAJECTORY_CONSENSUS_TAYLOR_NUM_LATENT_FRAMES
             --trajectory_consensus_taylor_metric_scope $TRAJECTORY_CONSENSUS_TAYLOR_METRIC_SCOPE
+            --trajectory_consensus_taylor_patching_metric $TRAJECTORY_CONSENSUS_TAYLOR_PATCHING_METRIC
+            --trajectory_consensus_taylor_ablation_mode $TRAJECTORY_CONSENSUS_TAYLOR_ABLATION_MODE
             --trajectory_consensus_taylor_use_gradient_checkpointing $TRAJECTORY_CONSENSUS_TAYLOR_USE_GRADIENT_CHECKPOINTING
+            --trajectory_consensus_filter_heads $([ "$RUN_MODE" = "filter_heads" ] && echo True || echo False)
+            --trajectory_consensus_filter_step $TRAJECTORY_CONSENSUS_FILTER_STEP
+            --trajectory_consensus_filter_convergence_speed_rule "$TRAJECTORY_CONSENSUS_FILTER_CONVERGENCE_SPEED_RULE"
+            --trajectory_consensus_filter_contribution_rule "$TRAJECTORY_CONSENSUS_FILTER_CONTRIBUTION_RULE"
+            --trajectory_consensus_filter_contribution_metric "$TRAJECTORY_CONSENSUS_FILTER_CONTRIBUTION_METRIC"
+            --trajectory_consensus_filter_module $TRAJECTORY_CONSENSUS_FILTER_MODULE
         )
     fi
 
@@ -341,33 +363,37 @@ for SEED in "${SEEDS[@]}"; do
     REUSE_CROSS_ATTENTION_DIR="$WORK_DIR/outputs_wan_2_1_${task}/cross_attention_token_viz/${PROMPT_TAG}/seed_${SEED}_shift_${SAMPLE_SHIFT}_guide_${SAMPLE_GUIDE_SCALE}"
     # REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR="$WORK_DIR/outputs_wan_2_1_${task}/head_trajectory_dynamics/${PROMPT_TAG}/seed_${SEED}_shift_${SAMPLE_SHIFT}_guide_${SAMPLE_GUIDE_SCALE}/traj_clear_vague/head_trajectory_dynamics_metrics_hypothesis_attractor_motion_planning_region_on_preprocessed_on_center_mode_geometric_center"
     REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR="$WORK_DIR/outputs_wan_2_1_${task}/head_trajectory_dynamics/${PROMPT_TAG}/seed_${SEED}_shift_${SAMPLE_SHIFT}_guide_${SAMPLE_GUIDE_SCALE}/all/hypothesis_attractor_motion_planning_region_on"
+    REUSE_HEAD_EVOLUTION_DIR="$WORK_DIR/outputs_wan_2_1_${task}/head_evolution/${PROMPT_TAG}/seed_${SEED}_shift_${SAMPLE_SHIFT}_guide_${SAMPLE_GUIDE_SCALE}"
 
     case "$RUN_MODE" in
         candidate_consensus)
-            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "candidate_consensus" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "candidate_consensus" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
             ;;
         self_attention_coupling)
-            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "self_attention_coupling" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "self_attention_coupling" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
             ;;
         seed_influence)
-            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "seed_influence" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "seed_influence" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
             ;;
         head_contribution)
-            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "head_contribution" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "head_contribution" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
             ;;
         plot_candidate)
-            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "candidate_consensus" "True" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "candidate_consensus" "True" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
             ;;
         plot_self)
-            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "self_attention_coupling" "True" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "self_attention_coupling" "True" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
             ;;
         plot_head)
-            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "head_contribution" "True" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "head_contribution" "True" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
+            ;;
+        filter_heads)
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "head_contribution" "True" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
             ;;
         all)
-            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "candidate_consensus" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
-            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "self_attention_coupling" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
-            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "head_contribution" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "candidate_consensus" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "self_attention_coupling" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
+            run_once "$PROMPT" "$SEED" "$SAVE_DIR" "head_contribution" "False" "$REUSE_CROSS_ATTENTION_DIR" "$REUSE_HEAD_TRAJECTORY_DYNAMICS_DIR" "$REUSE_HEAD_EVOLUTION_DIR"
             ;;
         *)
             echo "Unknown RUN_MODE: $RUN_MODE"

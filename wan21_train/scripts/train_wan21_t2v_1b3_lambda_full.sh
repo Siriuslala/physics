@@ -71,6 +71,9 @@ LAMBDA_BETA=1e-4
 LAMBDA_TIMESTEP_CONDITIONED=1
 LAMBDA_HIDDEN_DIM=128
 LAMBDA_CHECKPOINT=
+LAMBDA_PARAMETRIZATION=unconstrained  # unconstrained | softplus_leq_one | bounded_leq_one
+LAMBDA_MIN=0.5  # lower bound for bounded_leq_one
+LAMBDA_INIT_EPS=1e-4  # near-identity init: lambda ~= 1 - eps
 
 
 
@@ -111,7 +114,8 @@ case "$TIMESTEP_SAMPLING_STRATEGY" in
     exit 1
     ;;
 esac
-EXP_NAME="lambda_full-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lambda_scope_${LAMBDA_SCOPE}-lambda_lr_${LAMBDA_LR}-lambda_beta_${LAMBDA_BETA}-lambda_tcond_${LAMBDA_TIMESTEP_CONDITIONED}-lambda_hidden_${LAMBDA_HIDDEN_DIM}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-${TIMESTEP_TOKEN}-seed_${SEED}"
+LAMBDA_PARAM_TOKEN="range_${LAMBDA_PARAMETRIZATION}_min_${LAMBDA_MIN}_eps_${LAMBDA_INIT_EPS}"
+EXP_NAME="lambda_full-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lambda_scope_${LAMBDA_SCOPE}-lambda_lr_${LAMBDA_LR}-lambda_beta_${LAMBDA_BETA}-lambda_tcond_${LAMBDA_TIMESTEP_CONDITIONED}-lambda_hidden_${LAMBDA_HIDDEN_DIM}-${LAMBDA_PARAM_TOKEN}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-${TIMESTEP_TOKEN}-seed_${SEED}"
 OUTPUT_PATH="$TRAIN_ROOT/$EXP_NAME"
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 WANDB_NAME="$EXP_NAME"
@@ -160,6 +164,9 @@ TRAIN_ARGS=(
   --wan_spatial_rope_lambda_lr "$LAMBDA_LR"
   --wan_spatial_rope_lambda_beta "$LAMBDA_BETA"
   --wan_spatial_rope_lambda_hidden_dim "$LAMBDA_HIDDEN_DIM"
+  --wan_spatial_rope_lambda_parametrization "$LAMBDA_PARAMETRIZATION"
+  --wan_spatial_rope_lambda_min "$LAMBDA_MIN"
+  --wan_spatial_rope_lambda_init_eps "$LAMBDA_INIT_EPS"
 )
 if [[ "$LAMBDA_TIMESTEP_CONDITIONED" == "1" ]]; then TRAIN_ARGS+=(--wan_spatial_rope_lambda_timestep_conditioned); fi
 if [[ -n "$LAMBDA_CHECKPOINT" ]]; then TRAIN_ARGS+=(--wan_spatial_rope_lambda_checkpoint "$LAMBDA_CHECKPOINT"); fi

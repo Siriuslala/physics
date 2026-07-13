@@ -2,15 +2,15 @@
 """Analyze timestep-conditioned spatial RoPE lambda distributions for Wan checkpoints.
 
 This script loads the trained `spatial_rope_lambda` module from a Wan fine-tuning
-checkpoint, reconstructs the effective height/width RoPE base values used at the
+checkpoint, reconstructs the effective height/width RoPE lambda scales used at the
 50-step inference timesteps, and exports phase-wise KDE visualizations.
 
 Output layout:
 
-- output_dir/model-wise/diffusion_early_rope_base_kde.pdf
-- output_dir/model-wise/diffusion_middle_late_rope_base_kde.pdf
-- output_dir/layer-wise/layer_{i}/diffusion_early_rope_base_kde.pdf
-- output_dir/layer-wise/layer_{i}/diffusion_middle_late_rope_base_kde.pdf
+- output_dir/model-wise/diffusion_early_rope_lambda_kde.pdf
+- output_dir/model-wise/diffusion_middle_late_rope_lambda_kde.pdf
+- output_dir/layer-wise/layer_{i}/diffusion_early_rope_lambda_kde.pdf
+- output_dir/layer-wise/layer_{i}/diffusion_middle_late_rope_lambda_kde.pdf
 
 The script also exports lightweight metadata files so the raw lambda parameters
 and timestep-conditioned MLP weights can be inspected later.
@@ -54,6 +54,7 @@ from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler  # noqa: E402
 
 
 _STEP_RE = re.compile(r"^(step|epoch)-(\d+)(?:_lambda)?\.safetensors$")
+_FLOAT_RE = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -78,11 +79,21 @@ def parse_experiment_name(experiment_name: str) -> dict[str, Any]:
         "wan_spatial_rope_lambda_timestep_conditioned": None,
         "wan_spatial_rope_lambda_hidden_dim": None,
         "wan_spatial_rope_lambda_learn_f": None,
+        "wan_spatial_rope_lambda_parametrization": None,
+        "wan_spatial_rope_lambda_min": None,
+        "wan_spatial_rope_lambda_init_eps": None,
+        "wan_spatial_rope_lambda_fixed_h": None,
+        "wan_spatial_rope_lambda_fixed_w": None,
     }
     patterns = {
         "lambda_scope": r"(?:^|-)lambda_scope_([^\-\s]+)",
         "lambda_tcond": r"(?:^|-)lambda_tcond_([^\-\s]+)",
         "lambda_hidden": r"(?:^|-)lambda_hidden_([^\-\s]+)",
+        "lambda_param": r"(?:^|-)lambda_param_([^\-\s]+)",
+        "lambda_min": rf"(?:^|-)lambda_min_({_FLOAT_RE})",
+        "lambda_init_eps": rf"(?:^|-)lambda_init_eps_({_FLOAT_RE})",
+        "lambda_h": rf"(?:^|-)lambda_h_({_FLOAT_RE})",
+        "lambda_w": rf"(?:^|-)lambda_w_({_FLOAT_RE})",
     }
     matches = {}
     for key, pattern in patterns.items():
@@ -96,6 +107,28 @@ def parse_experiment_name(experiment_name: str) -> dict[str, Any]:
         parsed["wan_spatial_rope_lambda_timestep_conditioned"] = bool(int(matches["lambda_tcond"]))
     if "lambda_hidden" in matches:
         parsed["wan_spatial_rope_lambda_hidden_dim"] = int(matches["lambda_hidden"])
+    if "lambda_param" in matches:
+        parsed["wan_spatial_rope_lambda_parametrization"] = matches["lambda_param"]
+    range_match = re.search(
+        rf"(?:^|-)range_(unconstrained|softplus_leq_one|bounded_leq_one|fixed)"
+        rf"(?:_min_({_FLOAT_RE}))?"
+        rf"(?:_eps_({_FLOAT_RE}))?",
+        experiment_name,
+    )
+    if range_match is not None:
+        parsed["wan_spatial_rope_lambda_parametrization"] = range_match.group(1)
+        if range_match.group(2) is not None:
+            parsed["wan_spatial_rope_lambda_min"] = float(range_match.group(2))
+        if range_match.group(3) is not None:
+            parsed["wan_spatial_rope_lambda_init_eps"] = float(range_match.group(3))
+    if "lambda_min" in matches:
+        parsed["wan_spatial_rope_lambda_min"] = float(matches["lambda_min"])
+    if "lambda_init_eps" in matches:
+        parsed["wan_spatial_rope_lambda_init_eps"] = float(matches["lambda_init_eps"])
+    if "lambda_h" in matches:
+        parsed["wan_spatial_rope_lambda_fixed_h"] = float(matches["lambda_h"])
+    if "lambda_w" in matches:
+        parsed["wan_spatial_rope_lambda_fixed_w"] = float(matches["lambda_w"])
     return parsed
 
 
@@ -228,6 +261,15 @@ def load_lambda_module(args) -> tuple[WanSpatialRopeLambda, dict[str, Any]]:
     )
     hidden_dim = int(args.lambda_hidden_dim or inferred.get("wan_spatial_rope_lambda_hidden_dim", 128))
     learn_f = bool(inferred.get("wan_spatial_rope_lambda_learn_f", False))
+    parametrization = args.lambda_parametrization or inferred.get("wan_spatial_rope_lambda_parametrization") or "unconstrained"
+    lambda_min = float(args.lambda_min if args.lambda_min is not None else inferred.get("wan_spatial_rope_lambda_min", 0.5))
+    lambda_init_eps = float(
+        args.lambda_init_eps
+        if args.lambda_init_eps is not None
+        else inferred.get("wan_spatial_rope_lambda_init_eps", 1e-4)
+    )
+    fixed_h = float(args.lambda_fixed_h if args.lambda_fixed_h is not None else inferred.get("wan_spatial_rope_lambda_fixed_h", 1.0))
+    fixed_w = float(args.lambda_fixed_w if args.lambda_fixed_w is not None else inferred.get("wan_spatial_rope_lambda_fixed_w", 1.0))
 
     module = WanSpatialRopeLambda(
         num_layers=cfg.num_layers,
@@ -237,6 +279,11 @@ def load_lambda_module(args) -> tuple[WanSpatialRopeLambda, dict[str, Any]]:
         learn_f=learn_f,
         timestep_conditioned=timestep_conditioned,
         hidden_dim=hidden_dim,
+        parametrization=parametrization,
+        lambda_min=lambda_min,
+        init_eps=lambda_init_eps,
+        fixed_h=fixed_h,
+        fixed_w=fixed_w,
     )
     missing, unexpected = module.load_state_dict(cleaned_state, strict=False)
     logging.info(
@@ -256,6 +303,11 @@ def load_lambda_module(args) -> tuple[WanSpatialRopeLambda, dict[str, Any]]:
         "timestep_conditioned": timestep_conditioned,
         "hidden_dim": hidden_dim,
         "learn_f": learn_f,
+        "parametrization": parametrization,
+        "lambda_min": lambda_min,
+        "lambda_init_eps": lambda_init_eps,
+        "fixed_h": fixed_h,
+        "fixed_w": fixed_w,
         "num_layers": cfg.num_layers,
         "num_heads": cfg.num_heads,
         "freq_dim": cfg.freq_dim,
@@ -304,7 +356,7 @@ def expand_scales_to_layer_head(scales: torch.Tensor, num_layers: int, num_heads
     raise ValueError(f"Unsupported scale tensor shape: {tuple(scales.shape)}")
 
 
-def compute_stepwise_rope_bases(module: WanSpatialRopeLambda, timesteps: list[int], num_layers: int, num_heads: int) -> list[dict[str, Any]]:
+def compute_stepwise_rope_lambdas(module: WanSpatialRopeLambda, timesteps: list[int], num_layers: int, num_heads: int) -> list[dict[str, Any]]:
     results = []
     for timestep in timesteps:
         timestep_tensor = torch.tensor([float(timestep)], dtype=torch.float32)
@@ -334,7 +386,7 @@ def pooled_phase_values(stepwise: list[dict[str, Any]], axis: str, layer_id: int
     return np.concatenate(values, axis=0).astype(np.float64)
 
 
-def build_density_curve(values: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+def build_density_curve(values: np.ndarray, x_bounds: tuple[float, float] | None = None) -> tuple[np.ndarray, np.ndarray] | None:
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
     if values.size == 0:
@@ -345,7 +397,14 @@ def build_density_curve(values: np.ndarray) -> tuple[np.ndarray, np.ndarray] | N
     value_min = float(values.min())
     value_max = float(values.max())
     pad = max((value_max - value_min) * 0.15, 1e-4)
-    xs = np.linspace(value_min - pad, value_max + pad, 512)
+    x_min = value_min - pad
+    x_max = value_max + pad
+    if x_bounds is not None:
+        x_min = max(x_min, float(x_bounds[0]))
+        x_max = min(x_max, float(x_bounds[1]))
+        if x_min >= x_max:
+            x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    xs = np.linspace(x_min, x_max, 512)
     kde = gaussian_kde(values)
     ys = kde(xs)
     return xs, ys
@@ -358,6 +417,7 @@ def plot_phase_distribution(
     phase_title: str,
     timestep_list: list[int],
     layer_id: int | None = None,
+    x_bounds: tuple[float, float] | None = None,
     dpi: int = 200,
 ) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), constrained_layout=True)
@@ -368,7 +428,7 @@ def plot_phase_distribution(
 
     for ax, (axis_name, values, color) in zip(axes, configs):
         values = np.asarray(values, dtype=np.float64)
-        curve = build_density_curve(values)
+        curve = build_density_curve(values, x_bounds=x_bounds)
         if curve is None:
             if values.size == 0:
                 ax.text(0.5, 0.5, "No values", ha="center", va="center", transform=ax.transAxes)
@@ -381,17 +441,23 @@ def plot_phase_distribution(
             ax.plot(xs, ys, color=color, linewidth=2)
             ax.fill_between(xs, 0, ys, color=color, alpha=0.22)
 
-        ax.set_title(f"{axis_name.capitalize()} RoPE base")
-        ax.set_xlabel("Effective base value")
+        ax.set_title(f"{axis_name.capitalize()} RoPE lambda scale")
+        ax.set_xlabel("Effective lambda scale")
         ax.set_ylabel("Density")
+        if x_bounds is not None:
+            ax.set_xlim(*x_bounds)
         ax.grid(alpha=0.2, linestyle="--")
 
         mean = float(values.mean()) if values.size else float("nan")
         std = float(values.std()) if values.size else float("nan")
+        vmin = float(values.min()) if values.size else float("nan")
+        vmax = float(values.max()) if values.size else float("nan")
         summary_lines = [
             f"count={values.size}",
             f"mean={mean:.6f}",
             f"std={std:.6f}",
+            f"min={vmin:.6f}",
+            f"max={vmax:.6f}",
         ]
         ax.text(
             0.98,
@@ -432,8 +498,8 @@ def save_metadata(output_dir: Path, metadata: dict[str, Any], module: WanSpatial
             "early_timesteps": early_steps,
             "middle_late_timesteps": middle_late_steps,
             "base_log_scale_shape": list(module.base_log_scale.shape),
-            "base_log_scale_values": module.base_log_scale.detach().cpu().tolist(),
-            "base_scale_values": torch.exp(module.base_log_scale.detach().cpu()).tolist(),
+            "base_raw_values": module.base_log_scale.detach().cpu().tolist(),
+            "base_lambda_values": torch.exp(module._spatial_log_scale_for_summary(timestep=None, update_last=False).detach().cpu()).tolist(),
             "has_timestep_mlp": module.timestep_mlp is not None,
             "timestep_mlp_parameter_shapes": {
                 key: list(value.shape) for key, value in module.state_dict().items() if key.startswith("timestep_mlp.")
@@ -458,6 +524,11 @@ def parse_args():
     parser.add_argument("--lambda_scope", type=str, default="", choices=("", "model", "layer", "head"), help="Optional manual override for lambda scope.")
     parser.add_argument("--lambda_timestep_conditioned", type=int, choices=(0, 1), default=None, help="Optional manual override for whether timestep-conditioned lambda is enabled.")
     parser.add_argument("--lambda_hidden_dim", type=int, default=None, help="Optional manual override for timestep-conditioned MLP hidden dimension.")
+    parser.add_argument("--lambda_parametrization", type=str, default="", choices=("", "unconstrained", "softplus_leq_one", "bounded_leq_one", "fixed"), help="Optional manual override for spatial RoPE lambda parameterization.")
+    parser.add_argument("--lambda_min", type=float, default=None, help="Optional manual override for bounded_leq_one lower bound.")
+    parser.add_argument("--lambda_init_eps", type=float, default=None, help="Optional manual override for constrained near-identity initialization epsilon.")
+    parser.add_argument("--lambda_fixed_h", type=float, default=None, help="Optional manual override for fixed height-axis lambda.")
+    parser.add_argument("--lambda_fixed_w", type=float, default=None, help="Optional manual override for fixed width-axis lambda.")
     parser.add_argument("--dpi", type=int, default=200, help="Figure dpi.")
     return parser.parse_args()
 
@@ -473,8 +544,15 @@ def main() -> None:
     module, metadata = load_lambda_module(args)
     timesteps = get_inference_timesteps(args.sample_solver, args.sample_steps, args.sample_shift)
     cfg = WAN_CONFIGS[args.task]
-    stepwise = compute_stepwise_rope_bases(module, timesteps, num_layers=cfg.num_layers, num_heads=cfg.num_heads)
+    stepwise = compute_stepwise_rope_lambdas(module, timesteps, num_layers=cfg.num_layers, num_heads=cfg.num_heads)
     early_stepwise, middle_late_stepwise = split_phase_steps(stepwise, args.early_fraction)
+    parametrization = metadata.get("parametrization", "unconstrained")
+    if parametrization == "bounded_leq_one":
+        lambda_x_bounds = (float(metadata.get("lambda_min", 0.0)), 1.0)
+    elif parametrization == "softplus_leq_one":
+        lambda_x_bounds = (0.0, 1.0)
+    else:
+        lambda_x_bounds = None
 
     save_metadata(
         output_dir=output_dir,
@@ -486,40 +564,44 @@ def main() -> None:
     )
 
     plot_phase_distribution(
-        output_path=model_wise_dir / "diffusion_early_rope_base_kde.pdf",
+        output_path=model_wise_dir / "diffusion_early_rope_lambda_kde.pdf",
         height_values=pooled_phase_values(early_stepwise, axis="height"),
         width_values=pooled_phase_values(early_stepwise, axis="width"),
         phase_title="Diffusion early (first 10%)",
         timestep_list=[item["timestep"] for item in early_stepwise],
+        x_bounds=lambda_x_bounds,
         dpi=args.dpi,
     )
     plot_phase_distribution(
-        output_path=model_wise_dir / "diffusion_middle_late_rope_base_kde.pdf",
+        output_path=model_wise_dir / "diffusion_middle_late_rope_lambda_kde.pdf",
         height_values=pooled_phase_values(middle_late_stepwise, axis="height"),
         width_values=pooled_phase_values(middle_late_stepwise, axis="width"),
         phase_title="Diffusion middle/late (remaining 90%)",
         timestep_list=[item["timestep"] for item in middle_late_stepwise],
+        x_bounds=lambda_x_bounds,
         dpi=args.dpi,
     )
 
     for layer_id in range(cfg.num_layers):
         layer_dir = layer_wise_dir / f"layer_{layer_id}"
         plot_phase_distribution(
-            output_path=layer_dir / "diffusion_early_rope_base_kde.pdf",
+            output_path=layer_dir / "diffusion_early_rope_lambda_kde.pdf",
             height_values=pooled_phase_values(early_stepwise, axis="height", layer_id=layer_id),
             width_values=pooled_phase_values(early_stepwise, axis="width", layer_id=layer_id),
             phase_title="Diffusion early (first 10%)",
             timestep_list=[item["timestep"] for item in early_stepwise],
             layer_id=layer_id,
+            x_bounds=lambda_x_bounds,
             dpi=args.dpi,
         )
         plot_phase_distribution(
-            output_path=layer_dir / "diffusion_middle_late_rope_base_kde.pdf",
+            output_path=layer_dir / "diffusion_middle_late_rope_lambda_kde.pdf",
             height_values=pooled_phase_values(middle_late_stepwise, axis="height", layer_id=layer_id),
             width_values=pooled_phase_values(middle_late_stepwise, axis="width", layer_id=layer_id),
             phase_title="Diffusion middle/late (remaining 90%)",
             timestep_list=[item["timestep"] for item in middle_late_stepwise],
             layer_id=layer_id,
+            x_bounds=lambda_x_bounds,
             dpi=args.dpi,
         )
 

@@ -21,7 +21,7 @@ export DIFFSYNTH_SKIP_DOWNLOAD=true
 
 
 # GPU settings ==============================
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=2
 NUM_PROCESSES=1
 
 export CUDA_VISIBLE_DEVICES=5,6
@@ -75,14 +75,17 @@ MIN_TIMESTEP_BOUNDARY=0.0
 MAX_TIMESTEP_BOUNDARY=1.0
 TIMESTEP_SAMPLING_STRATEGY=early_rest_mixture  # uniform | early_rest_mixture
 TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.10
-TIMESTEP_MIXTURE_EARLY_PROB=0.80
+TIMESTEP_MIXTURE_EARLY_PROB=1.00
 
 LAMBDA_SCOPE=head  # model | layer | head
-LAMBDA_LR=1e-4
-LAMBDA_BETA=1e-4
+LAMBDA_LR=5e-4
+LAMBDA_BETA=0  # 1e-4
 LAMBDA_TIMESTEP_CONDITIONED=1
 LAMBDA_HIDDEN_DIM=128
 LAMBDA_CHECKPOINT=
+LAMBDA_PARAMETRIZATION=bounded_leq_one  # unconstrained | softplus_leq_one | bounded_leq_one
+LAMBDA_MIN=0.50  # lower bound for bounded_leq_one
+LAMBDA_INIT_EPS=5e-2  # near-identity init: lambda ~= 1 - eps
 
 # Tensorboard settings ==============================
 WANDB_MODE=offline  # offline | online | disabled. Offline is syncable later and never depends on api.wandb.ai.
@@ -129,7 +132,8 @@ case "$TIMESTEP_SAMPLING_STRATEGY" in
     exit 1
     ;;
 esac
-EXP_NAME="lambda_only-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lambda_scope_${LAMBDA_SCOPE}-lambda_lr_${LAMBDA_LR}-lambda_beta_${LAMBDA_BETA}-lambda_tcond_${LAMBDA_TIMESTEP_CONDITIONED}-lambda_hidden_${LAMBDA_HIDDEN_DIM}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-${TIMESTEP_TOKEN}-seed_${SEED}"
+LAMBDA_PARAM_TOKEN="range_${LAMBDA_PARAMETRIZATION}_min_${LAMBDA_MIN}_eps_${LAMBDA_INIT_EPS}"
+EXP_NAME="lambda_only-bsz_${GLOBAL_BATCH_SIZE}-lr_${LEARNING_RATE}-lambda_scope_${LAMBDA_SCOPE}-lambda_lr_${LAMBDA_LR}-lambda_beta_${LAMBDA_BETA}-lambda_tcond_${LAMBDA_TIMESTEP_CONDITIONED}-lambda_hidden_${LAMBDA_HIDDEN_DIM}-${LAMBDA_PARAM_TOKEN}-${TRAIN_TOKEN}-warmup_${WARMUP_RATIO}-adam_beta1_${ADAM_BETA1}-beta2_${ADAM_BETA2}-${TIMESTEP_TOKEN}-seed_${SEED}"
 OUTPUT_PATH="$TRAIN_ROOT/$EXP_NAME"
 mkdir -p "$CACHE_DIR" "$OUTPUT_PATH"
 WANDB_NAME="$EXP_NAME"
@@ -179,6 +183,9 @@ TRAIN_ARGS=(
   --wan_spatial_rope_lambda_lr "$LAMBDA_LR"
   --wan_spatial_rope_lambda_beta "$LAMBDA_BETA"
   --wan_spatial_rope_lambda_hidden_dim "$LAMBDA_HIDDEN_DIM"
+  --wan_spatial_rope_lambda_parametrization "$LAMBDA_PARAMETRIZATION"
+  --wan_spatial_rope_lambda_min "$LAMBDA_MIN"
+  --wan_spatial_rope_lambda_init_eps "$LAMBDA_INIT_EPS"
 )
 if [[ "$LAMBDA_TIMESTEP_CONDITIONED" == "1" ]]; then TRAIN_ARGS+=(--wan_spatial_rope_lambda_timestep_conditioned); fi
 if [[ -n "$LAMBDA_CHECKPOINT" ]]; then TRAIN_ARGS+=(--wan_spatial_rope_lambda_checkpoint "$LAMBDA_CHECKPOINT"); fi

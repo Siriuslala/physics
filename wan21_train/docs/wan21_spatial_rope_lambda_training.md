@@ -176,19 +176,49 @@ Recommended values:
 
 Until the custom sampler is implemented, mode 2 should use full range for the most conservative comparison, or `[0.0,0.35]` for a more motion-focused run. Mode 3 should use full range unless there is a clear reason to bias early.
 
-## 9. Lambda Regularization
+## 9. Lambda Parameterization and Regularization
 
-The original Wan model corresponds to $z=0$. The primary regularizer is an L2 penalty on the effective log-scale: $L_\lambda=\beta_\lambda\,\mathbb{E}_{\tau}[\|z(\tau)\|_2^2/M]$, where $M$ is the number of trainable log-scale values.
+The default parameterization is unconstrained: $\lambda_h=\exp z_h$ and $\lambda_w=\exp z_w$. This preserves the original training behavior and allows learned spatial RoPE scales to move above or below one.
 
-If timestep conditioning is disabled, $z(\tau)=\mu$. If timestep conditioning is enabled, $z(\tau)=\mu+g_\psi(e_\tau)$.
+For the constrained ablation, the implementation supports two scalable parameterizations that enforce $\lambda_h\leq 1$ and $\lambda_w\leq 1$ for every layer, head, and timestep. Both forms learn an unconstrained raw variable $r_a(\tau)$ and map it to a valid RoPE scale, where $a\in\{h,w\}$.
 
-An optional smoothness regularizer is $L_{\mathrm{smooth}}=\beta_{\mathrm{smooth}}\,\mathbb{E}_{\tau,\delta}[\|z(\tau+\delta)-z(\tau)\|_2^2/M]$.
+The strict softplus form is $\lambda_a(\tau)=\exp(-\mathrm{softplus}(r_a(\tau)))$. It guarantees $0<\lambda_a<1$. However, near the identity point $\lambda_a\approx 1$, this form requires a large negative raw value, so $\sigma(r_a)$ is very small and the effective gradient on $\lambda_a$ can be weak. This form is mathematically clean but can be slow to move when initialized extremely close to one.
 
-The total objective is $L=L_{\mathrm{flow}}+L_\lambda+L_{\mathrm{smooth}}$.
+The bounded form is $\lambda_a(\tau)=\lambda_{\min}+(1-\lambda_{\min})\sigma(r_a(\tau))$, where $0\leq\lambda_{\min}<1$. It guarantees $\lambda_{\min}<\lambda_a<1$. The lower bound is configured by `wan_spatial_rope_lambda_min`. This form is the recommended constrained parameterization because it avoids the strongest near-one saturation of the softplus form while still forbidding spatial RoPE scales above one.
 
-Recommended initial values are `beta_lambda=1e-4` and `beta_smooth=0`. For head-wise lambda, use stronger regularization such as `3e-4` or `1e-3`.
+For bounded initialization, choose a near-identity target $\lambda_0=1-\epsilon$. The raw initial value is $r_0=\mathrm{logit}((\lambda_0-\lambda_{\min})/(1-\lambda_{\min}))$. The implementation uses `wan_spatial_rope_lambda_init_eps` for $\epsilon$ and initializes every spatial lambda value to $\lambda_0$. This requires $\lambda_{\min}<1-\epsilon$.
 
-An optional directional prior can discourage increasing spatial decay: $L_{\mathrm{upper}}=\beta_{\mathrm{upper}}\sum_m \mathrm{ReLU}(z_m(\tau))^2/M$. This should be an ablation, not the default.
+Exact identity initialization is impossible with finite raw parameters under a strict upper-bound parameterization. The implementation therefore uses a near-identity initialization $\lambda_a=1-\epsilon$. The default `wan_spatial_rope_lambda_init_eps=1e-4` is almost identical to the original Wan RoPE, but it may be too conservative for constrained training. For practical bounded runs, `wan_spatial_rope_lambda_init_eps=1e-2` is a stronger default because it starts from $\lambda_a=0.99$ and gives a larger effective gradient.
+
+The script-level parameters are:
+
+```text
+LAMBDA_PARAMETRIZATION=bounded_leq_one
+LAMBDA_MIN=0.5
+LAMBDA_INIT_EPS=1e-2
+```
+
+The corresponding CLI arguments are:
+
+```text
+--wan_spatial_rope_lambda_parametrization bounded_leq_one
+--wan_spatial_rope_lambda_min 0.5
+--wan_spatial_rope_lambda_init_eps 1e-2
+```
+
+The original Wan model corresponds to $\log\lambda=0$. The primary regularizer is an L2 penalty on the effective log-scale: $L_\lambda=\beta_\lambda\,\mathbb{E}_{\tau}[\|\log\lambda(\tau)\|_2^2/M]$, where $M$ is the number of spatial lambda values. In the unconstrained form, $\log\lambda(\tau)=z(\tau)$. In constrained forms, $\log\lambda(\tau)$ is computed after the raw parameter $r(\tau)$ is transformed into a valid lambda value.
+
+If timestep conditioning is disabled, the effective raw parameter is the base tensor only. If timestep conditioning is enabled, the effective raw parameter is the base tensor plus $g_\psi(e_\tau)$, and both the base tensor and $g_\psi$ are trainable in mode 1, mode 2, and mode 3.
+
+The total objective used by the current implementation is $L=L_{\mathrm{flow}}+L_\lambda$. Recommended initial values are `beta_lambda=1e-4` for lambda-only runs and `0` to `1e-4` for lambda plus LoRA runs, depending on whether the experiment is testing unconstrained movement or constrained shrinkage.
+
+A fixed manual lambda mode is also supported for LoRA adaptation experiments. In this mode, $\lambda_h$ and $\lambda_w$ are target constants provided by `wan_spatial_rope_lambda_fixed_h` and `wan_spatial_rope_lambda_fixed_w`; the lambda module has no trainable parameters, and only LoRA adapts to the manually modified RoPE geometry.
+
+Fixed manual lambda can optionally use a training-step schedule. Let $\lambda_a^*$ be the fixed target for axis $a\in\{h,w\}$ and let $\alpha(s)\in[0,1]$ be the schedule progress at optimizer update step $s$. The applied scale is $\lambda_a(s)=1+\alpha(s)(\lambda_a^*-1)$. `constant` uses $\alpha(s)=1$ from the first step. `linear` uses $\alpha(s)=\min(s/S,1)$. `cosine` uses $\alpha(s)=0.5-0.5\cos(\pi\min(s/S,1))$. Here $S$ is configured by `wan_spatial_rope_lambda_fixed_schedule_steps`; if it is zero, the total number of training update steps is used.
+
+The recommended fixed-lambda LoRA setting is `wan_spatial_rope_lambda_fixed_schedule=cosine`, because it starts from the original RoPE geometry, moves smoothly toward the target, and lets LoRA adapt before the full manual RoPE bias is applied.
+
+Fixed manual lambda also supports a timestep-activation switch. `wan_spatial_rope_lambda_global=true` applies the fixed lambda on every sampled training timestep. `wan_spatial_rope_lambda_global=false` applies the fixed lambda only when the sampled training timestep index is inside the early interval defined by `timestep_mixture_early_boundary`; other sampled timesteps use the original RoPE with $\lambda_h=\lambda_w=1$. This keeps the structural bias focused on early motion-planning timesteps while leaving middle and late detail-refinement training closer to the original model.
 
 ## 10. LoRA and Full Fine-Tuning Recommendations
 
@@ -311,16 +341,17 @@ max_timestep_boundary = 1.0
 
 ## 13. Checkpoint Contents
 
-The lambda module should be saved separately from LoRA or full DiT weights. Recommended outputs are:
+The training logger saves the normal DiffSynth checkpoint and additionally saves lambda-specific artifacts when a spatial RoPE lambda module is attached:
 
 ```text
-lambda_module.safetensors or lambda_module.pt
-lora weights, if mode 2
-DiT trainable weights, if mode 3
-training_args.json
+step-N.safetensors
+step-N_lambda.safetensors, if trainable lambda parameters are present
+lambda_heatmaps/step-N_lambda_heatmaps.pt
+lambda_heatmaps/step-N_lambda_heatmaps.json
+lambda_heatmaps/step-N_lambda_t{0,50,100,500,900}_{h,w}.png
 ```
 
-The lambda checkpoint should include `lambda_scope`, `learn_lambda_f`, `timestep_conditioned`, MLP hidden dimension, base log-scale parameters, MLP parameters if enabled, regularization coefficients, and timestep sampling configuration.
+The `.pt` heatmap payload stores the lambda scope, parameterization, lambda bounds or fixed values, and the layer-by-head lambda tensors. The `.png` files visualize per-layer or per-head $\lambda_h$ and $\lambda_w$ at fixed timesteps. The same export runs for learnable lambda and fixed manual lambda, so checkpoints can be compared by their applied RoPE geometry even when fixed lambda has no trainable state.
 
 ## 14. Validation
 

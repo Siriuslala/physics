@@ -85,6 +85,18 @@ def match_jsonl(full_path, subset_path, output_path):
             if cap in full_map:
                 writer.write(full_map[cap])
 
+def get_solid_dynamics_cases_from_videophy(input_path, output_path):
+    with jsonlines.open(input_path, "r") as reader, jsonlines.open(output_path, "w") as writer:
+        for item in reader:
+            if item["states_of_matter"] == "solid_solid":
+                writer.write(item)
+
+def get_liquid_dynamics_cases_from_phygenbench(input_path, output_path):
+    with jsonlines.open(input_path, "r") as reader, jsonlines.open(output_path, "w") as writer:
+        for item in reader:
+            if item["states_of_matter"] == "liquid_liquid":
+                writer.write(item)
+
 
 if __name__ == "__main__":
     pass
@@ -93,21 +105,21 @@ if __name__ == "__main__":
     # frames, sample_rate, height, width = read_video(video_path)
     # print(f"Number of frames: {len(frames)}\nSample rate: {sample_rate}\nHeight: {height}\nWidth: {width}")
 
-    # csv_path = str(work_dir / "wan_eval/datasets/videophy/videophy_test_public.csv")
-    # jsonl_path = str(work_dir / "wan_eval/datasets/videophy/videophy_test_public.jsonl")
+    # csv_path = str(root_dir / "wan_eval/datasets/videophy/videophy_test_public.csv")
+    # jsonl_path = str(root_dir / "wan_eval/datasets/videophy/videophy_test_public.jsonl")
     # csv_to_jsonl(csv_path, jsonl_path)
 
-    # json_path = str(work_dir / "wan_eval/datasets/phygenbench/prompts.json")
-    # jsonl_path = str(work_dir / "wan_eval/datasets/phygenbench/prompts.jsonl")
+    # json_path = str(root_dir / "wan_eval/datasets/phygenbench/prompts.json")
+    # jsonl_path = str(root_dir / "wan_eval/datasets/phygenbench/prompts.jsonl")
     # json_to_jsonl(json_path, jsonl_path)
 
-    # full_path = str(work_dir / "wan_eval/datasets/videophy2/videophy2_test.jsonl")
-    # test_path = str(work_dir / "wan_eval/datasets/videophy2/prompt-upsampled-test.jsonl")
-    # output_path = str(work_dir / "wan_eval/datasets/videophy2/prompt-upsampled-test-w_meta.jsonl")
+    # full_path = str(root_dir / "wan_eval/datasets/videophy2/videophy2_test.jsonl")
+    # test_path = str(root_dir / "wan_eval/datasets/videophy2/prompt-upsampled-test.jsonl")
+    # output_path = str(root_dir / "wan_eval/datasets/videophy2/prompt-upsampled-test-w_meta.jsonl")
     # match_jsonl(full_path, test_path, output_path)
 
-    old_jsonl_path = str(work_dir / "wan_eval/datasets/videophy/videophy_test_public.jsonl")
-    new_jsonl_path = str(work_dir / "wan_eval/datasets/videophy/prompts.jsonl")
-    condition_key = "caption"
-    format_jsonl_line_vid_gen(old_jsonl_path, new_jsonl_path, condition_key)
+    # old_jsonl_path = str(root_dir / "wan_eval/datasets/videophy/videophy_test_public_344.jsonl")
+    # new_jsonl_path = str(root_dir / "wan_eval/datasets/videophy/prompts.jsonl")
+    # condition_key = "caption"
+    # format_jsonl_line_vid_gen(old_jsonl_path, new_jsonl_path, condition_key)
     

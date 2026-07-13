@@ -3,14 +3,17 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-TARGET_GPU_INDEX=3  # ！
+TARGET_GPU_INDEX=2  # ！
+MEMORY_THRESHOLD_MIB=50000
 LOG_ENABLED=0  # ！
-TRAIN_SCRIPT="$(pwd)/train_wan21_t2v_1b3_lambda_lora.sh"
+MODE="train"  # train | eval
+TRAIN_SCRIPT="$(pwd)/train_wan21_t2v_1b3_fixed_lambda_lora.sh"
+EVAL_SCRIPT="$(pwd)/../../wan_eval/scripts/infer_eval_2.1.sh"
 
-MEMORY_THRESHOLD_MIB=10000
+
 REQUIRED_IDLE_SECONDS=60
 POLL_INTERVAL_SECONDS=5
-LOG_PATH="$(pwd)/logs/watch_gpu3_and_launch_train_wan21_t2v_1b3_lambda_lora.log"
+LOG_PATH="$(pwd)/logs/watch_gpu_and_launch_train_wan21_t2v_1b3.log"
 
 if [[ "$LOG_ENABLED" == "1" ]]; then
   mkdir -p "$(dirname "$LOG_PATH")"
@@ -42,26 +45,43 @@ get_gpu_memory_used_mib() {
     | tr -d '[:space:]'
 }
 
-is_train_script_running() {
-  pgrep -f "$TRAIN_SCRIPT" >/dev/null 2>&1
+resolve_target_script() {
+  case "$MODE" in
+    train)
+      echo "$TRAIN_SCRIPT"
+      ;;
+    eval)
+      echo "$EVAL_SCRIPT"
+      ;;
+    *)
+      log "Unsupported MODE: $MODE. Expected one of: train, eval"
+      exit 1
+      ;;
+  esac
 }
 
-launch_train() {
-  if is_train_script_running; then
-    log "Training script is already running: $TRAIN_SCRIPT"
+TARGET_SCRIPT="$(resolve_target_script)"
+
+is_target_script_running() {
+  pgrep -f "$TARGET_SCRIPT" >/dev/null 2>&1
+}
+
+launch_target_script() {
+  if is_target_script_running; then
+    log "Target script is already running: $TARGET_SCRIPT"
     exit 0
   fi
 
-  log "GPU ${TARGET_GPU_INDEX} stayed below ${MEMORY_THRESHOLD_MIB} MiB for ${REQUIRED_IDLE_SECONDS} seconds. Launching training."
-  log "Replacing watcher process with training script in the current terminal."
-  exec bash "$TRAIN_SCRIPT"
+  log "GPU ${TARGET_GPU_INDEX} stayed below ${MEMORY_THRESHOLD_MIB} MiB for ${REQUIRED_IDLE_SECONDS} seconds. Launching mode=${MODE}."
+  log "Replacing watcher process with target script in the current terminal: $TARGET_SCRIPT"
+  exec bash "$TARGET_SCRIPT"
 }
 
 require_command nvidia-smi
 require_command pgrep
 
-if [[ ! -f "$TRAIN_SCRIPT" ]]; then
-  log "Training script not found: $TRAIN_SCRIPT"
+if [[ ! -f "$TARGET_SCRIPT" ]]; then
+  log "Target script not found for MODE=${MODE}: $TARGET_SCRIPT"
   exit 1
 fi
 
@@ -83,11 +103,12 @@ fi
 idle_seconds=0
 
 log "Start watching GPU ${TARGET_GPU_INDEX}. Threshold=${MEMORY_THRESHOLD_MIB} MiB, required_idle=${REQUIRED_IDLE_SECONDS}s, poll_interval=${POLL_INTERVAL_SECONDS}s."
-log "Target training script: $TRAIN_SCRIPT"
+log "Mode: $MODE"
+log "Target script: $TARGET_SCRIPT"
 
 while true; do
-  if is_train_script_running; then
-    log "Detected existing running training script. Exiting watcher without launching a duplicate job."
+  if is_target_script_running; then
+    log "Detected existing running target script. Exiting watcher without launching a duplicate job."
     exit 0
   fi
 
@@ -102,7 +123,7 @@ while true; do
     idle_seconds=$((idle_seconds + POLL_INTERVAL_SECONDS))
     log "GPU ${TARGET_GPU_INDEX} memory used=${memory_used_mib} MiB < ${MEMORY_THRESHOLD_MIB} MiB. Idle countdown: ${idle_seconds}/${REQUIRED_IDLE_SECONDS}s."
     if (( idle_seconds >= REQUIRED_IDLE_SECONDS )); then
-      launch_train
+      launch_target_script
       exit 0
     fi
   else

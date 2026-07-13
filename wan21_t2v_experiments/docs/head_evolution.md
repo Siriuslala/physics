@@ -221,6 +221,123 @@ If `head_evolution_apply_preprocess_on_metrics = true`, the same winsorize + des
 
 If it is `false`, the map is only clamped to nonnegative values and no outlier-oriented connected-component logic is used.
 
+### Entropy metrics
+
+Let one analyzed map be
+
+\[
+A \in \mathbb{R}_{\ge 0}^{F \times H \times W},
+\]
+
+where:
+
+- \(F\) is the number of latent frames,
+- \(H\) and \(W\) are the token-grid height and width.
+
+Let the spatial index set be
+
+\[
+\Omega = \{1, \dots, H\} \times \{1, \dots, W\}, \qquad |\Omega| = HW.
+\]
+
+The implementation exports two different entropy summaries.
+
+#### Frame entropy
+
+For each frame \(f \in \{1, \dots, F\}\), define the frame mass
+
+\[
+Z_f = \sum_{(y,x) \in \Omega} A_f(y,x).
+\]
+
+Then define the frame-normalized spatial distribution
+
+\[
+P_f(y,x) = \frac{A_f(y,x)}{Z_f + \varepsilon}, \qquad \sum_{(y,x) \in \Omega} P_f(y,x) = 1.
+\]
+
+The spatial entropy of frame \(f\) is
+
+\[
+H_f = - \sum_{(y,x) \in \Omega} P_f(y,x) \log P_f(y,x).
+\]
+
+Because the maximum entropy on a grid of size \(HW\) is \(\log(HW)\), the code normalizes each frame entropy by
+
+\[
+\widetilde H_f = \frac{H_f}{\log(HW)}.
+\]
+
+Finally, the exported `entropy_frame` is the mean normalized frame entropy
+
+\[
+\mathrm{Entropy}^{\mathrm{frame}} = \frac{1}{F} \sum_{f=1}^{F} \widetilde H_f.
+\]
+
+Therefore `entropy_frame` only measures how spatially diffuse each frame is after each frame has been normalized independently. It is insensitive to how the total attention mass is distributed across time.
+
+#### Video entropy
+
+Define the full spatiotemporal index set
+
+\[
+\mathcal{V} = \{1, \dots, F\} \times \Omega, \qquad |\mathcal{V}| = FHW.
+\]
+
+Let the total mass of the whole video map be
+
+\[
+Z = \sum_{f=1}^{F} \sum_{(y,x) \in \Omega} A_f(y,x).
+\]
+
+The video-level normalized distribution is defined by normalizing once over the entire \(F \times H \times W\) support:
+
+\[
+P^{\mathrm{video}}(f,y,x) = \frac{A_f(y,x)}{Z + \varepsilon}, \qquad \sum_{(f,y,x) \in \mathcal{V}} P^{\mathrm{video}}(f,y,x) = 1.
+\]
+
+The corresponding spatiotemporal entropy is
+
+\[
+H^{\mathrm{video}} = - \sum_{(f,y,x) \in \mathcal{V}} P^{\mathrm{video}}(f,y,x) \log P^{\mathrm{video}}(f,y,x).
+\]
+
+Because the maximum entropy on \(FHW\) sites is \(\log(FHW)\), the exported `entropy_video` is
+
+\[
+\mathrm{Entropy}^{\mathrm{video}} = \frac{H^{\mathrm{video}}}{\log(FHW)}.
+\]
+
+This quantity is not a pure spatial entropy. It jointly measures:
+
+- how dispersed the attention is inside each frame, and
+- how dispersed the total attention mass is across frames.
+
+This can be seen by defining the frame-mass distribution
+
+\[
+m_f = \frac{Z_f}{Z + \varepsilon}, \qquad \sum_{f=1}^{F} m_f = 1.
+\]
+
+Whenever \(Z > 0\), one can write
+
+\[
+P^{\mathrm{video}}(f,y,x) = m_f P_f(y,x).
+\]
+
+Substituting this factorization into the entropy gives
+
+\[
+H^{\mathrm{video}} = - \sum_{f=1}^{F} m_f \log m_f + \sum_{f=1}^{F} m_f H_f.
+\]
+
+Hence video entropy contains two additive parts:
+
+- the temporal entropy of frame-level mass allocation \(-\sum_f m_f \log m_f\), and
+- the frame-mass-weighted average of within-frame spatial entropies \(\sum_f m_f H_f\).
+
+This decomposition is important for interpretation: a head can have visually sharp maps in several selected frames, yet still have a larger `entropy_video` if its mass is spread more evenly over many frames, or if many medium-mass frames remain spatially diffuse.
+
 ### Support-quality metric
 
 Frame-wise normalized probability:
@@ -242,6 +359,22 @@ Q^{\mathrm{frame}} = \frac{1}{F} \sum_{f=1}^{F} Q_f^{\mathrm{frame}}.
 \]
 
 Video-wise support quality is also computed after normalizing over the full spatiotemporal support \(FHW\).
+
+### Why entropy may disagree with the PDF appearance
+
+The attention PDFs from `cross_attention_token_viz` should not be interpreted as a direct visual rendering of either `entropy_frame` or `entropy_video` under the default plotting options.
+
+There are three separate reasons.
+
+First, `entropy_video` is a full spatiotemporal entropy on \(FHW\) sites, whereas the PDF only shows a small subset of frames. Therefore a comparison between `entropy_video` and a few displayed frames is not comparing the same object.
+
+Second, the default cross-attention PDF path uses the raw map values for visualization, because `attention_pdf_per_frame_normalize = false` by default. In contrast, the entropy computation always converts the map into a probability distribution internally before evaluating entropy. As a result, weak background activations may become visually prominent after plotting even though their probability mass is small.
+
+Third, the default PDF path uses `attention_pdf_share_color_scale = false`. Therefore each panel is autoscaled independently by `matplotlib`, and different heads are also saved into separate PDFs with separate autoscaling. This means that a frame with a very small absolute background can still look visually noisy if its own local dynamic range is stretched aggressively by the renderer.
+
+Fourth, entropy itself does not encode geometric connectedness, contour smoothness, or whether high-probability pixels form one compact component or several scattered islands. It only depends on the probability values assigned to sites, not on the spatial permutation of those sites. Therefore two maps can have very similar entropy even if one looks like a tight blob and the other looks like a fragmented ring or several disconnected bright patches.
+
+Consequently, the default PDF is useful for qualitative inspection of where activity exists, but it is not a calibrated visualization for comparing entropy values across heads.
 
 ## 8. Interpretation
 

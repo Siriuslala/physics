@@ -54,6 +54,67 @@ def read_wandb_max_logged_step(run_dir, run_id=None):
     return max_step
 
 
+def _save_wan_spatial_rope_lambda_heatmaps(output_path, file_name, model):
+    """Save lambda layer/head heatmaps next to checkpoints without making checkpointing fragile."""
+    pipe = getattr(model, "pipe", None)
+    dit = getattr(pipe, "dit", None)
+    module = getattr(dit, "spatial_rope_lambda", None)
+    if module is None or not hasattr(module, "heatmap_tensors"):
+        return
+    stem, _ = os.path.splitext(file_name)
+    heatmap_dir = os.path.join(output_path, "lambda_heatmaps")
+    os.makedirs(heatmap_dir, exist_ok=True)
+    try:
+        tensors = module.heatmap_tensors()
+        payload = {
+            "scope": getattr(module, "scope", "unknown"),
+            "parametrization": getattr(module, "parametrization", "unknown"),
+            "lambda_min": float(getattr(module, "lambda_min", 0.0)),
+            "init_eps": float(getattr(module, "init_eps", 0.0)),
+            "fixed_h": float(getattr(module, "fixed_h", 1.0)),
+            "fixed_w": float(getattr(module, "fixed_w", 1.0)),
+            "tensors": tensors,
+        }
+        torch.save(payload, os.path.join(heatmap_dir, f"{stem}_lambda_heatmaps.pt"))
+        summary_path = os.path.join(heatmap_dir, f"{stem}_lambda_heatmaps.json")
+        summary = {
+            key: {
+                "h_min": float(value[..., 0].min()),
+                "h_max": float(value[..., 0].max()),
+                "h_mean": float(value[..., 0].mean()),
+                "w_min": float(value[..., 1].min()),
+                "w_max": float(value[..., 1].max()),
+                "w_mean": float(value[..., 1].mean()),
+            }
+            for key, value in tensors.items()
+        }
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            print(f"Warning: failed to import matplotlib for lambda heatmaps: {exc}", flush=True)
+            return
+        for timestep_key, value in tensors.items():
+            for axis_id, axis_name in enumerate(("h", "w")):
+                array = value[..., axis_id].numpy()
+                fig_width = max(3.0, min(10.0, 0.35 * array.shape[1] + 2.0))
+                fig_height = max(3.0, min(12.0, 0.22 * array.shape[0] + 2.0))
+                fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=150)
+                im = ax.imshow(array, aspect="auto", interpolation="nearest", vmin=0.0, vmax=max(1.0, float(array.max())))
+                ax.set_title(f"lambda_{axis_name} {timestep_key}")
+                ax.set_xlabel("head")
+                ax.set_ylabel("layer")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                fig.tight_layout()
+                fig.savefig(os.path.join(heatmap_dir, f"{stem}_lambda_{timestep_key}_{axis_name}.png"))
+                plt.close(fig)
+    except Exception as exc:
+        print(f"Warning: failed to save Wan spatial RoPE lambda heatmaps for {file_name}: {exc}", flush=True)
+
+
 class TensorBoardLogger:
     def __init__(self, log_dir):
         from torch.utils.tensorboard import SummaryWriter
@@ -376,3 +437,4 @@ class ModelLogger:
                 stem, ext = os.path.splitext(file_name)
                 lambda_path = os.path.join(self.output_path, f"{stem}_lambda{ext}")
                 accelerator.save(lambda_state_dict, lambda_path, safe_serialization=True)
+            _save_wan_spatial_rope_lambda_heatmaps(self.output_path, file_name, accelerator.unwrap_model(model))

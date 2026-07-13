@@ -163,6 +163,7 @@ def _plot_wan21_t2v_trajectory_consensus_heatmap(
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import ScalarFormatter
 
     if not matrix_rows:
         return ""
@@ -452,6 +453,8 @@ def _plot_wan21_t2v_trajectory_consensus_curve(
     axis.set_title(title)
     axis.set_xlabel(x_label)
     axis.set_ylabel(y_label)
+    axis.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    axis.yaxis.set_major_formatter(ScalarFormatter(useMathText=True))
     axis.grid(alpha=0.22, linestyle="--")
     if group_key and len(group_names) <= 20:
         axis.legend(fontsize=7, ncol=2)
@@ -462,6 +465,37 @@ def _plot_wan21_t2v_trajectory_consensus_curve(
     return save_file
 
 
+def _classify_wan21_t2v_scatter_split_class(
+    x_value: float,
+    y_value: float,
+) -> str:
+    """Assign one point to the requested split-class bucket."""
+    if float(y_value) > 500.0:
+        return "high_contribution"
+    if float(x_value) <= 0.1:
+        return "low_speed"
+    return "high_speed"
+
+
+_SPLIT_CLASS_STYLE = {
+    "high_contribution": {
+        "label": "contribution > 500",
+        "color": "#8fdf93",
+        "edge": "#000000",
+    },
+    "low_speed": {
+        "label": "contribution <= 500 and speed <= 0.1",
+        "color": "#f0d84f",
+        "edge": "#000000",
+    },
+    "high_speed": {
+        "label": "contribution <= 500 and speed > 0.1",
+        "color": "#7fb3f0",
+        "edge": "#000000",
+    },
+}
+
+
 def _plot_wan21_t2v_trajectory_consensus_scatter(
     rows: Sequence[Dict[str, object]],
     save_file: str,
@@ -470,11 +504,13 @@ def _plot_wan21_t2v_trajectory_consensus_scatter(
     title: str,
     x_label: str,
     y_label: str,
+    split_classes: bool = False,
 ):
     """Render a scatter plot from row dictionaries."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import ScalarFormatter
 
     plot_rows = [row for row in rows if row.get(x_key, "") != "" and row.get(y_key, "") != ""]
     if not plot_rows:
@@ -484,10 +520,59 @@ def _plot_wan21_t2v_trajectory_consensus_scatter(
     ys = [float(row[y_key]) for row in plot_rows]
 
     fig, axis = plt.subplots(1, 1, figsize=(6.8, 5.2))
-    axis.scatter(xs, ys, s=20, alpha=0.82, color="#0f766e", edgecolors="none")
+    if bool(split_classes):
+        class_to_points = defaultdict(lambda: {"x": [], "y": []})
+        for x_value, y_value in zip(xs, ys):
+            class_name = _classify_wan21_t2v_scatter_split_class(x_value, y_value)
+            class_to_points[class_name]["x"].append(float(x_value))
+            class_to_points[class_name]["y"].append(float(y_value))
+        for class_name in ("high_contribution", "low_speed", "high_speed"):
+            payload = class_to_points.get(class_name)
+            if not payload or not payload["x"]:
+                continue
+            style = _SPLIT_CLASS_STYLE[class_name]
+            axis.scatter(
+                payload["x"],
+                payload["y"],
+                s=22,
+                alpha=0.72,
+                color=style["color"],
+                edgecolors=style["edge"],
+                linewidths=0.5,
+                label=style["label"],
+            )
+        axis.legend(fontsize=8, frameon=True)
+    else:
+        axis.scatter(
+            xs,
+            ys,
+            s=20,
+            alpha=0.82,
+            color="#0f766e",
+            edgecolors="none",
+        )
+    if len(xs) >= 2:
+        xs_np = np.asarray(xs, dtype=np.float64)
+        ys_np = np.asarray(ys, dtype=np.float64)
+        if np.isfinite(xs_np).all() and np.isfinite(ys_np).all() and float(np.std(xs_np)) > 1e-12:
+            slope, intercept = np.polyfit(xs_np, ys_np, deg=1)
+            fit_xs = np.linspace(float(xs_np.min()), float(xs_np.max()), num=200, dtype=np.float64)
+            fit_ys = slope * fit_xs + intercept
+            axis.plot(
+                fit_xs,
+                fit_ys,
+                color="#dc2626",
+                linewidth=1.8,
+                alpha=0.92,
+            )
     axis.set_title(title)
-    axis.set_xlabel(x_label)
-    axis.set_ylabel(y_label)
+    axis.set_xlabel(x_label, fontsize=17)
+    axis.set_ylabel(y_label, fontsize=17)
+    axis.tick_params(axis="both", labelsize=14)
+    axis.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    sci_formatter = ScalarFormatter(useMathText=True)
+    sci_formatter.set_powerlimits((0, 0))
+    axis.yaxis.set_major_formatter(sci_formatter)
     axis.grid(alpha=0.22, linestyle="--")
     fig.tight_layout()
     _ensure_dir(os.path.dirname(save_file))
@@ -504,14 +589,16 @@ def _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
     title: str,
     x_label: str,
     y_label: str,
+    split_classes: bool = False,
 ):
-    """Render an interactive HTML scatter plot with hover tips."""
+    """Render an interactive HTML scatter plot with hover tips and head search."""
     plot_rows = [row for row in rows if row.get(x_key, "") != "" and row.get(y_key, "") != ""]
     if not plot_rows:
         return ""
 
     try:
         import plotly.graph_objects as go
+        import plotly.io as pio
     except Exception:
         return ""
 
@@ -522,6 +609,7 @@ def _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
     xs = [float(row[x_key]) for row in ordered_rows]
     ys = [float(row[y_key]) for row in ordered_rows]
     steps = [int(row.get("step", -1)) for row in ordered_rows]
+    head_tags = [str(row.get("head_tag", "")) for row in ordered_rows]
     labels = [
         f"T{int(row.get('step', -1))}{str(row.get('head_tag', ''))}"
         for row in ordered_rows
@@ -533,9 +621,23 @@ def _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
             str(row.get("module", "")),
             str(row.get("branch", "")),
             str(row.get("metric", "")),
+            head_tags[index],
         ]
         for index, row in enumerate(ordered_rows)
     ]
+
+    if bool(split_classes):
+        marker_colors = []
+        marker_line_colors = []
+        for x_value, y_value in zip(xs, ys):
+            class_name = _classify_wan21_t2v_scatter_split_class(x_value, y_value)
+            style = _SPLIT_CLASS_STYLE[class_name]
+            marker_colors.append(style["color"])
+            marker_line_colors.append(style["edge"])
+    else:
+        marker_colors = steps
+        marker_line_colors = ["rgba(0,0,0,0)"] * len(xs)
+
     figure = go.Figure(
         data=[
             go.Scatter(
@@ -544,11 +646,12 @@ def _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
                 mode="markers",
                 marker=dict(
                     size=7,
-                    color=steps,
-                    colorscale="Viridis",
-                    showscale=True,
-                    colorbar=dict(title="step"),
-                    opacity=0.82,
+                    color=marker_colors,
+                    colorscale=None if bool(split_classes) else "Viridis",
+                    showscale=bool(not split_classes),
+                    colorbar=dict(title="step") if not split_classes else None,
+                    opacity=0.76 if split_classes else 0.82,
+                    line=dict(color=marker_line_colors, width=0.75 if split_classes else 0.0),
                 ),
                 customdata=customdata,
                 hovertemplate=(
@@ -557,20 +660,225 @@ def _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
                     "module=%{customdata[2]}<br>"
                     "branch=%{customdata[3]}<br>"
                     "metric=%{customdata[4]}<br>"
+                    "head=%{customdata[5]}<br>"
                     f"{x_label}=%{{x:.6g}}<br>"
                     f"{y_label}=%{{y:.6g}}<extra></extra>"
                 ),
-            )
+                showlegend=False,
+            ),
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="markers",
+                marker=dict(
+                    size=12,
+                    color="red",
+                    opacity=0.96,
+                    line=dict(color="white", width=0.9),
+                ),
+                customdata=[],
+                hovertemplate=(
+                    "id=%{customdata[0]}<br>"
+                    "step=%{customdata[1]}<br>"
+                    "module=%{customdata[2]}<br>"
+                    "branch=%{customdata[3]}<br>"
+                    "metric=%{customdata[4]}<br>"
+                    "head=%{customdata[5]}<br>"
+                    f"{x_label}=%{{x:.6g}}<br>"
+                    f"{y_label}=%{{y:.6g}}<extra></extra>"
+                ),
+                showlegend=False,
+            ),
         ]
     )
+    if len(xs) >= 2:
+        xs_np = np.asarray(xs, dtype=np.float64)
+        ys_np = np.asarray(ys, dtype=np.float64)
+        if np.isfinite(xs_np).all() and np.isfinite(ys_np).all() and float(np.std(xs_np)) > 1e-12:
+            slope, intercept = np.polyfit(xs_np, ys_np, deg=1)
+            fit_xs = np.linspace(float(xs_np.min()), float(xs_np.max()), num=200, dtype=np.float64)
+            fit_ys = slope * fit_xs + intercept
+            figure.add_trace(
+                go.Scatter(
+                    x=fit_xs.tolist(),
+                    y=fit_ys.tolist(),
+                    mode="lines",
+                    line=dict(color="#dc2626", width=1.8),
+                    opacity=0.92,
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
+    if bool(split_classes):
+        for class_name in ("high_contribution", "low_speed", "high_speed"):
+            style = _SPLIT_CLASS_STYLE[class_name]
+            figure.add_trace(
+                go.Scatter(
+                    x=[None],
+                    y=[None],
+                    mode="markers",
+                    marker=dict(
+                        size=8,
+                        color=style["color"],
+                        opacity=0.76,
+                        line=dict(color=style["edge"], width=0.75),
+                    ),
+                    name=style["label"],
+                    hoverinfo="skip",
+                    showlegend=True,
+                )
+            )
     figure.update_layout(
         title=title,
-        xaxis_title=x_label,
-        yaxis_title=y_label,
+        xaxis=dict(
+            title=dict(text=x_label, font=dict(size=20)),
+            tickfont=dict(size=14),
+        ),
+        yaxis=dict(
+            title=dict(text=y_label, font=dict(size=20)),
+            tickfont=dict(size=14),
+            exponentformat="e",
+            showexponent="all",
+        ),
         template="plotly_white",
+        width=760,
+        height=560,
+        margin=dict(l=72, r=28, t=72, b=68),
+        legend=dict(
+            bgcolor="rgba(255,255,255,0.86)",
+            bordercolor="rgba(0,0,0,0.08)",
+            borderwidth=1,
+        ),
     )
     _ensure_dir(os.path.dirname(save_file))
-    figure.write_html(save_file, include_plotlyjs="cdn")
+    plot_div_id = f"traj_consensus_scatter_{abs(hash(save_file))}"
+    search_input_id = f"{plot_div_id}_search"
+    search_button_id = f"{plot_div_id}_button"
+    search_status_id = f"{plot_div_id}_status"
+    plot_html = pio.to_html(
+        figure,
+        include_plotlyjs="cdn",
+        full_html=False,
+        div_id=plot_div_id,
+        default_width="760px",
+        default_height="560px",
+    )
+    html = rf"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>{title}</title>
+</head>
+<body>
+  <div style="margin: 12px auto 10px auto; width: 760px; font-family: sans-serif;">
+    <label for="{search_input_id}" style="margin-right: 8px;"><strong>Find head</strong></label>
+    <input
+      id="{search_input_id}"
+      type="text"
+      placeholder="L20H5 or 20,5 or L20H5,L21H3"
+      style="width: 320px; padding: 4px 8px;"
+    />
+    <button id="{search_button_id}" type="button" style="margin-left: 8px; padding: 4px 10px;">
+      Highlight
+    </button>
+    <span id="{search_status_id}" style="margin-left: 12px; color: #555;"></span>
+  </div>
+  <div style="width: 760px; margin: 0 auto;">
+    {plot_html}
+  </div>
+  <script>
+    (function() {{
+      const plotDiv = document.getElementById("{plot_div_id}");
+      const inputEl = document.getElementById("{search_input_id}");
+      const buttonEl = document.getElementById("{search_button_id}");
+      const statusEl = document.getElementById("{search_status_id}");
+
+      function normalizeHeadQuery(query) {{
+        const text = (query || "").trim().toUpperCase();
+        if (!text) {{
+          return "";
+        }}
+        const explicit = text.match(/^L\s*(\d+)\s*H\s*(\d+)$/);
+        if (explicit) {{
+          return `L${{parseInt(explicit[1], 10)}}H${{parseInt(explicit[2], 10)}}`;
+        }}
+        const nums = text.match(/\d+/g);
+        if (nums && nums.length >= 2) {{
+          return `L${{parseInt(nums[0], 10)}}H${{parseInt(nums[1], 10)}}`;
+        }}
+        return text.replace(/\s+/g, "");
+      }}
+
+      function parseHeadQueries(query) {{
+        const rawText = String(query || "").trim();
+        if (!rawText) {{
+          return [];
+        }}
+        const normalizedWhole = normalizeHeadQuery(rawText);
+        if (/^\s*\d+\s*,\s*\d+\s*$/.test(rawText) || /^\s*L/i.test(rawText) === false && rawText.indexOf(",") >= 0 && rawText.split(",").length === 2 && /^L\d+H\d+$/.test(normalizedWhole)) {{
+          return normalizedWhole ? [normalizedWhole] : [];
+        }}
+        const rawParts = rawText.split(",");
+        const normalizedParts = [];
+        const seen = new Set();
+        for (let i = 0; i < rawParts.length; i += 1) {{
+          const normalized = normalizeHeadQuery(rawParts[i]);
+          if (!normalized || seen.has(normalized)) {{
+            continue;
+          }}
+          seen.add(normalized);
+          normalizedParts.push(normalized);
+        }}
+        return normalizedParts;
+      }}
+
+      function highlightHead() {{
+        const normalizedQueries = parseHeadQueries(inputEl.value);
+        const normalizedSet = new Set(normalizedQueries);
+        const baseTrace = plotDiv.data[0];
+        const matchedX = [];
+        const matchedY = [];
+        const matchedCustom = [];
+        if (normalizedQueries.length === 0) {{
+          Plotly.restyle(plotDiv, {{ x: [[]], y: [[]], customdata: [[]] }}, [1]);
+          statusEl.textContent = "highlight cleared";
+          return;
+        }}
+        const xs = baseTrace.x || [];
+        const ys = baseTrace.y || [];
+        const custom = baseTrace.customdata || [];
+        for (let i = 0; i < custom.length; i += 1) {{
+          const headTag = String(custom[i][5] || "").toUpperCase();
+          if (normalizedSet.has(headTag)) {{
+            matchedX.push(xs[i]);
+            matchedY.push(ys[i]);
+            matchedCustom.push(custom[i]);
+          }}
+        }}
+        Plotly.restyle(plotDiv, {{
+          x: [matchedX],
+          y: [matchedY],
+          customdata: [matchedCustom],
+        }}, [1]);
+        const querySummary = normalizedQueries.join(", ");
+        statusEl.textContent = matchedX.length > 0
+          ? `highlighted ${{matchedX.length}} point(s) for ${{querySummary}}`
+          : `no point found for ${{querySummary}}`;
+      }}
+
+      buttonEl.addEventListener("click", highlightHead);
+      inputEl.addEventListener("keydown", function(event) {{
+        if (event.key === "Enter") {{
+          highlightHead();
+        }}
+      }});
+    }})();
+  </script>
+</body>
+</html>
+"""
+    with open(save_file, 'w', encoding='utf-8') as handle:
+        handle.write(html)
     return save_file
 
 
@@ -1664,6 +1972,7 @@ class Wan21T2VTrajectoryConsensusGlobalAttributionState:
 
     captured_clean_vpred: Optional[torch.Tensor] = None
     captured_head_writes: Dict[Tuple[int, str], torch.Tensor] = field(default_factory=dict)
+    captured_head_write_means: Dict[Tuple[int, str], torch.Tensor] = field(default_factory=dict)
     captured_head_writes_grad_obj: Dict[Tuple[int, str], torch.Tensor] = field(default_factory=dict)
 
     def on_forward_start(self, t_tensor):
@@ -2958,15 +3267,16 @@ def _install_wan21_t2v_trajectory_consensus_global_attribution_patch(
                     window_size=self.self_attn.window_size,
                 )
                 if str(state.attribution_position) == "post_o":
-                    full_activation, tracked_activation = _build_gradient_subset_activation(
-                        _project_all_head_writes(z_self, self.self_attn, post_scale=modulation[2])
-                    )
+                    projected_self = _project_all_head_writes(z_self, self.self_attn, post_scale=modulation[2])
+                    state.captured_head_write_means[(int(layer_index), "self")] = projected_self.detach().float().mean(dim=(0, 1), keepdim=True).cpu()
+                    full_activation, tracked_activation = _build_gradient_subset_activation(projected_self)
                     state.captured_head_writes[(int(layer_index), "self")] = tracked_activation.detach().float().cpu()
                     tracked_activation.register_hook(lambda grad, key=(int(layer_index), "self"): _capture_grad(key, grad))
                     sa_output = full_activation.sum(dim=2)
                     with amp.autocast(dtype=torch.float32):
                         x = x + sa_output
                 else:
+                    state.captured_head_write_means[(int(layer_index), "self")] = z_self.detach().float().mean(dim=(0, 1), keepdim=True).cpu()
                     full_activation, tracked_activation = _build_gradient_subset_activation(z_self)
                     state.captured_head_writes[(int(layer_index), "self")] = tracked_activation.detach().float().cpu()
                     tracked_activation.register_hook(lambda grad, key=(int(layer_index), "self"): _capture_grad(key, grad))
@@ -2987,13 +3297,14 @@ def _install_wan21_t2v_trajectory_consensus_global_attribution_patch(
                 cross_input = self.norm3(x)
                 z_cross = _run_manual_cross_attn(self.cross_attn, cross_input, context, context_lens)
                 if str(state.attribution_position) == "post_o":
-                    full_activation, tracked_activation = _build_gradient_subset_activation(
-                        _project_all_head_writes(z_cross, self.cross_attn, post_scale=None)
-                    )
+                    projected_cross = _project_all_head_writes(z_cross, self.cross_attn, post_scale=None)
+                    state.captured_head_write_means[(int(layer_index), "cross")] = projected_cross.detach().float().mean(dim=(0, 1), keepdim=True).cpu()
+                    full_activation, tracked_activation = _build_gradient_subset_activation(projected_cross)
                     state.captured_head_writes[(int(layer_index), "cross")] = tracked_activation.detach().float().cpu()
                     tracked_activation.register_hook(lambda grad, key=(int(layer_index), "cross"): _capture_grad(key, grad))
                     cross_output = full_activation.sum(dim=2)
                 else:
+                    state.captured_head_write_means[(int(layer_index), "cross")] = z_cross.detach().float().mean(dim=(0, 1), keepdim=True).cpu()
                     full_activation, tracked_activation = _build_gradient_subset_activation(z_cross)
                     state.captured_head_writes[(int(layer_index), "cross")] = tracked_activation.detach().float().cpu()
                     tracked_activation.register_hook(lambda grad, key=(int(layer_index), "cross"): _capture_grad(key, grad))
@@ -3403,22 +3714,83 @@ def _compute_wan21_t2v_attribution_patch_dot_metrics(
     }
 
 
+def _build_wan21_t2v_taylor_scalar_metric(
+    clean_vpred: torch.Tensor,
+    metric_scope: str,
+    patching_metric: str,
+    object_mask_fhw: Optional[torch.Tensor],
+    clean_uncond_vpred: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build the clean-only scalar metric used by Taylor attribution patching."""
+    metric_scope = str(metric_scope).strip().lower()
+    patching_metric = str(patching_metric).strip().lower()
+    metric_tensor = clean_vpred
+    metric_mask = None
+    if metric_scope == "obj":
+        if object_mask_fhw is None:
+            raise ValueError("object_mask_fhw is required when trajectory_consensus_taylor_metric_scope='obj'.")
+        metric_mask = object_mask_fhw.detach().to(device=clean_vpred.device, dtype=clean_vpred.dtype).unsqueeze(0)
+        metric_tensor = metric_tensor * metric_mask
+    elif metric_scope != "global":
+        raise ValueError(f"Unsupported Taylor metric scope: {metric_scope}")
+
+    if patching_metric == "v_sum":
+        return metric_tensor.sum()
+    if patching_metric == "ref_dot":
+        clean_reference = metric_tensor.detach()
+        return (metric_tensor * clean_reference).sum()
+    if patching_metric == "sem_obj":
+        if metric_scope != "obj":
+            raise ValueError("trajectory_consensus_taylor_patching_metric='sem_obj' requires trajectory_consensus_taylor_metric_scope='obj'.")
+        if clean_uncond_vpred is None:
+            raise ValueError("clean_uncond_vpred is required when trajectory_consensus_taylor_patching_metric='sem_obj'.")
+        uncond_vpred_device = clean_uncond_vpred.detach().to(device=clean_vpred.device, dtype=clean_vpred.dtype)
+        semantic_reference = clean_vpred.detach() - uncond_vpred_device
+        if metric_mask is not None:
+            semantic_reference = semantic_reference * metric_mask
+        return (metric_tensor * semantic_reference).sum()
+    raise ValueError(f"Unsupported Taylor patching metric: {patching_metric}")
+
+
 def _compute_wan21_t2v_taylor_contribution_metrics(
     head_writes: torch.Tensor,
     head_writes_grad: torch.Tensor,
+    ablation_mode: str = "zero_ablation",
+    full_token_head_mean: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Compute first-order Taylor contributions for all heads.
 
-    The Taylor path now uses a clean-only scalar objective `M` and reports the
-    corresponding first-order change under zero-ablation:
+    Let `A_h` be the clean tracked activation of head `h` and let `A_h^base`
+    denote the Taylor baseline.
 
-    `contribution_h = - <∇_{U_h} M(clean), U_h(clean)>`.
+    - `zero_ablation`: `A_h^base = 0`
+    - `mean_ablation`: `A_h^base` is the per-head mean activation vector over
+      all latent tokens at the current step, broadcast back to every tracked token.
 
-    The returned tensor is one scalar per head.
+    The first-order scalar change is
+
+    `contribution_h = <∇_{A_h} M(clean), A_h^base - A_h(clean)>`.
+
+    The returned tensor is one absolute-magnitude scalar per head.
     """
     head_writes = head_writes.detach().float()
     head_writes_grad = head_writes_grad.detach().float()
-    contribution = torch.abs(-torch.einsum("bthd,bthd->h", head_writes_grad, head_writes))
+    baseline_mode = str(ablation_mode).strip().lower()
+    if baseline_mode == "zero_ablation":
+        delta = -head_writes
+    elif baseline_mode == "mean_ablation":
+        if full_token_head_mean is None:
+            head_mean = head_writes.mean(dim=(0, 1), keepdim=True)
+        else:
+            head_mean = full_token_head_mean.detach().float()
+            if head_mean.dim() != 4 or int(head_mean.shape[0]) != 1 or int(head_mean.shape[1]) != 1:
+                raise ValueError("full_token_head_mean must have shape [1, 1, H, d].")
+        delta = head_mean - head_writes
+    else:
+        raise ValueError(f"Unsupported Taylor ablation mode: {ablation_mode}")
+    contribution_sum = torch.abs(torch.einsum("bthd,bthd->h", head_writes_grad, delta))
+    num_tracked_positions = max(1, int(head_writes.shape[0]) * int(head_writes.shape[1]))
+    contribution = contribution_sum / float(num_tracked_positions)
     return {"contribution": contribution.cpu()}
 
 
@@ -3638,18 +4010,13 @@ def _resolve_wan21_t2v_candidate_viz_frame_indices(frame_count: int, num_frames:
     return [int(frame_index) for frame_index in frame_indices]
 
 
-def _load_wan21_t2v_reference_distance_summary(
+def _load_wan21_t2v_head_trajectory_alignment_summary(
     reuse_head_trajectory_dynamics_dir: Optional[str],
     distance_metric: str,
     selected_steps: Sequence[int],
+    alignment_summary_steps: int,
 ) -> Dict[Tuple[int, int], Dict[str, float]]:
-    """Load early-alignment summaries from head_trajectory_dynamics reference-distance CSV.
-
-    The returned summary uses the mean reference distance over the first ten available
-    diffusion steps for each `(layer, head)` pair. The legacy key
-    `early_alignment_auc_neg` is retained only for compatibility with downstream
-    plotting code; it now stores the negated first-10-step mean rather than a true AUC.
-    """
+    """Load early-alignment summaries from head_trajectory_dynamics reference-distance CSV."""
     if not reuse_head_trajectory_dynamics_dir:
         return {}
     csv_path = os.path.join(
@@ -3675,33 +4042,88 @@ def _load_wan21_t2v_reference_distance_summary(
         if not step_value_pairs:
             continue
         sorted_pairs = sorted(step_value_pairs, key=lambda item: int(item[0]))
-        first_ten_values = [float(value) for _, value in sorted_pairs[:25]]  # take first 10 steps
-        if not first_ten_values:
+        first_step_values = [float(value) for _, value in sorted_pairs[:max(1, int(alignment_summary_steps))]]
+        if not first_step_values:
             continue
-        mean_value = float(sum(first_ten_values) / len(first_ten_values))
+        mean_value = float(sum(first_step_values) / len(first_step_values))
         summary[key] = {
-            "early_alignment_auc_neg": float(-mean_value),
-            "early_alignment_raw": float(mean_value),
+            "convergence_speed": float(-mean_value),
+            "alignment_mean": float(mean_value),
+            "alignment_family": "distance",
+        }
+    return summary
+
+
+def _load_wan21_t2v_head_evolution_support_quality_summary(
+    reuse_head_evolution_dir: Optional[str],
+    selected_steps: Sequence[int],
+    alignment_summary_steps: int,
+) -> Dict[Tuple[int, int], Dict[str, float]]:
+    """Load early support-quality summaries from head_evolution_headwise.csv."""
+    if not reuse_head_evolution_dir:
+        return {}
+    csv_path = os.path.join(
+        reuse_head_evolution_dir,
+        "head_evolution_headwise.csv",
+    )
+    rows = _load_wan21_t2v_csv_rows(csv_path)
+    if not rows:
+        return {}
+
+    grouped_values: Dict[Tuple[int, int], List[Tuple[int, float]]] = defaultdict(list)
+    for row in rows:
+        metric_text = str(row.get("support_quality_video", "")).strip()
+        if not metric_text:
+            continue
+        step = int(row["step"])
+        layer = int(row["layer"])
+        head = int(row["head"])
+        grouped_values[(layer, head)].append((int(step), float(metric_text)))
+
+    summary = {}
+    for key, step_value_pairs in grouped_values.items():
+        if not step_value_pairs:
+            continue
+        sorted_pairs = sorted(step_value_pairs, key=lambda item: int(item[0]))
+        first_step_values = [float(value) for _, value in sorted_pairs[:max(1, int(alignment_summary_steps))]]
+        if not first_step_values:
+            continue
+        mean_value = float(sum(first_step_values) / len(first_step_values))
+        summary[key] = {
+            "convergence_speed": float(mean_value),
+            "alignment_mean": float(mean_value),
+            "alignment_family": "quality",
         }
     return summary
 
 
 def _load_wan21_t2v_reference_distance_summaries(
     reuse_head_trajectory_dynamics_dir: Optional[str],
+    reuse_head_evolution_dir: Optional[str],
     distance_metrics: Sequence[str],
     selected_steps: Sequence[int],
+    alignment_summary_steps: int,
 ) -> Dict[str, Dict[Tuple[int, int], Dict[str, float]]]:
-    """Load early-alignment summaries for multiple reference-distance metrics."""
+    """Load early-alignment summaries for multiple trajectory-consensus scatter metrics."""
     summaries: Dict[str, Dict[Tuple[int, int], Dict[str, float]]] = {}
     for metric_name in distance_metrics:
         metric_key = str(metric_name).strip()
         if not metric_key:
             continue
-        summaries[metric_key] = _load_wan21_t2v_reference_distance_summary(
-            reuse_head_trajectory_dynamics_dir=reuse_head_trajectory_dynamics_dir,
-            distance_metric=metric_key,
-            selected_steps=selected_steps,
-        )
+        normalized_metric_key = metric_key.lower()
+        if normalized_metric_key in {"support_quality", "support_quality_video"}:
+            summaries[metric_key] = _load_wan21_t2v_head_evolution_support_quality_summary(
+                reuse_head_evolution_dir=reuse_head_evolution_dir,
+                selected_steps=selected_steps,
+                alignment_summary_steps=alignment_summary_steps,
+            )
+        else:
+            summaries[metric_key] = _load_wan21_t2v_head_trajectory_alignment_summary(
+                reuse_head_trajectory_dynamics_dir=reuse_head_trajectory_dynamics_dir,
+                distance_metric=metric_key,
+                selected_steps=selected_steps,
+                alignment_summary_steps=alignment_summary_steps,
+            )
     return summaries
 
 
@@ -3724,14 +4146,15 @@ def _append_wan21_t2v_alignment_scatter_row(
         return
     scatter_rows.append({
         "alignment_metric_name": str(alignment_metric_name),
+        "alignment_family": str(alignment_summary.get("alignment_family", "distance")),
         "analysis_method": str(analysis_method),
         "module": str(module_name),
         "branch": str(branch_name),
         "metric": str(metric_name),
         "head_tag": str(head_tag),
         "step": int(step),
-        "early_alignment_auc_neg": float(alignment_summary["early_alignment_auc_neg"]),
-        "early_alignment_raw": float(alignment_summary["early_alignment_raw"]),
+        "convergence_speed": float(alignment_summary["convergence_speed"]),
+        "alignment_mean": float(alignment_summary["alignment_mean"]),
         "metric_value": float(metric_value),
     })
 
@@ -3760,6 +4183,170 @@ def _apply_wan21_t2v_abs_to_ablation_contribution_row(
             continue
         row[metric_name] = abs(float(metric_text))
     return row
+
+
+
+def _format_wan21_t2v_filter_threshold_for_filename(value: float) -> str:
+    """Convert one numeric threshold into a stable filename component."""
+    scalar = float(value)
+    if math.isinf(scalar):
+        return "neg_inf" if scalar < 0 else "pos_inf"
+    if math.isnan(scalar):
+        return "nan"
+    text = f"{scalar:.6g}"
+    text = text.replace("-", "neg_")
+    text = text.replace(".", "p")
+    return _normalize_wan21_t2v_path_component(text)
+
+
+def _resolve_wan21_t2v_filter_contribution_metric(
+    analysis_method: str,
+    explicit_metric_name: str,
+) -> str:
+    """Resolve the contribution column used by filtered-head export."""
+    metric_name = str(explicit_metric_name).strip()
+    if metric_name:
+        return metric_name
+    normalized_method = str(analysis_method).strip().lower()
+    if normalized_method == "taylor_approx":
+        return "contribution"
+    if normalized_method == "exact_ablation":
+        return "ablate_dot_obj"
+    if normalized_method == "direct_proxy":
+        return "proj_dot_obj"
+    raise ValueError(f"Unsupported analysis method for filtered-head export: {analysis_method}")
+
+
+def _parse_wan21_t2v_filter_rule(
+    rule_text: str,
+    *,
+    default_direction: str,
+    rule_name: str,
+) -> Dict[str, object]:
+    """Parse one threshold rule such as `gt_0.2` or `lt_10`.
+
+    `gt_x` means value >= x and `lt_x` means value <= x.
+    Bare numeric strings are still accepted for backward compatibility and are
+    interpreted using `default_direction`.
+    """
+    normalized_default = str(default_direction).strip().lower()
+    if normalized_default not in {"gt", "lt"}:
+        raise ValueError(f"Unsupported default filter direction: {default_direction}")
+    text = str(rule_text).strip()
+    if not text:
+        text = f"{normalized_default}_{'-inf' if normalized_default == 'gt' else 'inf'}"
+    match = re.fullmatch(r"(gt|lt)\s*_\s*([-+]?((\d+\.?\d*)|(\.\d+))(?:[eE][-+]?\d+)?|inf|-inf)", text, flags=re.IGNORECASE)
+    if match:
+        direction = str(match.group(1)).strip().lower()
+        value = float(str(match.group(2)).strip().lower())
+    else:
+        try:
+            value = float(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"{rule_name} must be a rule like `gt_0.2` or `lt_10`, got: {rule_text}"
+            ) from exc
+        direction = normalized_default
+    normalized_text = f"{direction}_{value:.6g}" if math.isfinite(value) else f"{direction}_{str(value).lower()}"
+    return {
+        "direction": direction,
+        "value": float(value),
+        "text": normalized_text,
+    }
+
+
+def _wan21_t2v_filter_rule_matches(value: float, rule: Dict[str, object]) -> bool:
+    """Return whether one scalar passes the parsed filter rule."""
+    direction = str(rule.get("direction", "")).strip().lower()
+    threshold = float(rule.get("value", float("nan")))
+    scalar = float(value)
+    if direction == "gt":
+        return scalar >= threshold
+    if direction == "lt":
+        return scalar <= threshold
+    raise ValueError(f"Unsupported filter direction: {direction}")
+
+
+def _export_wan21_t2v_filtered_heads(
+    output_dir: str,
+    head_rows: Sequence[Dict[str, object]],
+    *,
+    analysis_method: str,
+    module_name: str,
+    branch_name: str,
+    reuse_head_evolution_dir: Optional[str],
+    alignment_summary_steps: int,
+    filter_step: int,
+    convergence_speed_rule: str,
+    contribution_rule: str,
+    contribution_metric_name: str,
+) -> str:
+    """Export one comma-separated `LxHy` head list filtered by convergence speed and contribution."""
+    if not head_rows:
+        return ""
+    normalized_method = str(analysis_method).strip().lower()
+    normalized_module = str(module_name).strip().lower()
+    normalized_branch = str(branch_name).strip().lower()
+    metric_name = _resolve_wan21_t2v_filter_contribution_metric(normalized_method, contribution_metric_name)
+    parsed_convergence_rule = _parse_wan21_t2v_filter_rule(
+        str(convergence_speed_rule),
+        default_direction="gt",
+        rule_name="convergence_speed_rule",
+    )
+    parsed_contribution_rule = _parse_wan21_t2v_filter_rule(
+        str(contribution_rule),
+        default_direction="lt",
+        rule_name="contribution_rule",
+    )
+    support_quality_summary = _load_wan21_t2v_head_evolution_support_quality_summary(
+        reuse_head_evolution_dir=reuse_head_evolution_dir,
+        selected_steps=tuple(),
+        alignment_summary_steps=int(alignment_summary_steps),
+    )
+    if not support_quality_summary:
+        raise FileNotFoundError(
+            "Filtered-head export requires cached head_evolution support-quality results, but none were found."
+        )
+
+    matched_rows: List[Tuple[int, int, str]] = []
+    for row in head_rows:
+        if str(row.get("analysis_method", "")).strip().lower() != normalized_method:
+            continue
+        if str(row.get("module", "")).strip().lower() != normalized_module:
+            continue
+        if str(row.get("branch", "")).strip().lower() != normalized_branch:
+            continue
+        if int(row.get("step", -1)) != int(filter_step):
+            continue
+        metric_text = str(row.get(metric_name, "")).strip()
+        if not metric_text or metric_text.lower() == "nan":
+            continue
+        layer = int(row["layer"])
+        head = int(row["head"])
+        summary_key = (layer, head)
+        if summary_key not in support_quality_summary:
+            continue
+        convergence_speed = float(support_quality_summary[summary_key]["convergence_speed"])
+        contribution_value = float(metric_text)
+        if (
+            _wan21_t2v_filter_rule_matches(convergence_speed, parsed_convergence_rule)
+            and _wan21_t2v_filter_rule_matches(contribution_value, parsed_contribution_rule)
+        ):
+            matched_rows.append((layer, head, str(row.get("head_tag", f"L{layer}H{head}"))))
+
+    matched_rows = sorted(dict.fromkeys(matched_rows), key=lambda item: (int(item[0]), int(item[1])))
+    plots_root_dir = os.path.join(output_dir, "trajectory_consensus_head_contribution_plots")
+    _ensure_dir(plots_root_dir)
+    file_name = (
+        f"filtered_heads_{normalized_module}_{normalized_branch}_step_{int(filter_step):03d}_"
+        f"support_quality_video_convergence_speed_{_normalize_wan21_t2v_path_component(str(parsed_convergence_rule['text']))}_"
+        f"{_normalize_wan21_t2v_path_component(metric_name)}_"
+        f"{_normalize_wan21_t2v_path_component(str(parsed_contribution_rule['text']))}.txt"
+    )
+    save_path = os.path.join(plots_root_dir, file_name)
+    with open(save_path, "w", encoding="utf-8") as handle:
+        handle.write(",".join(head_tag for _, _, head_tag in matched_rows))
+    return save_path
 
 
 def _render_wan21_t2v_candidate_consensus_plots(
@@ -3827,6 +4414,7 @@ def _render_wan21_t2v_head_contribution_plots(
     head_rows: Sequence[Dict[str, object]],
     scatter_rows: Sequence[Dict[str, object]],
     scatter_outlier_heads_by_module: Optional[Dict[str, Sequence[str]]] = None,
+    alignment_summary_steps: int = 10,
     skip_existing_plots: bool = False,
 ):
     """Render contribution heatmaps, curves, and scatter plots."""
@@ -4052,6 +4640,11 @@ def _render_wan21_t2v_head_contribution_plots(
         alignment_metric_tag = _normalize_wan21_t2v_path_component(alignment_metric_name)
         scatter_plots_dir = os.path.join(plots_root_dir, f"scatter_{alignment_metric_tag}")
         metric_dir = os.path.join(scatter_plots_dir, module_name, branch_name, metric_name)
+        alignment_family = str(rows[0].get("alignment_family", "distance")).strip().lower() if rows else "distance"
+        if alignment_family == "quality":
+            convergence_x_label = f"convergence speed"
+        else:
+            convergence_x_label = f"convergence speed"
         scatter_outlier_head_set = normalized_outlier_by_module.get(str(module_name).strip().lower(), set())
         scatter_variants = [("", rows)]
         if scatter_outlier_head_set:
@@ -4060,79 +4653,86 @@ def _render_wan21_t2v_head_contribution_plots(
                 if str(row.get("head_tag", "")).strip().upper() not in scatter_outlier_head_set
             ]
             scatter_variants.append(("_del_outlier", filtered_rows))
+        split_class_scatter = (
+            str(alignment_metric_name).strip().lower() in {"support_quality", "support_quality_video"}
+            and str(metric_name).strip().lower() == "contribution"
+        )
         for suffix, variant_rows in scatter_variants:
-            auc_save = os.path.join(metric_dir, f"{metric_name}_vs_alignment_auc_neg{suffix}.pdf")
-            raw_save = os.path.join(metric_dir, f"{metric_name}_vs_alignment_raw{suffix}.pdf")
-            auc_html_save = os.path.join(metric_dir, f"{metric_name}_vs_alignment_auc_neg{suffix}.html")
-            raw_html_save = os.path.join(metric_dir, f"{metric_name}_vs_alignment_raw{suffix}.html")
-            if _maybe_skip_wan21_t2v_existing_plot(auc_save, skip_existing_plots):
-                plot_paths.append(auc_save)
+            scatter_save = os.path.join(metric_dir, f"{metric_name}_vs_convergence_speed{suffix}.pdf")
+            scatter_html_save = os.path.join(metric_dir, f"{metric_name}_vs_convergence_speed{suffix}.html")
+            if _maybe_skip_wan21_t2v_existing_plot(scatter_save, skip_existing_plots):
+                plot_paths.append(scatter_save)
             else:
                 plot_paths.append(
                     _plot_wan21_t2v_trajectory_consensus_scatter(
                         rows=variant_rows,
-                        save_file=auc_save,
-                        x_key="early_alignment_auc_neg",
+                        save_file=scatter_save,
+                        x_key="convergence_speed",
                         y_key="metric_value",
                         title=(
-                            f"{metric_name} vs negated early alignment ({method_name}, {module_name}, "
+                            f"{metric_name} vs convergence speed ({method_name}, {module_name}, "
                             f"{branch_name}; alignment_metric={alignment_metric_name})"
                         ),
-                        x_label="negative mean reference distance over first 10 steps",
+                        x_label=convergence_x_label,
                         y_label=metric_name,
                     )
                 )
-            if _maybe_skip_wan21_t2v_existing_plot(auc_html_save, skip_existing_plots):
-                plot_paths.append(auc_html_save)
+            if _maybe_skip_wan21_t2v_existing_plot(scatter_html_save, skip_existing_plots):
+                plot_paths.append(scatter_html_save)
             else:
                 html_path = _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
                     rows=variant_rows,
-                    save_file=auc_html_save,
-                    x_key="early_alignment_auc_neg",
+                    save_file=scatter_html_save,
+                    x_key="convergence_speed",
                     y_key="metric_value",
                     title=(
-                        f"{metric_name} vs negated early alignment ({method_name}, {module_name}, "
+                        f"{metric_name} vs convergence speed ({method_name}, {module_name}, "
                         f"{branch_name}; alignment_metric={alignment_metric_name})"
                     ),
-                    x_label="negative mean reference distance over first 10 steps",
+                    x_label=convergence_x_label,
                     y_label=metric_name,
                 )
                 if html_path:
                     plot_paths.append(html_path)
-            if _maybe_skip_wan21_t2v_existing_plot(raw_save, skip_existing_plots):
-                plot_paths.append(raw_save)
-            else:
-                plot_paths.append(
-                    _plot_wan21_t2v_trajectory_consensus_scatter(
+            if split_class_scatter:
+                split_scatter_save = os.path.join(metric_dir, f"{metric_name}_vs_convergence_speed{suffix}_split_classes.pdf")
+                split_scatter_html_save = os.path.join(metric_dir, f"{metric_name}_vs_convergence_speed{suffix}_split_classes.html")
+                if _maybe_skip_wan21_t2v_existing_plot(split_scatter_save, skip_existing_plots):
+                    plot_paths.append(split_scatter_save)
+                else:
+                    plot_paths.append(
+                        _plot_wan21_t2v_trajectory_consensus_scatter(
+                            rows=variant_rows,
+                            save_file=split_scatter_save,
+                            x_key="convergence_speed",
+                            y_key="metric_value",
+                            title=(
+                                f"{metric_name} vs convergence speed ({method_name}, {module_name}, "
+                                f"{branch_name}; alignment_metric={alignment_metric_name}; split classes)"
+                            ),
+                            x_label=convergence_x_label,
+                            y_label=metric_name,
+                            split_classes=True,
+                        )
+                    )
+                if _maybe_skip_wan21_t2v_existing_plot(split_scatter_html_save, skip_existing_plots):
+                    plot_paths.append(split_scatter_html_save)
+                else:
+                    html_path = _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
                         rows=variant_rows,
-                        save_file=raw_save,
-                        x_key="early_alignment_raw",
+                        save_file=split_scatter_html_save,
+                        x_key="convergence_speed",
                         y_key="metric_value",
                         title=(
-                            f"{metric_name} vs early alignment ({method_name}, {module_name}, "
-                            f"{branch_name}; alignment_metric={alignment_metric_name})"
+                            f"{metric_name} vs convergence speed ({method_name}, {module_name}, "
+                            f"{branch_name}; alignment_metric={alignment_metric_name}; split classes)"
                         ),
-                        x_label="mean reference distance over first 10 steps",
+                        x_label=convergence_x_label,
                         y_label=metric_name,
+                        split_classes=True,
                     )
-                )
-            if _maybe_skip_wan21_t2v_existing_plot(raw_html_save, skip_existing_plots):
-                plot_paths.append(raw_html_save)
-            else:
-                html_path = _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
-                    rows=variant_rows,
-                    save_file=raw_html_save,
-                    x_key="early_alignment_raw",
-                    y_key="metric_value",
-                    title=(
-                        f"{metric_name} vs early alignment ({method_name}, {module_name}, "
-                        f"{branch_name}; alignment_metric={alignment_metric_name})"
-                    ),
-                    x_label="mean reference distance over first 10 steps",
-                    y_label=metric_name,
-                )
-                if html_path:
-                    plot_paths.append(html_path)
+                    if html_path:
+                        plot_paths.append(html_path)
         per_step_groups = defaultdict(list)
         for row in rows:
             per_step_groups[int(row["step"])].append(row)
@@ -4146,82 +4746,85 @@ def _render_wan21_t2v_head_contribution_plots(
                 ]
                 step_variants.append(("_del_outlier", filtered_step_rows))
             for suffix, variant_step_rows in step_variants:
-                step_auc_save = os.path.join(step_dir, f"{metric_name}_vs_alignment_auc_neg{suffix}.pdf")
-                step_raw_save = os.path.join(step_dir, f"{metric_name}_vs_alignment_raw{suffix}.pdf")
-                step_auc_html_save = os.path.join(step_dir, f"{metric_name}_vs_alignment_auc_neg{suffix}.html")
-                step_raw_html_save = os.path.join(step_dir, f"{metric_name}_vs_alignment_raw{suffix}.html")
-                if _maybe_skip_wan21_t2v_existing_plot(step_auc_save, skip_existing_plots):
-                    plot_paths.append(step_auc_save)
+                step_scatter_save = os.path.join(step_dir, f"{metric_name}_vs_convergence_speed{suffix}.pdf")
+                step_scatter_html_save = os.path.join(step_dir, f"{metric_name}_vs_convergence_speed{suffix}.html")
+                if _maybe_skip_wan21_t2v_existing_plot(step_scatter_save, skip_existing_plots):
+                    plot_paths.append(step_scatter_save)
                 else:
                     plot_paths.append(
                         _plot_wan21_t2v_trajectory_consensus_scatter(
                             rows=variant_step_rows,
-                            save_file=step_auc_save,
-                            x_key="early_alignment_auc_neg",
+                            save_file=step_scatter_save,
+                            x_key="convergence_speed",
                             y_key="metric_value",
                             title=(
-                                f"{metric_name} vs negated early alignment at step={int(step)} "
+                                f"{metric_name} vs convergence speed at step={int(step)} "
                                 f"({method_name}, {module_name}, {branch_name}; "
                                 f"alignment_metric={alignment_metric_name})"
                             ),
-                            x_label="negative mean reference distance over first 10 steps",
+                            x_label=convergence_x_label,
                             y_label=metric_name,
                         )
                     )
-                if _maybe_skip_wan21_t2v_existing_plot(step_auc_html_save, skip_existing_plots):
-                    plot_paths.append(step_auc_html_save)
+                if _maybe_skip_wan21_t2v_existing_plot(step_scatter_html_save, skip_existing_plots):
+                    plot_paths.append(step_scatter_html_save)
                 else:
                     html_path = _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
                         rows=variant_step_rows,
-                        save_file=step_auc_html_save,
-                        x_key="early_alignment_auc_neg",
+                        save_file=step_scatter_html_save,
+                        x_key="convergence_speed",
                         y_key="metric_value",
                         title=(
-                            f"{metric_name} vs negated early alignment at step={int(step)} "
+                            f"{metric_name} vs convergence speed at step={int(step)} "
                             f"({method_name}, {module_name}, {branch_name}; "
                             f"alignment_metric={alignment_metric_name})"
                         ),
-                        x_label="negative mean reference distance over first 10 steps",
+                        x_label=convergence_x_label,
                         y_label=metric_name,
                     )
                     if html_path:
                         plot_paths.append(html_path)
-                if _maybe_skip_wan21_t2v_existing_plot(step_raw_save, skip_existing_plots):
-                    plot_paths.append(step_raw_save)
-                else:
-                    plot_paths.append(
-                        _plot_wan21_t2v_trajectory_consensus_scatter(
+                if split_class_scatter:
+                    step_split_scatter_save = os.path.join(step_dir, f"{metric_name}_vs_convergence_speed{suffix}_split_classes.pdf")
+                    step_split_scatter_html_save = os.path.join(step_dir, f"{metric_name}_vs_convergence_speed{suffix}_split_classes.html")
+                    if _maybe_skip_wan21_t2v_existing_plot(step_split_scatter_save, skip_existing_plots):
+                        plot_paths.append(step_split_scatter_save)
+                    else:
+                        plot_paths.append(
+                            _plot_wan21_t2v_trajectory_consensus_scatter(
+                                rows=variant_step_rows,
+                                save_file=step_split_scatter_save,
+                                x_key="convergence_speed",
+                                y_key="metric_value",
+                                title=(
+                                    f"{metric_name} vs convergence speed at step={int(step)} "
+                                    f"({method_name}, {module_name}, {branch_name}; "
+                                    f"alignment_metric={alignment_metric_name}; split classes)"
+                                ),
+                                x_label=convergence_x_label,
+                                y_label=metric_name,
+                                split_classes=True,
+                            )
+                        )
+                    if _maybe_skip_wan21_t2v_existing_plot(step_split_scatter_html_save, skip_existing_plots):
+                        plot_paths.append(step_split_scatter_html_save)
+                    else:
+                        html_path = _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
                             rows=variant_step_rows,
-                            save_file=step_raw_save,
-                            x_key="early_alignment_raw",
+                            save_file=step_split_scatter_html_save,
+                            x_key="convergence_speed",
                             y_key="metric_value",
                             title=(
-                                f"{metric_name} vs early alignment at step={int(step)} "
+                                f"{metric_name} vs convergence speed at step={int(step)} "
                                 f"({method_name}, {module_name}, {branch_name}; "
-                                f"alignment_metric={alignment_metric_name})"
+                                f"alignment_metric={alignment_metric_name}; split classes)"
                             ),
-                            x_label="mean reference distance over first 10 steps",
+                            x_label=convergence_x_label,
                             y_label=metric_name,
+                            split_classes=True,
                         )
-                    )
-                if _maybe_skip_wan21_t2v_existing_plot(step_raw_html_save, skip_existing_plots):
-                    plot_paths.append(step_raw_html_save)
-                else:
-                    html_path = _plot_wan21_t2v_trajectory_consensus_interactive_scatter(
-                        rows=variant_step_rows,
-                        save_file=step_raw_html_save,
-                        x_key="early_alignment_raw",
-                        y_key="metric_value",
-                        title=(
-                            f"{metric_name} vs early alignment at step={int(step)} "
-                            f"({method_name}, {module_name}, {branch_name}; "
-                            f"alignment_metric={alignment_metric_name})"
-                        ),
-                        x_label="mean reference distance over first 10 steps",
-                        y_label=metric_name,
-                    )
-                    if html_path:
-                        plot_paths.append(html_path)
+                        if html_path:
+                            plot_paths.append(html_path)
     return [path for path in plot_paths if path]
 
 
@@ -7116,6 +7719,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     target_verb_words: Sequence[str] = tuple(),
     reuse_cross_attention_dir: Optional[str] = None,
     reuse_head_trajectory_dynamics_dir: Optional[str] = None,
+    reuse_head_evolution_dir: Optional[str] = None,
     trajectory_consensus_stages: Sequence[str] = ("candidate_consensus", "head_contribution"),
     trajectory_consensus_steps: Sequence[int] = tuple(),
     trajectory_consensus_layers: Sequence[int] = tuple(),
@@ -7124,6 +7728,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     trajectory_consensus_modules: Sequence[str] = ("cross", "self"),
     trajectory_consensus_branch: str = "cond",
     trajectory_consensus_reference_distance_metrics: Sequence[str] = ("center_l2",),
+    trajectory_consensus_alignment_summary_steps: int = 10,
     trajectory_consensus_scatter_outlier_heads: Sequence[str] = tuple(),
     trajectory_consensus_scatter_outlier_cross_heads: Sequence[str] = tuple(),
     trajectory_consensus_scatter_outlier_self_heads: Sequence[str] = tuple(),
@@ -7147,7 +7752,15 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     trajectory_consensus_taylor_object_only: bool = True,
     trajectory_consensus_taylor_num_latent_frames: int = 10,
     trajectory_consensus_taylor_metric_scope: str = "obj",
+    trajectory_consensus_taylor_patching_metric: str = "v_sum",
+    trajectory_consensus_taylor_ablation_mode: str = "zero_ablation",
     trajectory_consensus_taylor_use_gradient_checkpointing: bool = True,
+    trajectory_consensus_filter_heads: bool = False,
+    trajectory_consensus_filter_step: int = 1,
+    trajectory_consensus_filter_convergence_speed_rule: str = "gt_-inf",
+    trajectory_consensus_filter_contribution_rule: str = "lt_inf",
+    trajectory_consensus_filter_contribution_metric: str = "",
+    trajectory_consensus_filter_module: str = "cross",
     trajectory_consensus_sa_anchor_step: int = 49,
     trajectory_consensus_sa_anchor_layer: int = 27,
     trajectory_consensus_sa_covered_mass_min: float = 0.0,
@@ -7249,6 +7862,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
     ]
     if not reference_distance_metrics:
         reference_distance_metrics = ["center_l2"]
+    alignment_summary_steps = max(1, int(trajectory_consensus_alignment_summary_steps))
     legacy_scatter_outlier_heads = [
         str(head_tag).strip()
         for head_tag in trajectory_consensus_scatter_outlier_heads
@@ -7273,9 +7887,12 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
         "cross": list(scatter_outlier_cross_heads),
         "self": list(scatter_outlier_self_heads),
     }
+    contribution_branch = str(trajectory_consensus_branch).strip().lower()
     taylor_object_only = bool(trajectory_consensus_taylor_object_only)
     taylor_num_latent_frames = int(trajectory_consensus_taylor_num_latent_frames)
     taylor_metric_scope = str(trajectory_consensus_taylor_metric_scope).strip().lower()
+    taylor_patching_metric = str(trajectory_consensus_taylor_patching_metric).strip().lower()
+    taylor_ablation_mode = str(trajectory_consensus_taylor_ablation_mode).strip().lower()
     taylor_use_gradient_checkpointing = bool(trajectory_consensus_taylor_use_gradient_checkpointing)
     if taylor_num_latent_frames == 0:
         raise ValueError("trajectory_consensus_taylor_num_latent_frames must be positive or -1.")
@@ -7283,8 +7900,32 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
         raise ValueError("trajectory_consensus_taylor_num_latent_frames must be positive or -1.")
     if taylor_metric_scope not in {"obj", "global"}:
         raise ValueError("trajectory_consensus_taylor_metric_scope must be `obj` or `global`.")
+    if taylor_patching_metric not in {"v_sum", "ref_dot", "sem_obj"}:
+        raise ValueError("trajectory_consensus_taylor_patching_metric must be `v_sum`, `ref_dot`, or `sem_obj`.")
+    if taylor_patching_metric == "sem_obj" and str(contribution_branch).strip().lower() != "cond":
+        raise ValueError("trajectory_consensus_taylor_patching_metric='sem_obj' currently requires trajectory_consensus_branch='cond'.")
+    if taylor_patching_metric == "sem_obj" and taylor_metric_scope != "obj":
+        raise ValueError("trajectory_consensus_taylor_patching_metric='sem_obj' currently requires trajectory_consensus_taylor_metric_scope='obj'.")
+    if taylor_ablation_mode not in {"zero_ablation", "mean_ablation"}:
+        raise ValueError("trajectory_consensus_taylor_ablation_mode must be `zero_ablation` or `mean_ablation`.")
     if int(trajectory_consensus_sa_precedence_persistence) <= 0:
         raise ValueError("trajectory_consensus_sa_precedence_persistence must be positive.")
+    filter_heads = bool(trajectory_consensus_filter_heads)
+    filter_step = int(trajectory_consensus_filter_step)
+    filter_convergence_speed_rule = _parse_wan21_t2v_filter_rule(
+        str(trajectory_consensus_filter_convergence_speed_rule),
+        default_direction="gt",
+        rule_name="trajectory_consensus_filter_convergence_speed_rule",
+    )
+    filter_contribution_rule = _parse_wan21_t2v_filter_rule(
+        str(trajectory_consensus_filter_contribution_rule),
+        default_direction="lt",
+        rule_name="trajectory_consensus_filter_contribution_rule",
+    )
+    filter_contribution_metric = str(trajectory_consensus_filter_contribution_metric).strip()
+    filter_module = str(trajectory_consensus_filter_module).strip().lower()
+    if filter_module not in {"cross", "self"}:
+        raise ValueError("trajectory_consensus_filter_module must be `cross` or `self`.")
 
     head_contribution_base_dir = os.path.join(output_dir, "trajectory_consensus_head_contribution")
     head_contribution_output_dirs: Dict[str, str] = {}
@@ -7293,10 +7934,11 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
         if contribution_method == "taylor_approx":
             taylor_region_tag = "obj" if taylor_object_only else "global"
             taylor_scope_tag = f"ablate_at_{taylor_region_tag}_{int(taylor_num_latent_frames)}frames"
-            patching_metric_tag = f"patching_metric_{str(taylor_metric_scope)}"
+            patching_metric_tag = f"patching_metric_{str(taylor_patching_metric)}_{str(taylor_metric_scope)}"
+            ablation_mode_tag = f"baseline_{str(taylor_ablation_mode)}"
             method_dir_name = (
                 f"taylor_approx-{ablate_position_tag}-"
-                f"{taylor_scope_tag}-{patching_metric_tag}"
+                f"{taylor_scope_tag}-{patching_metric_tag}-{ablation_mode_tag}"
             )
         else:
             method_dir_name = f"{str(contribution_method)}-{ablate_position_tag}"
@@ -7380,6 +8022,7 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
         "trajectory_consensus_do_ablation": bool(do_ablation),
         "trajectory_consensus_do_direct_proxy": bool(do_direct_proxy),
         "trajectory_consensus_reference_distance_metrics": list(reference_distance_metrics),
+        "trajectory_consensus_alignment_summary_steps": int(alignment_summary_steps),
         "trajectory_consensus_scatter_outlier_heads": list(legacy_scatter_outlier_heads),
         "trajectory_consensus_scatter_outlier_cross_heads": list(scatter_outlier_cross_heads),
         "trajectory_consensus_scatter_outlier_self_heads": list(scatter_outlier_self_heads),
@@ -7390,7 +8033,15 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
         "trajectory_consensus_taylor_object_only": bool(taylor_object_only),
         "trajectory_consensus_taylor_num_latent_frames": int(taylor_num_latent_frames),
         "trajectory_consensus_taylor_metric_scope": str(taylor_metric_scope),
+        "trajectory_consensus_taylor_patching_metric": str(taylor_patching_metric),
+        "trajectory_consensus_taylor_ablation_mode": str(taylor_ablation_mode),
         "trajectory_consensus_taylor_use_gradient_checkpointing": bool(taylor_use_gradient_checkpointing),
+        "trajectory_consensus_filter_heads": bool(filter_heads),
+        "trajectory_consensus_filter_step": int(filter_step),
+        "trajectory_consensus_filter_convergence_speed_rule": str(filter_convergence_speed_rule["text"]),
+        "trajectory_consensus_filter_contribution_rule": str(filter_contribution_rule["text"]),
+        "trajectory_consensus_filter_contribution_metric": str(filter_contribution_metric),
+        "trajectory_consensus_filter_module": str(filter_module),
         "trajectory_consensus_sa_anchor_step": int(trajectory_consensus_sa_anchor_step),
         "trajectory_consensus_sa_anchor_layer": int(trajectory_consensus_sa_anchor_layer),
         "trajectory_consensus_sa_covered_mass_min": float(trajectory_consensus_sa_covered_mass_min),
@@ -8324,8 +8975,10 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
 
         early_alignment_summaries = _load_wan21_t2v_reference_distance_summaries(
             reuse_head_trajectory_dynamics_dir=reuse_head_trajectory_dynamics_dir,
+            reuse_head_evolution_dir=reuse_head_evolution_dir,
             distance_metrics=reference_distance_metrics,
             selected_steps=selected_steps,
+            alignment_summary_steps=alignment_summary_steps,
         )
         legacy_head_contribution_csv_path = os.path.join(output_dir, "trajectory_consensus_head_contribution.csv")
 
@@ -8380,12 +9033,29 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                     metric_value=row.get(metric_name, ""),
                                     alignment_summary=early_alignment_summary[alignment_key],
                                 )
+                if filter_heads:
+                    filtered_head_path = _export_wan21_t2v_filtered_heads(
+                        method_output_dir,
+                        head_contribution_rows_by_method[str(analysis_method)],
+                        analysis_method=str(analysis_method),
+                        module_name=str(filter_module),
+                        branch_name=str(contribution_branch),
+                        reuse_head_evolution_dir=reuse_head_evolution_dir,
+                        alignment_summary_steps=int(alignment_summary_steps),
+                        filter_step=int(filter_step),
+                        convergence_speed_rule=str(filter_convergence_speed_rule["text"]),
+                        contribution_rule=str(filter_contribution_rule["text"]),
+                        contribution_metric_name=str(filter_contribution_metric),
+                    )
+                    if filtered_head_path:
+                        plot_paths.append(filtered_head_path)
                 plot_paths.extend(
                     _render_wan21_t2v_head_contribution_plots(
                         method_output_dir,
                         head_contribution_rows_by_method[str(analysis_method)],
                         scatter_rows_by_method[str(analysis_method)],
                         scatter_outlier_heads_by_module=scatter_outlier_heads_by_module,
+                        alignment_summary_steps=int(alignment_summary_steps),
                         skip_existing_plots=bool(trajectory_consensus_skip_existing_plots),
                     )
                 )
@@ -8560,16 +9230,26 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                     f"Failed to capture global attribution clean v_pred for step={step}, module={module_name}."
                                 )
                             clean_vpred_device = global_attribution_state.captured_clean_vpred
-                            metric_mask_vpred = object_mask_vpred if str(taylor_metric_scope) == "obj" else None
+                            clean_uncond_vpred_cpu = None
+                            if str(taylor_patching_metric) == "sem_obj":
+                                uncond_key = (int(step), "uncond")
+                                if uncond_key not in clean_cache:
+                                    clean_cache[uncond_key] = _run_wan21_t2v_local_clean_vpred(
+                                        pipeline=pipeline,
+                                        latent_input=step_latent_state["latent_input"],
+                                        timestep_value=step_latent_state["timestep"],
+                                        seq_len=int(step_latent_state["seq_len"]),
+                                        context=step_latent_state["context_null"],
+                                    )
+                                clean_uncond_vpred_cpu = clean_cache[uncond_key]
                             target_model.zero_grad(set_to_none=True)
-                            if metric_mask_vpred is not None:
-                                metric_mask_device = metric_mask_vpred.to(
-                                    device=clean_vpred_device.device,
-                                    dtype=clean_vpred_device.dtype,
-                                ).unsqueeze(0)
-                                scalar_metric = (clean_vpred_device * metric_mask_device).sum()
-                            else:
-                                scalar_metric = clean_vpred_device.sum()
+                            scalar_metric = _build_wan21_t2v_taylor_scalar_metric(
+                                clean_vpred=clean_vpred_device,
+                                metric_scope=str(taylor_metric_scope),
+                                patching_metric=str(taylor_patching_metric),
+                                object_mask_fhw=object_mask_vpred,
+                                clean_uncond_vpred=clean_uncond_vpred_cpu,
+                            )
                             scalar_metric.backward(retain_graph=False)
                             for key, head_writes in global_attribution_state.captured_head_writes.items():
                                 grad_obj = global_attribution_state.captured_head_writes_grad_obj.get(key, None)
@@ -8581,9 +9261,12 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
                                 taylor_metrics_by_layer_module[key] = _compute_wan21_t2v_taylor_contribution_metrics(
                                     head_writes=head_writes,
                                     head_writes_grad=grad_obj,
+                                    ablation_mode=str(taylor_ablation_mode),
+                                    full_token_head_mean=global_attribution_state.captured_head_write_means.get(key),
                                 )
                             global_attribution_state.captured_clean_vpred = None
                             global_attribution_state.captured_head_writes.clear()
+                            global_attribution_state.captured_head_write_means.clear()
                             global_attribution_state.captured_head_writes_grad_obj.clear()
                             del scalar_metric
                             del clean_vpred_device
@@ -8858,12 +9541,29 @@ def run_wan21_t2v_trajectory_consensus_dynamics(
             method_output_dir = head_contribution_output_dirs.get(str(analysis_method))
             if not method_output_dir:
                 continue
+            if filter_heads:
+                filtered_head_path = _export_wan21_t2v_filtered_heads(
+                    method_output_dir,
+                    method_rows,
+                    analysis_method=str(analysis_method),
+                    module_name=str(filter_module),
+                    branch_name=str(contribution_branch),
+                    reuse_head_evolution_dir=reuse_head_evolution_dir,
+                    alignment_summary_steps=int(alignment_summary_steps),
+                    filter_step=int(filter_step),
+                    convergence_speed_rule=str(filter_convergence_speed_rule["text"]),
+                    contribution_rule=str(filter_contribution_rule["text"]),
+                    contribution_metric_name=str(filter_contribution_metric),
+                )
+                if filtered_head_path:
+                    plot_paths.append(filtered_head_path)
             plot_paths.extend(
                 _render_wan21_t2v_head_contribution_plots(
                     method_output_dir,
                     method_rows,
                     scatter_rows_by_method.get(str(analysis_method), []),
                     scatter_outlier_heads_by_module=scatter_outlier_heads_by_module,
+                    alignment_summary_steps=int(alignment_summary_steps),
                     skip_existing_plots=bool(trajectory_consensus_skip_existing_plots),
                 )
             )

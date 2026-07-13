@@ -64,6 +64,24 @@ class PromptSample:
 _LAMBDA_PATCH_INSTALLED = False
 
 
+def parse_step_list(value: str | None) -> set[int] | None:
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value == '':
+        return None
+    steps = set()
+    for item in value.split(','):
+        item = item.strip()
+        if item == '':
+            continue
+        step = int(item)
+        if step <= 0:
+            raise ValueError(f'Lambda denoising steps must be positive 1-based indices, got {step}.')
+        steps.add(step)
+    return steps or None
+
+
 def _rescale_official_rope_freqs(freqs: torch.Tensor, lambda_scales: torch.Tensor | None, num_heads: int) -> torch.Tensor:
     if lambda_scales is None:
         return freqs
@@ -235,7 +253,8 @@ def install_official_wan_lambda_patch() -> None:
 
         rope_lambda_scales_all = None
         rope_lambda_module = getattr(self, 'spatial_rope_lambda', None)
-        if rope_lambda_module is not None:
+        lambda_enabled_for_step = getattr(self, '_wan_eval_lambda_enabled_for_step', True)
+        if rope_lambda_module is not None and lambda_enabled_for_step:
             rope_lambda_scales_all = rope_lambda_module(t)
 
         kwargs = dict(
@@ -333,8 +352,15 @@ def parse_experiment_name(experiment_name: str) -> dict:
         'wan_spatial_rope_lambda_scope': None,
         'wan_spatial_rope_lambda_timestep_conditioned': None,
         'wan_spatial_rope_lambda_hidden_dim': None,
+        'wan_spatial_rope_lambda_parametrization': None,
+        'wan_spatial_rope_lambda_min': None,
+        'wan_spatial_rope_lambda_init_eps': None,
+        'wan_spatial_rope_lambda_fixed_h': None,
+        'wan_spatial_rope_lambda_fixed_w': None,
+        'wan_spatial_rope_lambda_global': None,
     }
 
+    float_pattern = r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
     patterns = {
         'lora_rank': r'(?:^|-)lora_rank_([^\-\s]+)',
         'lora_alpha': r'(?:^|-)lora_alpha_([^\-\s]+)',
@@ -342,6 +368,15 @@ def parse_experiment_name(experiment_name: str) -> dict:
         'lambda_scope': r'(?:^|-)lambda_scope_([^\-\s]+)',
         'lambda_tcond': r'(?:^|-)lambda_tcond_([^\-\s]+)',
         'lambda_hidden': r'(?:^|-)lambda_hidden_([^\-\s]+)',
+        'lambda_parametrization': r'(?:^|-)lambda_param_([^\-\s]+)',
+        'lambda_min': rf'(?:^|-)lambda_min_({float_pattern})',
+        'lambda_init_eps': rf'(?:^|-)lambda_init_eps_({float_pattern})',
+        'fixed_lambda_h': rf'(?:^|-)lambda_h_({float_pattern})',
+        'fixed_lambda_w': rf'(?:^|-)lambda_w_({float_pattern})',
+        'lambda_global': r'(?:^|-)lambda_global_([^\-\s]+)',
+        'legacy_range_parametrization': r'(?:^|-)range_(.+?)_min_',
+        'legacy_range_min': rf'(?:^|-)range_.+?_min_({float_pattern})(?=_eps_|-steps_|-epochs_|-warmup_|-adam_beta1_|-beta2_|-timestep_|-seed_|$)',
+        'legacy_range_eps': rf'(?:^|-)range_.+?_min_{float_pattern}_eps_({float_pattern})(?=-steps_|-epochs_|-warmup_|-adam_beta1_|-beta2_|-timestep_|-seed_|$)',
     }
 
     matches = {}
@@ -365,6 +400,29 @@ def parse_experiment_name(experiment_name: str) -> dict:
         parsed['wan_spatial_rope_lambda_timestep_conditioned'] = bool(int(matches['lambda_tcond']))
     if 'lambda_hidden' in matches:
         parsed['wan_spatial_rope_lambda_hidden_dim'] = int(matches['lambda_hidden'])
+    if 'lambda_parametrization' in matches:
+        parsed['wan_spatial_rope_lambda_parametrization'] = matches['lambda_parametrization']
+    elif 'legacy_range_parametrization' in matches:
+        parsed['wan_spatial_rope_lambda_parametrization'] = matches['legacy_range_parametrization']
+    elif 'fixed_lambda' in experiment_name:
+        parsed['wan_spatial_rope_lambda_parametrization'] = 'fixed'
+    if 'lambda_min' in matches:
+        parsed['wan_spatial_rope_lambda_min'] = float(matches['lambda_min'])
+    elif 'legacy_range_min' in matches:
+        parsed['wan_spatial_rope_lambda_min'] = float(matches['legacy_range_min'])
+    if 'lambda_init_eps' in matches:
+        parsed['wan_spatial_rope_lambda_init_eps'] = float(matches['lambda_init_eps'])
+    elif 'legacy_range_eps' in matches:
+        parsed['wan_spatial_rope_lambda_init_eps'] = float(matches['legacy_range_eps'])
+    if 'fixed_lambda_h' in matches:
+        parsed['wan_spatial_rope_lambda_fixed_h'] = float(matches['fixed_lambda_h'])
+        parsed['wan_spatial_rope_lambda_parametrization'] = 'fixed'
+    if 'fixed_lambda_w' in matches:
+        parsed['wan_spatial_rope_lambda_fixed_w'] = float(matches['fixed_lambda_w'])
+        parsed['wan_spatial_rope_lambda_parametrization'] = 'fixed'
+    if 'lambda_global' in matches:
+        value = str(matches['lambda_global']).strip().lower()
+        parsed['wan_spatial_rope_lambda_global'] = value in {'1', 'true', 'yes', 'y'}
 
     return parsed
 
@@ -589,6 +647,11 @@ class BatchWanT2V(wan.WanT2V):
         if lambda_tcond is None:
             lambda_tcond = False
         lambda_hidden_dim = spatial_rope_lambda_hidden_dim or int(training_args.get('wan_spatial_rope_lambda_hidden_dim', 128))
+        lambda_parametrization = str(training_args.get('wan_spatial_rope_lambda_parametrization') or 'unconstrained')
+        lambda_min = float(training_args.get('wan_spatial_rope_lambda_min', 0.5))
+        lambda_init_eps = float(training_args.get('wan_spatial_rope_lambda_init_eps', 1e-4))
+        lambda_fixed_h = float(training_args.get('wan_spatial_rope_lambda_fixed_h', 1.0))
+        lambda_fixed_w = float(training_args.get('wan_spatial_rope_lambda_fixed_w', 1.0))
         lambda_checkpoint_path = spatial_rope_lambda_checkpoint or artifacts['lambda_checkpoint_path']
         resolved_lora_target_modules = parse_lora_target_modules(lora_target_modules)
         if resolved_lora_target_modules is None:
@@ -599,8 +662,10 @@ class BatchWanT2V(wan.WanT2V):
             resolved_lora_target_modules = parse_lora_target_modules(resolved_lora_target_modules)
         if resolved_lora_target_modules is None:
             resolved_lora_target_modules = preset_to_lora_target_modules(training_args.get('lora_modules'))
-        resolved_lora_rank = int(lora_rank if lora_rank is not None else training_args.get('lora_rank', 32))
-        resolved_lora_alpha = int(lora_alpha if lora_alpha is not None else training_args.get('lora_alpha', resolved_lora_rank))
+        raw_lora_rank = lora_rank if lora_rank is not None else training_args.get('lora_rank')
+        raw_lora_alpha = lora_alpha if lora_alpha is not None else training_args.get('lora_alpha')
+        resolved_lora_rank = None if raw_lora_rank is None else int(raw_lora_rank)
+        resolved_lora_alpha = None if raw_lora_alpha is None else int(raw_lora_alpha)
 
         main_checkpoint_path = artifacts['main_checkpoint_path']
         if main_checkpoint_path is not None:
@@ -611,6 +676,10 @@ class BatchWanT2V(wan.WanT2V):
                     raise RuntimeError(
                         'Detected LoRA weights in the checkpoint, but no lora_target_modules were provided and training_args.json does not contain them.'
                     )
+                if resolved_lora_rank is None:
+                    resolved_lora_rank = 32
+                if resolved_lora_alpha is None:
+                    resolved_lora_alpha = resolved_lora_rank
                 lora_config = LoraConfig(
                     r=resolved_lora_rank,
                     lora_alpha=resolved_lora_alpha,
@@ -666,6 +735,11 @@ class BatchWanT2V(wan.WanT2V):
                 learn_f=False,
                 timestep_conditioned=bool(lambda_tcond),
                 hidden_dim=int(lambda_hidden_dim),
+                parametrization=lambda_parametrization,
+                lambda_min=lambda_min,
+                init_eps=lambda_init_eps,
+                fixed_h=lambda_fixed_h,
+                fixed_w=lambda_fixed_w,
             ).to(device=self.device)
             self.model.spatial_rope_lambda = module
             if lambda_checkpoint_path:
@@ -692,9 +766,20 @@ class BatchWanT2V(wan.WanT2V):
                     len(unexpected),
                 )
             else:
-                logging.warning(
-                    'Spatial RoPE lambda was enabled but no checkpoint was provided. The lambda module stays at identity initialization.'
-                )
+                if lambda_parametrization == 'fixed':
+                    logging.info(
+                        'Enabled fixed spatial RoPE lambda without a separate lambda checkpoint: scope=%s, fixed_h=%.6f, fixed_w=%.6f.',
+                        lambda_scope,
+                        lambda_fixed_h,
+                        lambda_fixed_w,
+                    )
+                else:
+                    logging.warning(
+                        'Spatial RoPE lambda was enabled but no checkpoint was provided. The lambda module stays at initialization: parametrization=%s, scope=%s, timestep_conditioned=%s.',
+                        lambda_parametrization,
+                        lambda_scope,
+                        bool(lambda_tcond),
+                    )
             self.lambda_loaded = True
 
     def generate_batch(
@@ -710,6 +795,7 @@ class BatchWanT2V(wan.WanT2V):
         seeds: list[int] | None = None,
         offload_model: bool = True,
         show_progress: bool = True,
+        spatial_rope_lambda_steps: set[int] | None = None,
     ) -> list[torch.Tensor]:
         if not prompts:
             return []
@@ -753,7 +839,9 @@ class BatchWanT2V(wan.WanT2V):
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
             self.model.to(self.device)
             progress = tqdm(timesteps, disable=not show_progress, desc='Sampling')
-            for t in progress:
+            for progress_id, t in enumerate(progress, start=1):
+                lambda_enabled_for_step = spatial_rope_lambda_steps is None or progress_id in spatial_rope_lambda_steps
+                setattr(self.model, '_wan_eval_lambda_enabled_for_step', lambda_enabled_for_step)
                 timestep = torch.stack([t] * batch_size)
                 noise_pred_cond = self.model(latents, t=timestep, **arg_c)
                 noise_pred_uncond = self.model(latents, t=timestep, **arg_null)
@@ -772,6 +860,7 @@ class BatchWanT2V(wan.WanT2V):
                 self.model.cpu()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+            setattr(self.model, '_wan_eval_lambda_enabled_for_step', True)
             videos = self.vae.decode(latents)
 
         del sample_scheduler
@@ -831,6 +920,25 @@ def run_worker(args, samples: list[PromptSample]) -> None:
     )
 
     size = SIZE_CONFIGS[args.size]
+    lambda_steps = parse_step_list(args.spatial_rope_lambda_steps)
+    inferred_for_lambda_steps = collect_inferred_training_args(
+        args.model_path,
+        resolve_model_artifacts(args.model_path)['training_args_path'] if args.model_path else None,
+    ) if args.model_path else {}
+    lambda_global = inferred_for_lambda_steps.get('wan_spatial_rope_lambda_global')
+    if lambda_global is True:
+        lambda_steps = None
+        args.spatial_rope_lambda_steps = ''
+        logging.info('Checkpoint name/config requests lambda_global=True; spatial RoPE lambda is forced active on all denoising steps.')
+    elif lambda_global is False:
+        logging.info('Checkpoint name/config requests lambda_global=False; respecting --spatial_rope_lambda_steps.')
+    if lambda_steps is None:
+        logging.info('Spatial RoPE lambda is active on all denoising steps.')
+    else:
+        logging.info(
+            'Spatial RoPE lambda is restricted to denoising steps (1-based): %s',
+            ','.join(str(step) for step in sorted(lambda_steps)),
+        )
     total_batches = math.ceil(len(samples) / args.batch_size)
     for batch_id, batch in enumerate(iter_batches(samples, args.batch_size), start=1):
         prompts = [sample.prompt for sample in batch]
@@ -855,6 +963,7 @@ def run_worker(args, samples: list[PromptSample]) -> None:
             seeds=seeds,
             offload_model=args.offload_model,
             show_progress=not args.disable_tqdm,
+            spatial_rope_lambda_steps=lambda_steps,
         )
         save_videos(videos, batch, Path(args.output_dir), fps=cfg.sample_fps)
         logging.info('Saved batch %d outputs to %s', batch_id, args.output_dir)
@@ -913,6 +1022,8 @@ def launch_multi_gpu_workers(args, samples: list[PromptSample]) -> None:
             cmd.extend(['--spatial_rope_lambda_hidden_dim', str(args.spatial_rope_lambda_hidden_dim)])
         if args.spatial_rope_lambda_checkpoint:
             cmd.extend(['--spatial_rope_lambda_checkpoint', args.spatial_rope_lambda_checkpoint])
+        if args.spatial_rope_lambda_steps:
+            cmd.extend(['--spatial_rope_lambda_steps', args.spatial_rope_lambda_steps])
         if args.lora_target_modules:
             cmd.extend(['--lora_target_modules', args.lora_target_modules])
         if args.lora_rank is not None:
@@ -961,6 +1072,7 @@ def parse_args():
     parser.add_argument('--spatial_rope_lambda_timestep_conditioned', action='store_true', default=None, help='Enable timestep-conditioned lambda MLP g(e_t).')
     parser.add_argument('--spatial_rope_lambda_hidden_dim', type=int, default=None, help='Hidden dimension of the timestep-conditioned lambda MLP.')
     parser.add_argument('--spatial_rope_lambda_checkpoint', type=str, default='', help='Optional explicit lambda checkpoint path. When omitted, the script tries to infer it from model_path.')
+    parser.add_argument('--spatial_rope_lambda_steps', type=str, default='', help='Optional comma-separated 1-based denoising step indices where lambda stays active, for example `1,2,3,4,5`. Empty means enable lambda on every denoising step.')
     parser.add_argument('--worker_mode', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--disable_tqdm', action='store_true', help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -978,6 +1090,7 @@ def validate_args(args):
         raise ValueError(f'frame_num must be positive and satisfy 4n+1, got {args.frame_num}.')
     if args.batch_size <= 0:
         raise ValueError(f'batch_size must be positive, got {args.batch_size}.')
+    parse_step_list(args.spatial_rope_lambda_steps)
     if args.gpu_ids:
         gpu_ids = [gpu_id.strip() for gpu_id in args.gpu_ids.split(',') if gpu_id.strip()]
         if not gpu_ids:

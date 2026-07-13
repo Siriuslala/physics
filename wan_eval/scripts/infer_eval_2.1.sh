@@ -15,19 +15,32 @@ GPU_IDS=2
 export CUDA_VISIBLE_DEVICES=$GPU_IDS
 GPU_TAG=a800
 
-SEEDS=(1 8 20 23 29)
+SEEDS=(8 1 20 23 29)
 BENCHMARK_NAME=test
 BATCH_SIZE=1
 
 # SEEDS=(42)
-# BENCHMARK_NAME=videophy2_rewrite  # test | videophy2 | videophy2_rewrite | phygenbench
+# BENCHMARK_NAME=phygenbench  # test | videophy2 | videophy2_rewrite | phygenbench
 # BATCH_SIZE=4
 
 MODEL_TYPE=1.3B
-MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_lora/lambda_lora-bsz_16-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_0.80-seed_42
-CKPT_STEP=1000
+
+# MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_lora/lambda_lora-bsz_16-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_0.80-seed_42
+# MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_lora/lambda_lora-bsz_16-lr_1e-4-lora_rank_128-lora_alpha_64-lora_modules_attn_ffn-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_0.80-seed_42
+# MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_only/lambda_only-bsz_16-lr_1e-3-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_0.80-seed_42
+# MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_only/lambda_only-bsz_16-lr_1e-3-lambda_scope_head-lambda_lr_1e-3-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_0.80-seed_42
+# MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_only/lambda_only-bsz_16-lr_1e-3-lambda_scope_head-lambda_lr_1e-3-lambda_beta_0-lambda_tcond_1-lambda_hidden_128-range_bounded_leq_one_min_0.45_eps_5e-2-steps_3000-warmup_0.01-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_1.00-seed_42
+MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_16-lr_1e-4-lora_rank_128-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_3000-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42
+MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_16-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lam_schedulecosine_1500-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.1_prob_0.9-seed_42
 # MODEL_PATH=
 # CKPT_STEP=
+
+CKPT_STEP=1500
+
+
+# null | 1,2,3,4,5
+SPATIAL_ROPE_LAMBDA_STEPS=
+SPATIAL_ROPE_LAMBDA_STEPS=1,2,3,4,5
 
 # dir
 # $WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lora
@@ -115,8 +128,31 @@ else
   CKPT_STEP_TAG=ckpt_step_latest
 fi
 
+EFFECTIVE_SPATIAL_ROPE_LAMBDA_STEPS="$SPATIAL_ROPE_LAMBDA_STEPS"
+LAMBDA_GLOBAL_FROM_CKPT=unset
+if [[ "$MODEL_NAME" =~ (^|-)lambda_global_([^-/]+) ]]; then
+  LAMBDA_GLOBAL_FROM_CKPT="${BASH_REMATCH[2]}"
+  case "${LAMBDA_GLOBAL_FROM_CKPT,,}" in
+    1|true|yes|y)
+      EFFECTIVE_SPATIAL_ROPE_LAMBDA_STEPS=""
+      ;;
+    0|false|no|n)
+      ;;
+    *)
+      echo "Unsupported lambda_global value in checkpoint name: $LAMBDA_GLOBAL_FROM_CKPT" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+OUTPUT_CKPT_STEP_TAG="$CKPT_STEP_TAG"
+if [[ -n "$EFFECTIVE_SPATIAL_ROPE_LAMBDA_STEPS" ]]; then
+  LAMBDA_STEPS_TAG="${EFFECTIVE_SPATIAL_ROPE_LAMBDA_STEPS//,/-}"
+  OUTPUT_CKPT_STEP_TAG="${CKPT_STEP_TAG}_lambda_steps_${LAMBDA_STEPS_TAG}"
+fi
+
 for BASE_SEED in "${SEEDS[@]}"; do
-  OUTPUT_DIR=$WORK_DIR/wan_eval/$BENCHMARK_NAME/$GPU_TAG/$BASE_SEED/$MODEL_NAME/$CKPT_STEP_TAG
+  OUTPUT_DIR=$WORK_DIR/wan_eval/$BENCHMARK_NAME/$GPU_TAG/$BASE_SEED/$MODEL_NAME/$OUTPUT_CKPT_STEP_TAG
   mkdir -p "$OUTPUT_DIR"
 
   ARGS=(
@@ -153,6 +189,9 @@ for BASE_SEED in "${SEEDS[@]}"; do
   if [[ "$T5_CPU" == "1" ]]; then
     ARGS+=(--t5_cpu)
   fi
+  if [[ -n "$EFFECTIVE_SPATIAL_ROPE_LAMBDA_STEPS" ]]; then
+    ARGS+=(--spatial_rope_lambda_steps "$EFFECTIVE_SPATIAL_ROPE_LAMBDA_STEPS")
+  fi
 
   printf 'Benchmark: %s\n' "$BENCHMARK_NAME"
   printf 'Input JSONL: %s\n' "$INPUT_JSONL"
@@ -164,6 +203,9 @@ for BASE_SEED in "${SEEDS[@]}"; do
   printf 'Model Path: %s\n' "${MODEL_PATH:-<original>}"
   printf 'CKPT_STEP: %s\n' "${CKPT_STEP:-<latest>}"
   printf 'Resolved Model Path: %s\n' "${RESOLVED_MODEL_PATH:-<original>}"
+  printf 'Configured Lambda Steps: %s\n' "${SPATIAL_ROPE_LAMBDA_STEPS:-<all>}"
+  printf 'Checkpoint lambda_global: %s\n' "$LAMBDA_GLOBAL_FROM_CKPT"
+  printf 'Effective Lambda Steps: %s\n' "${EFFECTIVE_SPATIAL_ROPE_LAMBDA_STEPS:-<all>}"
   printf 'Result JSONL: %s\n' "$OUTPUT_DIR/$(basename "$INPUT_JSONL" .jsonl)_with_video_url.jsonl"
   printf 'LoRA/Lambda Config Source: %s\n' "${RESOLVED_MODEL_PATH:-official base model}"
 

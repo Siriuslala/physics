@@ -58,6 +58,14 @@ class WanTrainingModule(DiffusionTrainingModule):
         wan_spatial_rope_lambda_lr=None,
         wan_spatial_rope_lambda_beta=0.0,
         wan_spatial_rope_lambda_checkpoint=None,
+        wan_spatial_rope_lambda_parametrization="unconstrained",
+        wan_spatial_rope_lambda_min=0.5,
+        wan_spatial_rope_lambda_init_eps=1e-4,
+        wan_spatial_rope_lambda_fixed_h=1.0,
+        wan_spatial_rope_lambda_fixed_w=1.0,
+        wan_spatial_rope_lambda_fixed_schedule="constant",
+        wan_spatial_rope_lambda_fixed_schedule_steps=0,
+        wan_spatial_rope_lambda_global=True,
         timestep_sampling_strategy="uniform",
         timestep_mixture_early_boundary=0.12,
         timestep_mixture_early_prob=0.5,
@@ -91,6 +99,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.wan_spatial_rope_lambda_enabled = bool(wan_spatial_rope_lambda_enabled) and not task.endswith(":data_process")
         self.wan_spatial_rope_lambda_lr = wan_spatial_rope_lambda_lr
         self.wan_spatial_rope_lambda_beta = float(wan_spatial_rope_lambda_beta or 0.0)
+        self.wan_spatial_rope_lambda_global = bool(wan_spatial_rope_lambda_global)
         if self.wan_spatial_rope_lambda_enabled:
             self.attach_wan_spatial_rope_lambda(
                 scope=wan_spatial_rope_lambda_scope,
@@ -98,6 +107,13 @@ class WanTrainingModule(DiffusionTrainingModule):
                 timestep_conditioned=wan_spatial_rope_lambda_timestep_conditioned,
                 hidden_dim=wan_spatial_rope_lambda_hidden_dim,
                 checkpoint=wan_spatial_rope_lambda_checkpoint,
+                parametrization=wan_spatial_rope_lambda_parametrization,
+                lambda_min=wan_spatial_rope_lambda_min,
+                init_eps=wan_spatial_rope_lambda_init_eps,
+                fixed_h=wan_spatial_rope_lambda_fixed_h,
+                fixed_w=wan_spatial_rope_lambda_fixed_w,
+                fixed_schedule=wan_spatial_rope_lambda_fixed_schedule,
+                fixed_schedule_steps=wan_spatial_rope_lambda_fixed_schedule_steps,
             )
         
         # Store other configs
@@ -123,7 +139,21 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.timestep_mixture_early_boundary = float(timestep_mixture_early_boundary)
         self.timestep_mixture_early_prob = float(timestep_mixture_early_prob)
 
-    def attach_wan_spatial_rope_lambda(self, scope, learn_f, timestep_conditioned, hidden_dim, checkpoint=None):
+    def attach_wan_spatial_rope_lambda(
+        self,
+        scope,
+        learn_f,
+        timestep_conditioned,
+        hidden_dim,
+        checkpoint=None,
+        parametrization="unconstrained",
+        lambda_min=0.5,
+        init_eps=1e-4,
+        fixed_h=1.0,
+        fixed_w=1.0,
+        fixed_schedule="constant",
+        fixed_schedule_steps=0,
+    ):
         dit = self.pipe.dit
         module = WanSpatialRopeLambda(
             num_layers=len(dit.blocks),
@@ -133,6 +163,13 @@ class WanTrainingModule(DiffusionTrainingModule):
             learn_f=learn_f,
             timestep_conditioned=timestep_conditioned,
             hidden_dim=hidden_dim,
+            parametrization=parametrization,
+            lambda_min=lambda_min,
+            init_eps=init_eps,
+            fixed_h=fixed_h,
+            fixed_w=fixed_w,
+            fixed_schedule=fixed_schedule,
+            fixed_schedule_steps=fixed_schedule_steps,
         ).to(device=next(dit.parameters()).device)
         if checkpoint is not None and str(checkpoint).strip():
             state = load_state_dict(str(checkpoint).strip())
@@ -149,8 +186,18 @@ class WanTrainingModule(DiffusionTrainingModule):
         print(
             "Wan spatial RoPE lambda enabled: "
             f"scope={scope}, learn_f={learn_f}, timestep_conditioned={timestep_conditioned}, "
-            f"hidden_dim={hidden_dim}, beta={self.wan_spatial_rope_lambda_beta}."
+            f"hidden_dim={hidden_dim}, parametrization={parametrization}, lambda_min={lambda_min}, "
+            f"init_eps={init_eps}, fixed_h={fixed_h}, fixed_w={fixed_w}, "
+            f"fixed_schedule={fixed_schedule}, fixed_schedule_steps={fixed_schedule_steps}, "
+            f"beta={self.wan_spatial_rope_lambda_beta}."
         )
+
+    def set_training_progress(self, step, total_steps=None):
+        if not self.wan_spatial_rope_lambda_enabled:
+            return
+        module = getattr(self.pipe.dit, "spatial_rope_lambda", None)
+        if module is not None and hasattr(module, "set_training_progress"):
+            module.set_training_progress(step, total_steps)
 
     def get_optimizer_param_groups(self, default_lr, default_weight_decay):
         if not self.wan_spatial_rope_lambda_enabled:
@@ -179,6 +226,8 @@ class WanTrainingModule(DiffusionTrainingModule):
             return {}
         metrics = module.summary()
         metrics["lambda/beta"] = float(self.wan_spatial_rope_lambda_beta)
+        metrics["lambda/global"] = 1.0 if self.wan_spatial_rope_lambda_global else 0.0
+        metrics["lambda/active"] = 1.0 if getattr(self.pipe.dit, "_wan_train_lambda_enabled_for_timestep", True) else 0.0
         lambda_reg_loss = getattr(self, "_last_lambda_reg_loss", None)
         if lambda_reg_loss is not None:
             metrics["lambda_reg_loss"] = lambda_reg_loss
@@ -212,6 +261,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs_shared["timestep_sampling_strategy"] = self.timestep_sampling_strategy
         inputs_shared["timestep_mixture_early_boundary"] = self.timestep_mixture_early_boundary
         inputs_shared["timestep_mixture_early_prob"] = self.timestep_mixture_early_prob
+        inputs_shared["wan_spatial_rope_lambda_global"] = self.wan_spatial_rope_lambda_global
         return inputs_shared, inputs_posi, inputs_nega
 
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
@@ -588,6 +638,14 @@ def wan_parser():
     parser.add_argument("--wan_spatial_rope_lambda_lr", type=float, default=None, help="Optional learning rate for spatial RoPE lambda parameters.")
     parser.add_argument("--wan_spatial_rope_lambda_beta", type=float, default=0.0, help="L2 regularization coefficient on effective log lambda.")
     parser.add_argument("--wan_spatial_rope_lambda_checkpoint", type=str, default=None, help="Optional checkpoint for the spatial RoPE lambda module.")
+    parser.add_argument("--wan_spatial_rope_lambda_parametrization", type=str, default="unconstrained", choices=["unconstrained", "softplus_leq_one", "bounded_leq_one", "fixed"], help="Parameterization for spatial RoPE lambda. Constrained modes force lambda_h/w <= 1; fixed keeps manual constants and does not train lambda.")
+    parser.add_argument("--wan_spatial_rope_lambda_min", type=float, default=0.5, help="Lower bound for --wan_spatial_rope_lambda_parametrization bounded_leq_one.")
+    parser.add_argument("--wan_spatial_rope_lambda_init_eps", type=float, default=1e-4, help="Near-identity initialization epsilon. Constrained modes initialize lambda_h/w to about 1 - eps.")
+    parser.add_argument("--wan_spatial_rope_lambda_fixed_h", type=float, default=1.0, help="Fixed manual height-axis lambda for --wan_spatial_rope_lambda_parametrization fixed.")
+    parser.add_argument("--wan_spatial_rope_lambda_fixed_w", type=float, default=1.0, help="Fixed manual width-axis lambda for --wan_spatial_rope_lambda_parametrization fixed.")
+    parser.add_argument("--wan_spatial_rope_lambda_fixed_schedule", type=str, default="constant", choices=["constant", "linear", "cosine"], help="Optional training-step schedule for fixed lambda. constant applies the target immediately; linear/cosine anneal from 1 to the target.")
+    parser.add_argument("--wan_spatial_rope_lambda_fixed_schedule_steps", type=int, default=0, help="Number of optimizer update steps used by the fixed lambda schedule. 0 uses total training steps.")
+    parser.add_argument("--wan_spatial_rope_lambda_global", default=True, action=argparse.BooleanOptionalAction, help="If true, apply fixed spatial RoPE lambda on all sampled training timesteps. If false, apply it only inside --timestep_mixture_early_boundary.")
     parser.add_argument("--cache_prefetch_batches", type=int, default=0, help="Number of preprocessed cache batches to keep in a background prefetch queue during data_process. 0 disables it.")
     parser.add_argument("--cache_resume", default=False, action="store_true", help="Resume single-process cache generation by skipping existing continuous 0.pth..N.pth files.")
     parser.add_argument("--cache_skip_mismatched_shapes", default=False, action="store_true", help="During data_process, skip samples whose decoded video shape does not match --num_frames/--height/--width and log them to jsonl.")
@@ -664,6 +722,14 @@ if __name__ == "__main__":
         wan_spatial_rope_lambda_lr=args.wan_spatial_rope_lambda_lr,
         wan_spatial_rope_lambda_beta=args.wan_spatial_rope_lambda_beta,
         wan_spatial_rope_lambda_checkpoint=args.wan_spatial_rope_lambda_checkpoint,
+        wan_spatial_rope_lambda_parametrization=args.wan_spatial_rope_lambda_parametrization,
+        wan_spatial_rope_lambda_min=args.wan_spatial_rope_lambda_min,
+        wan_spatial_rope_lambda_init_eps=args.wan_spatial_rope_lambda_init_eps,
+        wan_spatial_rope_lambda_fixed_h=args.wan_spatial_rope_lambda_fixed_h,
+        wan_spatial_rope_lambda_fixed_w=args.wan_spatial_rope_lambda_fixed_w,
+        wan_spatial_rope_lambda_fixed_schedule=args.wan_spatial_rope_lambda_fixed_schedule,
+        wan_spatial_rope_lambda_fixed_schedule_steps=args.wan_spatial_rope_lambda_fixed_schedule_steps,
+        wan_spatial_rope_lambda_global=args.wan_spatial_rope_lambda_global,
         timestep_sampling_strategy=args.timestep_sampling_strategy,
         timestep_mixture_early_boundary=args.timestep_mixture_early_boundary,
         timestep_mixture_early_prob=args.timestep_mixture_early_prob,

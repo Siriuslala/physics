@@ -176,6 +176,8 @@ class AttentionModule(nn.Module):
 
 
 class WanSpatialRopeLambda(nn.Module):
+    PARAMETRIZATIONS = {"unconstrained", "softplus_leq_one", "bounded_leq_one", "fixed"}
+
     def __init__(
         self,
         num_layers: int,
@@ -185,10 +187,31 @@ class WanSpatialRopeLambda(nn.Module):
         learn_f: bool = False,
         timestep_conditioned: bool = True,
         hidden_dim: int = 128,
+        parametrization: str = "unconstrained",
+        lambda_min: float = 0.5,
+        init_eps: float = 1e-4,
+        fixed_h: float = 1.0,
+        fixed_w: float = 1.0,
+        fixed_schedule: str = "constant",
+        fixed_schedule_steps: int = 0,
     ):
         super().__init__()
         if scope not in {"model", "layer", "head"}:
             raise ValueError(f"scope must be one of {{'model', 'layer', 'head'}}, got {scope!r}.")
+        if parametrization not in self.PARAMETRIZATIONS:
+            raise ValueError(f"parametrization must be one of {sorted(self.PARAMETRIZATIONS)}, got {parametrization!r}.")
+        if not (0.0 <= float(init_eps) < 1.0):
+            raise ValueError(f"init_eps must be in [0, 1), got {init_eps}.")
+        if not (0.0 <= float(lambda_min) < 1.0):
+            raise ValueError(f"lambda_min must be in [0, 1), got {lambda_min}.")
+        if parametrization in {"softplus_leq_one", "bounded_leq_one"} and float(init_eps) <= 0.0:
+            raise ValueError("Constrained lambda parameterizations need init_eps > 0 because exact lambda=1 requires infinite raw parameters.")
+        if parametrization == "bounded_leq_one" and (1.0 - float(init_eps)) <= float(lambda_min):
+            raise ValueError("bounded_leq_one needs lambda_min < 1 - init_eps for near-identity initialization.")
+        if fixed_h <= 0 or fixed_w <= 0:
+            raise ValueError(f"fixed_h and fixed_w must be positive, got fixed_h={fixed_h}, fixed_w={fixed_w}.")
+        if fixed_schedule not in {"constant", "linear", "cosine"}:
+            raise ValueError(f"fixed_schedule must be one of {{'constant', 'linear', 'cosine'}}, got {fixed_schedule!r}.")
         self.num_layers = int(num_layers)
         self.num_heads = int(num_heads)
         self.freq_dim = int(freq_dim)
@@ -196,6 +219,15 @@ class WanSpatialRopeLambda(nn.Module):
         self.learn_f = bool(learn_f)
         self.timestep_conditioned = bool(timestep_conditioned)
         self.hidden_dim = int(hidden_dim)
+        self.parametrization = str(parametrization)
+        self.lambda_min = float(lambda_min)
+        self.init_eps = float(init_eps)
+        self.fixed_h = float(fixed_h)
+        self.fixed_w = float(fixed_w)
+        self.fixed_schedule = str(fixed_schedule)
+        self.fixed_schedule_steps = int(fixed_schedule_steps or 0)
+        self._training_step = 0
+        self._total_training_steps = 0
         self.spatial_axes = 2
 
         if self.scope == "model":
@@ -204,9 +236,17 @@ class WanSpatialRopeLambda(nn.Module):
             shape = (self.num_layers, self.spatial_axes)
         else:
             shape = (self.num_layers, self.num_heads, self.spatial_axes)
-        self.base_log_scale = nn.Parameter(torch.zeros(shape, dtype=torch.float32))
 
-        if self.timestep_conditioned:
+        init = self._initial_raw_value(shape)
+        if self.parametrization == "fixed":
+            fixed = torch.empty(shape, dtype=torch.float32)
+            fixed[..., 0] = math.log(self.fixed_h)
+            fixed[..., 1] = math.log(self.fixed_w)
+            self.register_buffer("base_log_scale", fixed)
+        else:
+            self.base_log_scale = nn.Parameter(init)
+
+        if self.timestep_conditioned and self.parametrization != "fixed":
             out_dim = int(self.base_log_scale.numel())
             self.timestep_mlp = nn.Sequential(
                 nn.Linear(self.freq_dim, self.hidden_dim),
@@ -219,17 +259,71 @@ class WanSpatialRopeLambda(nn.Module):
             self.timestep_mlp = None
         self._last_effective_log_scale = None
 
-    def _effective_spatial_log_scale(self, timestep):
+    def _initial_raw_value(self, shape):
+        if self.parametrization == "unconstrained":
+            value = 0.0
+        elif self.parametrization == "softplus_leq_one":
+            lambda0 = 1.0 - self.init_eps
+            softplus_value = -math.log(lambda0)
+            value = math.log(math.expm1(softplus_value))
+        elif self.parametrization == "bounded_leq_one":
+            lambda0 = 1.0 - self.init_eps
+            normalized = (lambda0 - self.lambda_min) / (1.0 - self.lambda_min)
+            normalized = min(max(normalized, 1e-12), 1.0 - 1e-12)
+            value = math.log(normalized / (1.0 - normalized))
+        else:
+            value = 0.0
+        return torch.full(shape, value, dtype=torch.float32)
+
+    def set_training_progress(self, step: int, total_steps: int | None = None):
+        self._training_step = max(0, int(step or 0))
+        if total_steps is not None:
+            self._total_training_steps = max(0, int(total_steps or 0))
+
+    def _fixed_schedule_alpha(self):
+        if self.parametrization != "fixed" or self.fixed_schedule == "constant" or not self.training:
+            return 1.0
+        schedule_steps = self.fixed_schedule_steps if self.fixed_schedule_steps > 0 else self._total_training_steps
+        if schedule_steps <= 0:
+            return 1.0
+        progress = min(max(float(self._training_step) / float(schedule_steps), 0.0), 1.0)
+        if self.fixed_schedule == "linear":
+            return progress
+        if self.fixed_schedule == "cosine":
+            return 0.5 - 0.5 * math.cos(math.pi * progress)
+        return 1.0
+
+    def _raw_to_spatial_lambda(self, raw):
+        if self.parametrization == "unconstrained":
+            return torch.exp(raw)
+        if self.parametrization == "softplus_leq_one":
+            return torch.exp(-F.softplus(raw))
+        if self.parametrization == "bounded_leq_one":
+            return self.lambda_min + (1.0 - self.lambda_min) * torch.sigmoid(raw)
+        if self.parametrization == "fixed":
+            target = torch.exp(raw)
+            alpha = self._fixed_schedule_alpha()
+            if alpha >= 1.0:
+                return target
+            return torch.ones_like(target) + float(alpha) * (target - 1.0)
+        raise ValueError(f"Unsupported lambda parametrization: {self.parametrization}")
+
+    def _effective_spatial_raw_scale(self, timestep):
         base = self.base_log_scale
         if self.timestep_mlp is None:
-            z = base
+            raw = base
         else:
             if timestep.ndim == 0:
                 timestep = timestep.view(1)
             timestep = timestep.to(device=base.device, dtype=torch.float32).flatten()[:1]
             emb = sinusoidal_embedding_1d(self.freq_dim, timestep).to(device=base.device, dtype=torch.float32)
             delta = self.timestep_mlp(emb).view_as(base)
-            z = base + delta
+            raw = base + delta
+        return raw
+
+    def _effective_spatial_log_scale(self, timestep):
+        raw = self._effective_spatial_raw_scale(timestep)
+        z = torch.log(self._raw_to_spatial_lambda(raw).clamp_min(1e-12))
         self._last_effective_log_scale = z
         return z
 
@@ -244,17 +338,18 @@ class WanSpatialRopeLambda(nn.Module):
     def regularization_loss(self):
         z = self._last_effective_log_scale
         if z is None:
-            z = self.base_log_scale
+            z = self._spatial_log_scale_for_summary(timestep=None, update_last=False)
         return z.float().square().mean()
 
     def _spatial_log_scale_for_summary(self, timestep=None, update_last=False):
         base = self.base_log_scale
         if self.timestep_mlp is None or timestep is None:
-            z = base
+            raw = base
         else:
             timestep = torch.as_tensor(timestep, device=base.device, dtype=torch.float32).flatten()[:1]
             emb = sinusoidal_embedding_1d(self.freq_dim, timestep).to(device=base.device, dtype=torch.float32)
-            z = base + self.timestep_mlp(emb).view_as(base)
+            raw = base + self.timestep_mlp(emb).view_as(base)
+        z = torch.log(self._raw_to_spatial_lambda(raw).clamp_min(1e-12))
         if update_last:
             self._last_effective_log_scale = z
         return z
@@ -273,11 +368,13 @@ class WanSpatialRopeLambda(nn.Module):
     def summary(self):
         z = self._last_effective_log_scale
         if z is None:
-            z = self.base_log_scale
+            z = self._spatial_log_scale_for_summary(timestep=None, update_last=False)
         z = z.detach().float()
         lam = torch.exp(z)
         flat = lam.reshape(-1, 2)
         summary = {
+            "lambda/parametrization_id": float(sorted(self.PARAMETRIZATIONS).index(self.parametrization)),
+            "lambda/fixed_schedule_alpha": float(self._fixed_schedule_alpha()),
             "lambda/h_mean": float(flat[:, 0].mean().cpu()),
             "lambda/w_mean": float(flat[:, 1].mean().cpu()),
             "lambda/h_std": float(flat[:, 0].std(unbiased=False).cpu()) if flat.shape[0] > 1 else 0.0,
@@ -289,12 +386,12 @@ class WanSpatialRopeLambda(nn.Module):
             "lambda/log_abs_mean": float(z.abs().mean().cpu()),
         }
 
-        base_lam = torch.exp(self.base_log_scale.detach().float())
+        base_lam = torch.exp(self._spatial_log_scale_for_summary(timestep=None, update_last=False).detach().float())
         base_flat = base_lam.reshape(-1, 2)
         summary["lambda_base/h_min"] = float(base_flat[:, 0].min().cpu())
         summary["lambda_base/w_min"] = float(base_flat[:, 1].min().cpu())
 
-        for timestep in (0, 50, 100, 500, 900):
+        for timestep in (0, 50, 100, 500, 900, 982, 987, 991, 995, 999):
             eff_z = self._spatial_log_scale_for_summary(timestep=timestep, update_last=False).detach().float()
             eff_lam = torch.exp(eff_z)
             self._add_hw_min_max_mean(summary, f"lambda_eff/t{timestep}", eff_lam)
@@ -309,6 +406,21 @@ class WanSpatialRopeLambda(nn.Module):
             summary["lambda/layerlast_h"] = float(layer_lam[-1, 0].cpu())
             summary["lambda/layerlast_w"] = float(layer_lam[-1, 1].cpu())
         return summary
+
+    @torch.no_grad()
+    def heatmap_tensors(self, timesteps=(0, 50, 100, 500, 900)):
+        tensors = {}
+        for timestep in timesteps:
+            z = self._spatial_log_scale_for_summary(timestep=timestep, update_last=False).detach().float().cpu()
+            lam = torch.exp(z)
+            if self.scope == "model":
+                lam = lam.view(1, 1, 2)
+            elif self.scope == "layer":
+                lam = lam.view(self.num_layers, 1, 2)
+            else:
+                lam = lam.view(self.num_layers, self.num_heads, 2)
+            tensors[f"t{int(timestep)}"] = lam
+        return tensors
 
 
 class SelfAttention(nn.Module):
@@ -711,7 +823,8 @@ class WanModel(torch.nn.Module):
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
         rope_lambda_module = getattr(self, "spatial_rope_lambda", None)
-        rope_lambda_scales_all = rope_lambda_module(timestep) if rope_lambda_module is not None else None
+        lambda_enabled_for_timestep = getattr(self, "_wan_train_lambda_enabled_for_timestep", True)
+        rope_lambda_scales_all = rope_lambda_module(timestep) if rope_lambda_module is not None and lambda_enabled_for_timestep else None
 
         for block_id, block in enumerate(self.blocks):
             rope_lambda_scales = None

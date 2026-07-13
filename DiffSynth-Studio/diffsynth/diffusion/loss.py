@@ -33,6 +33,22 @@ def _sample_flowmatch_timestep_id(inputs, num_timesteps):
     )
 
 
+def _set_wan_spatial_rope_lambda_active(pipe: BasePipeline, inputs, timestep_id, num_timesteps):
+    """Control fixed spatial RoPE lambda by sampled training timestep index."""
+    dit = getattr(pipe, "dit", None)
+    if dit is None or not hasattr(dit, "spatial_rope_lambda"):
+        return
+    lambda_global = bool(inputs.get("wan_spatial_rope_lambda_global", True))
+    active = True
+    if not lambda_global:
+        early_boundary = float(inputs.get("timestep_mixture_early_boundary", 0.12))
+        early_boundary_id = int(early_boundary * num_timesteps)
+        early_boundary_id = max(1, min(num_timesteps - 1, early_boundary_id))
+        timestep_id_value = int(timestep_id.flatten()[0].item()) if torch.is_tensor(timestep_id) else int(timestep_id)
+        active = timestep_id_value < early_boundary_id
+    setattr(dit, "_wan_train_lambda_enabled_for_timestep", active)
+
+
 def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     if "lora" in inputs:
         # Image-to-LoRA models need to load lora here.
@@ -40,6 +56,7 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
         pipe.load_lora(pipe.dit, state_dict=inputs["lora"], hotload=True, verbose=0)
 
     timestep_id = _sample_flowmatch_timestep_id(inputs, len(pipe.scheduler.timesteps))
+    _set_wan_spatial_rope_lambda_active(pipe, inputs, timestep_id, len(pipe.scheduler.timesteps))
     timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
     
     noise = torch.randn_like(inputs["input_latents"]) * inputs.get("noise_scale", 1.0)

@@ -1,6 +1,9 @@
 source ./env.sh
 cd $ROOT_DIR
 
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate video
+
 # size
 # t2v-14B: '720*1280', '1280*720', '480*832', '832*480'
 # t2v-1.3B: '480*832', '832*480'
@@ -66,6 +69,8 @@ HEAD_EVOLUTION_STEPWISE_LAYER=27
 HEAD_EVOLUTION_LAYERWISE_STEPS=""
 # Layer-wise analysis. -2 all layers; -1 last layer; >=0 specific layer
 HEAD_EVOLUTION_HEAD_LAYER=-2
+# Head-wise plot palette. default / wandb
+HEAD_EVOLUTION_HEADWISE_PALETTE="wandb"
 
 # Reference map for support-mask construction
 HEAD_EVOLUTION_REFERENCE_STEP=50
@@ -161,6 +166,7 @@ for SEED in "${SEEDS[@]}"; do
         --head_evolution_preprocess_despike_quantile $HEAD_EVOLUTION_PREPROCESS_DESPIKE_QUANTILE \
         --head_evolution_preprocess_min_component_area $HEAD_EVOLUTION_PREPROCESS_MIN_COMPONENT_AREA \
         --head_evolution_concentrated_region_top_ratio $HEAD_EVOLUTION_CONCENTRATED_REGION_TOP_RATIO \
+        --head_evolution_headwise_palette $HEAD_EVOLUTION_HEADWISE_PALETTE \
         --reuse_cross_attention_dir "$REUSE_CROSS_ATTENTION_DIR"
 
     echo "Finished head_evolution | prompt: $PROMPT | seed: $SEED"

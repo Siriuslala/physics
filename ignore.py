@@ -28,14 +28,14 @@ def sort_key(head):
 r = sorted(r, key=sort_key)
 
 # 3. 计算剩余
-remained = total - selected
-print(f"全集数量: {len(total)}")
-print(f"已选数量: {len(selected)}")
-print(f"剩余数量: {len(remained)}")
-print(f"校验: {len(selected)+len(r) == len(total)}")
-# 4. 输出剩余字符串
-print('TRAJ_HEADS_1B3_T40_remained="{}"'.format(",".join(r)))
-print("----"*100)
+# remained = total - selected
+# print(f"全集数量: {len(total)}")
+# print(f"已选数量: {len(selected)}")
+# print(f"剩余数量: {len(remained)}")
+# print(f"校验: {len(selected)+len(r) == len(total)}")
+# # 4. 输出剩余字符串
+# print('TRAJ_HEADS_1B3_T40_remained="{}"'.format(",".join(r)))
+# print("----"*100)
 
 def get_remained_heads(series_complete=[], series_to_exclude=[]):
     if series_complete == []:
@@ -90,6 +90,8 @@ def find_missed_heads(series_complete=[], sub_series=[]):
 
 if __name__ == "__main__":
     pass
+
+    print(len("lambda_lora-bsz_16-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_head-lambda_lr_5e-4-lambda_beta_0-lambda_tcond_1-lambda_hidden_128-range_bounded_leq_one_min_0.5-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_1.00-seed_42"))
 
     # complete_series = [
     #     "L0H3,L0H5,L1H9,L2H0,L2H3,L2H5,L2H8,L3H0,L3H4,L3H6,L3H10,L4H0,L4H3,L4H8,L5H0,L5H2,L5H3,L5H8,L5H10,L6H3,L6H10,L7H4,L9H0,L9H3,L9H4,L9H5,L9H8,L10H1,L11H7,L11H8,L11H9,L12H3,L12H4,L12H6,L12H7,L12H8,L13H5,L13H10,L14H1,L14H7,L14H11,L15H1,L15H3,L16H0,L17H1,L17H2,L17H8,L17H10,L18H0,L18H1,L18H2,L18H6,L18H7,L18H10,L19H5,L19H11,L20H1,L20H3,L20H6,L20H7,L20H8,L20H11,L21H0,L21H4,L21H6,L21H7,L22H3,L22H5,L22H6,L22H7,L22H8,L22H9,L23H3,L23H6,L23H8,L23H9,L23H10,L24H7,L24H8,L24H11,L25H3,L25H4,L25H5,L26H3,L26H4,L26H5,L26H10,L27H7,L28H2,L28H4,L28H8,L28H9,L29H6,L29H9,L29H11,L0H10,L1H0,L6H1,L20H4,L20H5,L25H0,L25H10,L26H11,L28H0,L28H5,L28H7,L28H10,L3H1,L7H10,L21H5,L7H8,L17H6,L17H9,L3H3",

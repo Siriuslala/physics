@@ -640,9 +640,10 @@ def _plot_wan21_t2v_head_evolution_stepwise_metric(
     axis.set_title(
         f"Head Evolution Step-Wise: {metric_key} (layer={int(stepwise_layer)}, head-mean map)"
     )
-    axis.set_xlabel("diffusion step")
-    axis.set_ylabel(y_label)
+    axis.set_xlabel("diffusion step", fontsize=20)
+    axis.set_ylabel(y_label, fontsize=20)
     _set_wan21_t2v_axis_ylim_from_values(axis, y_values, clamp_to_unit_interval=True)
+    axis.tick_params(axis="both", labelsize=14)
     axis.grid(alpha=0.22, linestyle="--")
     fig.tight_layout()
 
@@ -676,9 +677,10 @@ def _plot_wan21_t2v_head_evolution_layerwise_metric_for_step(
     fig, axis = plt.subplots(1, 1, figsize=(8.0, 4.8))
     axis.plot(x_layers, y_values, marker="o", linewidth=1.6, color="#0ea5e9")
     axis.set_title(f"Head Evolution Layer-Wise: {metric_key} (step={int(step)}, head-mean map)")
-    axis.set_xlabel("layer")
-    axis.set_ylabel(y_label)
+    axis.set_xlabel("layer", fontsize=20)
+    axis.set_ylabel(y_label, fontsize=20)
     _set_wan21_t2v_axis_ylim_from_values(axis, y_values, clamp_to_unit_interval=True)
+    axis.tick_params(axis="both", labelsize=14)
     axis.grid(alpha=0.22, linestyle="--")
     fig.tight_layout()
 
@@ -693,11 +695,13 @@ def _plot_wan21_t2v_head_evolution_headwise_metric_for_layer(
     metric_key: str,
     y_label: str,
     layer: int,
+    palette_name: str = "default",
 ):
     """Plot one head-wise metric figure for a fixed layer across diffusion steps."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib import colors as mcolors
 
     object_rows = [row for row in rows if str(row.get("token", "")) == "__object_mean__"]
     object_rows = [row for row in object_rows if int(row.get("layer", -1)) == int(layer)]
@@ -715,12 +719,44 @@ def _plot_wan21_t2v_head_evolution_headwise_metric_for_layer(
     fig, axis = plt.subplots(1, 1, figsize=(8.2, 5.0))
     head_indices = sorted(rows_by_head.keys())
     num_heads = len(head_indices)
-    if num_heads <= 20:
-        # Use a discrete qualitative palette to avoid repeated default cycle colors.
-        color_map = plt.get_cmap("tab20", num_heads)
+    resolved_palette_name = str(palette_name).strip().lower() or "default"
+    # wandb color
+    # 5BC5DB
+    # A1A9AD
+    # AD6F50
+    # F0434F
+    # FAB796
+    # FFB83D
+    # 9BC750
+    # 479A5F
+    # 87CEBF
+    # 538AE5
+    # 865ED6
+    # F07FDD
+    wandb_palette = [
+        "#538AE5",
+        "#A1A9AD",
+        "#AD6F50",
+        "#F0434F",
+        "#FAB796",
+        "#479A5F",
+        "#FFB83D",
+        "#9BC750",
+        "#87CEBF",
+        "#5BC5DB",
+        "#865ED6",
+        "#F07FDD",
+    ]
+    if resolved_palette_name == "wandb" and num_heads <= len(wandb_palette):
+        head_colors = [mcolors.to_rgba(wandb_palette[color_index]) for color_index in range(num_heads)]
     else:
-        # Fall back to a high-cardinality palette when the head count is large.
-        color_map = plt.get_cmap("gist_rainbow", num_heads)
+        if num_heads <= 20:
+            # Use a discrete qualitative palette to avoid repeated default cycle colors.
+            color_map = plt.get_cmap("tab20", num_heads)
+        else:
+            # Fall back to a high-cardinality palette when the head count is large.
+            color_map = plt.get_cmap("gist_rainbow", num_heads)
+        head_colors = [color_map(color_index) for color_index in range(num_heads)]
 
     all_values: List[float] = []
     for color_index, head_index in enumerate(head_indices):
@@ -731,19 +767,20 @@ def _plot_wan21_t2v_head_evolution_headwise_metric_for_layer(
         axis.plot(
             x_steps,
             y_values,
-            linewidth=1.2,
+            linewidth=1.5,
             alpha=0.9,
-            color=color_map(color_index),
+            color=head_colors[color_index],
             label=f"h{head_index:02d}",
         )
 
     axis.set_title(f"Head Evolution Head-Wise: {metric_key} (layer={int(layer)})")
-    axis.set_xlabel("diffusion step")
-    axis.set_ylabel(y_label)
+    axis.set_xlabel("diffusion step", fontsize=20)
+    axis.set_ylabel(y_label, fontsize=20)
     _set_wan21_t2v_axis_ylim_from_values(axis, all_values, clamp_to_unit_interval=True)
+    axis.tick_params(axis="both", labelsize=14)
     axis.grid(alpha=0.22, linestyle="--")
     if len(rows_by_head) <= 20:
-        axis.legend(fontsize=7, ncol=2)
+        axis.legend(fontsize=10, ncol=2)
     fig.tight_layout()
 
     _ensure_dir(os.path.dirname(save_file))
@@ -1045,6 +1082,7 @@ def run_wan21_t2v_head_evolution(
     head_evolution_preprocess_despike_quantile: float = 0.98,
     head_evolution_preprocess_min_component_area: int = 2,
     head_evolution_concentrated_region_top_ratio: float = 0.05,
+    head_evolution_headwise_palette: str = "default",
     entropy_eps: float = 1e-12,
     reuse_cross_attention_dir: Optional[str] = None,
     parallel_cfg: Optional[Wan21T2VParallelConfig] = None,
@@ -1172,6 +1210,13 @@ def run_wan21_t2v_head_evolution(
         raise ValueError(
             f"head_evolution_head_layer={head_layer_raw} resolved to invalid layers "
             f"{head_layer_indices} (num_layers={num_layers})."
+        )
+
+    headwise_palette_name = str(head_evolution_headwise_palette).strip().lower() or "default"
+    if headwise_palette_name not in {"default", "wandb"}:
+        raise ValueError(
+            "head_evolution_headwise_palette must be one of {default, wandb}, "
+            f"got: {head_evolution_headwise_palette}"
         )
 
     reference_step = int(head_evolution_reference_step)
@@ -1531,6 +1576,7 @@ def run_wan21_t2v_head_evolution(
                 metric_key=metric_key,
                 y_label=y_label,
                 layer=int(layer_index),
+                palette_name=headwise_palette_name,
             )
             if headwise_plot_path:
                 plot_paths_headwise.append(headwise_plot_path)
@@ -1599,6 +1645,7 @@ def run_wan21_t2v_head_evolution(
             "head_evolution_reference_head_mean_map_preprocessed.pt",
         ),
         "support_mask_path": os.path.join(output_dir, "head_evolution_support_mask_fhw.pt"),
+        "head_evolution_headwise_palette": headwise_palette_name,
         "entropy_eps": float(entropy_eps),
     }
 

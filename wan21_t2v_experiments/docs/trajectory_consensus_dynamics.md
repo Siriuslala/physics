@@ -221,94 +221,254 @@ The exact zero-ablation effect is
 
 This is the primary causal contribution definition in the current implementation.
 
-### 4.3 First-order Taylor approximation of head ablation effect
+### 4.3 First-order Taylor approximation used in the current code
 
-Exact ablation requires one downstream rerun per head.
-To reduce cost, the experiment may also compute a first-order Taylor approximation.
+The current `taylor_approx` path does **not** approximate the whole vector-valued change in `v_pred`.
+Instead, it follows the standard attribution-patching strategy: define a clean-only **scalar** patching metric, differentiate that scalar with respect to the clean head activation, and then contract the gradient with the clean activation itself.
 
-Starting from
+For one diffusion step `s`, one layer `\ell`, one module `m \in \{\mathrm{self}, \mathrm{cross}\}`, and one head `h`, let the clean head activation used by Taylor attribution be
 
-\[ \Delta v_{s,\ell,h} = v_{s,\ell,h}(U_{s,\ell,h}) - v_{s,\ell,h}(0), \]
+\[ A_{s,\ell,m,h} \in \mathbb{R}^{B \times T' \times d_m}. \]
 
-take the first-order Taylor expansion of \(v_{s,\ell,h}(U)\) around the clean head write \(U_{s,\ell,h}\).
-Then
+Here:
 
-\[ v_{s,\ell,h}(0) \approx v_{s,\ell,h}(U_{s,\ell,h}) + \left. \frac{\partial v_{s,\ell,h}(U)}{\partial U} \right|_{U = U_{s,\ell,h}} (0 - U_{s,\ell,h}). \]
+- \(B\) is the batch size used inside the denoiser call; in the current implementation it is effectively `1`;
+- \(T'\) is the number of tracked token positions for Taylor attribution;
+- \(d_m\) is the per-head feature size;
+- for `pre_o`, \(d_m = d_{\mathrm{head}}\), so the captured tensor is the per-head attention output before the output projection;
+- for `post_o`, \(d_m = D\), where \(D\) is the transformer hidden size, so the captured tensor is the per-head residual write after the output projection and, for self-attention, after multiplication by the modulation factor.
 
-Rearranging gives
+For one module with \(H_m\) heads, the code captures all heads together as
 
-\[ \Delta v_{s,\ell,h} \approx \left. \frac{\partial v_{s,\ell,h}(U)}{\partial U} \right|_{U = U_{s,\ell,h}} U_{s,\ell,h}. \]
+\[ A_{s,\ell,m} \in \mathbb{R}^{B \times T' \times H_m \times d_m}. \]
 
-This approximation means:
+The final Wan denoiser output at step `s` is the flow-matching velocity prediction
 
-- use the clean run as the expansion point;
-- use the local Jacobian of the final `v_pred` with respect to the injected head write;
-- multiply that Jacobian by the clean head write itself.
+\[ v_s^{\mathrm{clean}} \in \mathbb{R}^{B \times C_v \times F_v \times H_v \times W_v}, \]
 
-This is a fast approximation to the exact ablation effect and is suitable for large-scale head screening.
+where \(C_v\) is the output channel count of the latent velocity field.
+This is a **vector-valued** object, so attribution patching cannot directly use it as the scalar target.
+The current implementation therefore defines a scalar patching metric
 
-### 4.4 Relation to JVP and attribution patching
+\[ M_s = M\!\big(v_s\big) \in \mathbb{R}. \]
 
-The Taylor approximation above can be written in two computationally useful forms.
+Let the object mask at `v_pred` resolution be
 
-First, define the downstream map
+\[ \Omega^{\mathrm{obj}} \in \{0,1\}^{F_v \times H_v \times W_v}. \]
 
-\[ F_{s,\ell,h}(U) = v_{s,\ell,h}(U). \]
+The current implementation supports two **patching-metric types**, controlled by `TRAJECTORY_CONSENSUS_TAYLOR_PATCHING_METRIC`.
 
-Then the first-order Taylor approximation is the Jacobian-vector product
+1. `TRAJECTORY_CONSENSUS_TAYLOR_PATCHING_METRIC=v_sum`
 
-\[ \Delta v_{s,\ell,h}^{\mathrm{Taylor}} = JF_{s,\ell,h}(U_{s,\ell,h})[U_{s,\ell,h}], \]
+This is the original scalarization, which simply sums the velocity field.
+Its exact support is controlled by `TRAJECTORY_CONSENSUS_TAYLOR_METRIC_SCOPE`.
 
-where \(JF(U)[dU]\) denotes the directional derivative of \(F\) at \(U\) along direction \(dU\).
+If `TRAJECTORY_CONSENSUS_TAYLOR_METRIC_SCOPE=global`, then
 
-This is exactly what `jvp` computes:
+\[ M_s^{\mathrm{vsum,global}}(v) = \sum_{b=1}^{B} \sum_{c=1}^{C_v} \sum_{f=1}^{F_v} \sum_{y=1}^{H_v} \sum_{x=1}^{W_v} v[b,c,f,y,x]. \]
 
-- input point: \(U_{s,\ell,h}\);
-- direction vector: \(U_{s,\ell,h}\);
-- output: the first-order approximation to the clean-to-ablate change in `v_pred`.
+If `TRAJECTORY_CONSENSUS_TAYLOR_METRIC_SCOPE=obj`, then
 
-Second, if the quantity of interest is not the whole vector \(\Delta v\) itself, but a scalar patch metric
+\[ M_s^{\mathrm{vsum,obj}}(v) = \sum_{b=1}^{B} \sum_{c=1}^{C_v} \sum_{f=1}^{F_v} \sum_{y=1}^{H_v} \sum_{x=1}^{W_v} \Omega^{\mathrm{obj}}[f,y,x] \, v[b,c,f,y,x]. \]
 
-\[ m(v), \]
+2. `TRAJECTORY_CONSENSUS_TAYLOR_PATCHING_METRIC=ref_dot`
 
-then the first-order change of that scalar metric is
+This is the clean-reference projection metric.
+First run one clean forward and cache the clean conditional velocity field
 
-\[ \Delta m_{s,\ell,h}^{\mathrm{Taylor}} \approx \left\langle \nabla_U m\!\big(F_{s,\ell,h}(U_{s,\ell,h})\big),\ U_{s,\ell,h} \right\rangle. \]
+\[ \bar{v}_s = \operatorname{stopgrad}\!\big(v_s^{\mathrm{cond,clean}}\big) \in \mathbb{R}^{B \times C_v \times F_v \times H_v \times W_v}. \]
 
-This is the same local-linear idea used in attribution patching.
+Then the scalar metric measures how strongly the current conditional velocity field aligns with this fixed clean reference.
 
-More generally, if one compares a clean activation \(U^{\mathrm{clean}}\) and a corrupted activation \(U^{\mathrm{corr}}\), attribution patching approximates the scalar patch effect by
+If `TRAJECTORY_CONSENSUS_TAYLOR_METRIC_SCOPE=global`, then
 
-\[ \Delta m^{\mathrm{attr}} \approx \left\langle \nabla_U m\!\big(F(U^{\mathrm{corr}})\big),\ U^{\mathrm{clean}} - U^{\mathrm{corr}} \right\rangle. \]
+\[ M_s^{\mathrm{refdot,global}}(v) = \sum_{b=1}^{B} \sum_{c=1}^{C_v} \sum_{f=1}^{F_v} \sum_{y=1}^{H_v} \sum_{x=1}^{W_v} v[b,c,f,y,x] \, \bar{v}_s[b,c,f,y,x]. \]
 
-Our ablation setting is a special case with
+If `TRAJECTORY_CONSENSUS_TAYLOR_METRIC_SCOPE=obj`, then
 
-\[ U^{\mathrm{clean}} = U_{s,\ell,h}, \qquad U^{\mathrm{corr}} = 0, \qquad U^{\mathrm{clean}} - U^{\mathrm{corr}} = U_{s,\ell,h}. \]
+\[ M_s^{\mathrm{refdot,obj}}(v) = \sum_{b=1}^{B} \sum_{c=1}^{C_v} \sum_{f=1}^{F_v} \sum_{y=1}^{H_v} \sum_{x=1}^{W_v} \Omega^{\mathrm{obj}}[f,y,x] \, v[b,c,f,y,x] \, \bar{v}_s[b,c,f,y,x]. \]
 
-So the attribution-patching style approximation becomes
+3. A motion-planning-oriented semantic-injection metric
 
-\[ \Delta m_{s,\ell,h}^{\mathrm{ablate}} \approx \left\langle \nabla_U m\!\big(F_{s,\ell,h}(U_{s,\ell,h})\big),\ U_{s,\ell,h} \right\rangle. \]
+Let the clean conditional and unconditional denoiser outputs at the same diffusion step be
 
-This is a scalarized version of the vector Taylor approximation above.
+\[ v_s^{\mathrm{cond,clean}},\; v_s^{\mathrm{uncond,clean}} \in \mathbb{R}^{B \times C_v \times F_v \times H_v \times W_v}. \]
 
-The distinction is important:
+Define the clean semantic increment by
 
-- `jvp` naturally approximates the **vector-valued** output change \(\Delta v\);
-- attribution patching naturally approximates the change of a **scalar metric** defined on the output.
+\[ \Delta v_s^{\mathrm{sem,clean}} = v_s^{\mathrm{cond,clean}} - v_s^{\mathrm{uncond,clean}}. \]
 
-The current code now implements the vector-valued Taylor path through a dedicated
-`trajectory_consensus_contribution_method=taylor_approx` option.
-The implementation:
+This tensor is the clean velocity component induced by the text condition relative to the unconditional denoising baseline. Restrict it to the final object-trajectory support and stop gradients through the reference:
 
-- runs one clean forward for each selected `(step, layer, module, branch)`;
-- captures the clean head writes and the clean downstream suffix payload;
-- replays the clean downstream suffix from the targeted head write;
-- uses `jvp` to compute the first-order approximation
-  \(JF_{s,\ell,h}(U_{s,\ell,h})[U_{s,\ell,h}]\).
+\[ R_s^{\mathrm{sem,obj}} = \Omega^{\mathrm{obj}} \odot \operatorname{stopgrad}\!\big(\Delta v_s^{\mathrm{sem,clean}}\big). \]
 
-The scalar attribution-patching style approximation from the equations above is
-still documented for interpretation, but it is not yet emitted as a separate
-metric family in the current CSV outputs.
+Then a semantic-injection patching metric for the conditional branch is
+
+\[ M_s^{\mathrm{sem,obj}}\!\big(v_s^{\mathrm{cond}}\big) = \sum_{b=1}^{B} \sum_{c=1}^{C_v} \sum_{f=1}^{F_v} \sum_{y=1}^{H_v} \sum_{x=1}^{W_v} \Omega^{\mathrm{obj}}[f,y,x] \, v_s^{\mathrm{cond}}[b,c,f,y,x] \, \Delta v_s^{\mathrm{sem,clean}}[b,c,f,y,x]. \]
+
+Equivalently,
+
+\[ M_s^{\mathrm{sem,obj}}\!\big(v_s^{\mathrm{cond}}\big) = \left\langle \Omega^{\mathrm{obj}} \odot v_s^{\mathrm{cond}},\; R_s^{\mathrm{sem,obj}} \right\rangle. \]
+
+This metric is intended to measure whether the selected head increases the amount of condition-induced object semantic signal written into the final object-trajectory region, rather than merely increasing the total velocity magnitude there.
+
+So `v_sum` asks whether the selected head changes the total velocity magnitude on the chosen support, `ref_dot` asks whether the selected head changes the component of the velocity field aligned with the full clean conditional velocity field, and `sem_obj` asks whether the selected head changes the condition-induced semantic increment written into the final object region.
+
+For the selected scalar metric \(M_s\), define the first-order ablation effect of head \((s,\ell,m,h)\) around the clean point as
+
+\[ \Delta M_{s,\ell,m,h}^{\mathrm{Taylor}} = \left\langle \nabla_{A_{s,\ell,m,h}} M_s, \; A_{s,\ell,m,h} - A_{s,\ell,m,h}^{\mathrm{base}} \right\rangle. \]
+
+The current code uses **zero ablation**, so
+
+\[ A_{s,\ell,m,h}^{\mathrm{base}} = 0, \]
+
+and therefore
+
+\[ \Delta M_{s,\ell,m,h}^{\mathrm{Taylor}} = - \left\langle \nabla_{A_{s,\ell,m,h}} M_s, \; A_{s,\ell,m,h} \right\rangle. \]
+
+The reported CSV value is the absolute magnitude
+
+\[ \mathrm{Contribution}(s,\ell,m,h) = \left| - \left\langle \nabla_{A_{s,\ell,m,h}} M_s, \; A_{s,\ell,m,h} \right\rangle \right|. \]
+
+This is implemented by the contraction
+
+\[ \mathrm{Contribution}(s,\ell,m,h) = \left| - \sum_{b=1}^{B} \sum_{t=1}^{T'} \sum_{d=1}^{d_m} G_{s,\ell,m}[b,t,h,d] \, A_{s,\ell,m}[b,t,h,d] \right|, \]
+
+where
+
+\[ G_{s,\ell,m} = \nabla_{A_{s,\ell,m}} M_s \in \mathbb{R}^{B \times T' \times H_m \times d_m}. \]
+
+This is exactly the tensor contraction in the current code:
+
+\[ \texttt{einsum("bthd,bthd->h", head\_writes\_grad, head\_writes)}. \]
+
+### 4.4 Tracking scope, object-only mode, and Taylor options
+
+The Taylor path has several engineering controls that change which activations are differentiated and which scalar metric is used.
+
+#### 4.4.1 `TRAJECTORY_CONSENSUS_ABLATE_POSITION`
+
+This option decides what tensor is treated as the head activation \(A_{s,\ell,m}\).
+
+For self-attention and cross-attention, let
+
+\[ Z_{s,\ell,m} \in \mathbb{R}^{B \times T \times H_m \times d_{\mathrm{head}}} \]
+
+be the per-head attention output before the output projection, and let
+
+\[ U_{s,\ell,m} \in \mathbb{R}^{B \times T \times H_m \times D} \]
+
+be the per-head residual write after the output projection.
+
+Then:
+
+- `pre_o` means \(A_{s,\ell,m} = Z_{s,\ell,m}\);
+- `post_o` means \(A_{s,\ell,m} = U_{s,\ell,m}\).
+
+For self-attention, `post_o` already includes the modulation scaling that is applied before the residual add.
+
+#### 4.4.2 `TRAJECTORY_CONSENSUS_TAYLOR_OBJECT_ONLY`
+
+Let the object support on the latent token grid be
+
+\[ \Omega_{\mathrm{tok}}^{\mathrm{obj}} \in \{0,1\}^{F_{\mathrm{tok}} \times H_{\mathrm{tok}} \times W_{\mathrm{tok}}}. \]
+
+The code may optionally keep only a subset of latent frames.
+Let the selected latent-frame index set be
+
+\[ \mathcal{F}_{\mathrm{sub}} \subseteq \{1, \dots, F_{\mathrm{tok}}\}. \]
+
+The frame-restricted token mask is
+
+\[ \Omega_{\mathrm{tok}}^{\mathrm{sub}}[f,y,x] = \begin{cases}
+\Omega_{\mathrm{tok}}^{\mathrm{obj}}[f,y,x], & f \in \mathcal{F}_{\mathrm{sub}}, \\
+0, & \text{otherwise.}
+\end{cases} \]
+
+Flatten this mask into a token index set
+
+\[ \mathcal{I}_{\mathrm{sub}} = \{ t : \Omega_{\mathrm{tok}}^{\mathrm{sub}}[t] = 1 \}. \]
+
+Then:
+
+- if `TRAJECTORY_CONSENSUS_TAYLOR_OBJECT_ONLY=False`, the captured activation uses **all** token positions, so \(T' = T\);
+- if `TRAJECTORY_CONSENSUS_TAYLOR_OBJECT_ONLY=True`, the captured activation is reduced to the token subset indexed by \(\mathcal{I}_{\mathrm{sub}}\), so \(T' = |\mathcal{I}_{\mathrm{sub}}|\).
+
+So this option changes the **activation support** over which gradients are stored and contracted.
+It does **not** by itself change the scalar patching metric.
+
+#### 4.4.3 `TRAJECTORY_CONSENSUS_TAYLOR_NUM_LATENT_FRAMES`
+
+This option controls the size of \(\mathcal{F}_{\mathrm{sub}}\).
+
+- if the value is `-1`, the code keeps all latent frames;
+- otherwise it uniformly samples the requested number of latent frames and keeps only the object tokens on those frames.
+
+This option matters only when `TRAJECTORY_CONSENSUS_TAYLOR_OBJECT_ONLY=True`.
+
+#### 4.4.4 `TRAJECTORY_CONSENSUS_TAYLOR_METRIC_SCOPE`
+
+This option chooses the spatial-temporal support of the scalar patching metric:
+
+- `global` uses either \(M_s^{\mathrm{vsum,global}}\) or \(M_s^{\mathrm{refdot,global}}\);
+- `obj` uses either \(M_s^{\mathrm{vsum,obj}}\) or \(M_s^{\mathrm{refdot,obj}}\).
+
+A subtle but important implementation detail is that the current code builds \(M_s^{\mathrm{obj}}\) from the **full** object mask at `v_pred` resolution, not from the frame-restricted mask used for token selection.
+Therefore:
+
+- `TAYLOR_OBJECT_ONLY` restricts which token activations are differentiated;
+- `TAYLOR_METRIC_SCOPE=obj` restricts where the final velocity field is summed;
+- these two restrictions are related but not identical.
+
+#### 4.4.5 `TRAJECTORY_CONSENSUS_TAYLOR_PATCHING_METRIC`
+
+This option chooses how the final velocity tensor is converted into a scalar objective before the backward pass.
+The current code exposes `v_sum` and `ref_dot`, while a motion-planning-oriented extension can additionally use `sem_obj`:
+
+- `v_sum` uses the raw velocity sum on the chosen support;
+- `ref_dot` uses the dot product between the current velocity tensor and the detached clean conditional velocity tensor on the chosen support;
+- `sem_obj` uses the dot product between the current conditional velocity tensor and the detached clean semantic increment \(v_s^{\mathrm{cond,clean}} - v_s^{\mathrm{uncond,clean}}\) on the final object support.
+
+The `sem_obj` metric is intrinsically object-scoped: it is defined for the final object support and is not intended to be paired with a global support setting.
+
+The `ref_dot` and `sem_obj` options are both clean-only in the attribution-patching sense, because their reference tensors are captured from the clean run and then treated as constants during differentiation.
+
+#### 4.4.6 One-step algorithm in the current code
+
+For one diffusion step `s` and one selected module `m`, the current implementation does the following.
+
+1. Run one clean denoiser forward on that step and branch.
+2. For every selected layer \(\ell\) in module `m`, capture the clean multi-head activation tensor
+
+\[ A_{s,\ell,m} \in \mathbb{R}^{B \times T' \times H_m \times d_m}. \]
+
+3. Continue the same clean forward to obtain
+
+\[ v_s^{\mathrm{clean}} \in \mathbb{R}^{B \times C_v \times F_v \times H_v \times W_v}. \]
+
+4. Construct the scalar metric \(M_s\) according to both `TAYLOR_METRIC_SCOPE` and `TAYLOR_PATCHING_METRIC`; when a semantic-injection metric is used, the clean conditional and clean unconditional velocity fields must both be available.
+5. Backpropagate this scalar once:
+
+\[ G_{s,\ell,m} = \nabla_{A_{s,\ell,m}} M_s. \]
+
+6. For each head \(h\), contract gradient and activation to obtain one scalar contribution.
+
+This means that one clean forward and one backward at a fixed diffusion step can produce Taylor contributions for **all selected heads in all selected layers of the chosen module**.
+This is why the Taylor path is much cheaper than exact per-head reruns.
+
+#### 4.4.7 Zero ablation and mean ablation
+
+The current implementation now supports two Taylor baselines.
+The default mode is zero ablation, namely baseline activation \(A^{\mathrm{base}} = 0\).
+The alternative mode is mean ablation, which replaces that baseline by a nonzero reference activation
+
+\[ A_{s,\ell,m,h}^{\mathrm{base}} = \bar{A}_{s,\ell,m,h}. \]
+
+When `TRAJECTORY_CONSENSUS_TAYLOR_ABLATION_MODE=mean_ablation`, the first-order formula becomes
+
+\[ \Delta M_{s,\ell,m,h}^{\mathrm{Taylor,mean}} = \left\langle \nabla_{A_{s,\ell,m,h}} M_s, \; \bar{A}_{s,\ell,m,h} - A_{s,\ell,m,h} \right\rangle. \]
+
+So zero ablation and mean ablation differ only in the chosen baseline vector; the attribution-patching machinery stays the same. In the current code, the mean baseline is the per-head mean activation vector over all latent tokens at the current step, broadcast back to every tracked token used by Taylor attribution.
 
 ### 4.5 Direct final-head projection proxy
 

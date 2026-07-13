@@ -735,6 +735,9 @@ def launch_training_task(
             epoch_dataloader = dataloader
         for batch in epoch_dataloader:
             dataloader_batches_seen += 1
+            unwrapped_model_for_progress = accelerator.unwrap_model(model)
+            if hasattr(unwrapped_model_for_progress, "set_training_progress"):
+                unwrapped_model_for_progress.set_training_progress(model_logger.num_steps, total_update_steps)
             with accelerator.accumulate(model):
                 loss = None
                 logging_loss = None

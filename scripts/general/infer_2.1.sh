@@ -57,11 +57,11 @@ SAMPLE_GUIDE_SCALE=5.0
 # SAMPLE_SHIFT=5.0
 # SAMPLE_GUIDE_SCALE=5.0
 
-# SEEDS=(26)
-SEEDS=($(seq 1 32))
+SEEDS=(26)
+# SEEDS=($(seq 1 32))
 # SEEDS=($(seq 33 1024))
 
-PROMPT="A basketball falls to the ground and bounces up several times, with the height of each bounce gradually decreasing until it comes to a stop."
+# PROMPT="A basketball falls to the ground and bounces up several times, with the height of each bounce gradually decreasing until it comes to a stop."
 PROMPTS=(
     # "A basketball falls to the ground."
     # "A basketball falls to the ground and bounces."
@@ -70,7 +70,7 @@ PROMPTS=(
     # "A basketball falls to the ground from the air and bounces up several times."
     # "A basketball falls to the ground from the air and bounces up several times, with the height of each bounce gradually decreasing until it comes to a stop."
     # "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor."
-    # "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times."
+    "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times."
     # "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times, with the height of each bounce gradually decreasing until it comes to a stop."
 
     # "Against a pure white background, two green balls of the same size and mass move toward each other from both ends of a wooden table at the same speed and rebound after collision."
@@ -88,7 +88,7 @@ PROMPTS=(
     # "Against a pure white background, a small green ball is thrown vertically upward from below, reaches its highest point, and then falls vertically back down to the ground."
     # "Against a pure white background, a small green ball is thrown from the bottom left corner toward the upper right, rises to its highest point, and then falls back down."
 
-    "Against a pure white background, a wooden cube block at the top of a smooth slope slides straight down the slope with steadily and uniformly increasing speed."
+    # "Against a pure white background, a wooden cube block at the top of a smooth slope slides straight down the slope with steadily and uniformly increasing speed."
     # "Against a pure white background, a wooden cube block starts from rest at the top of a smooth slope (higher on the left, lower on the right), slides straight down the slope with steadily and uniformly increasing speed, and never tips over or flips throughout the entire movement."
     # "Against a pure white background, a small green ball starts from rest at the top of a smooth slope (higher on the left, lower on the right), slides straight along the slope the entire time, with its speed increasing steadily and uniformly."
     # "Against a pure white background, there is one single wooden slope. A small green ball starts from rest at the top of the slope, slides straight along the slope the entire time, with its speed increasing steadily and uniformly."
@@ -116,7 +116,7 @@ for SEED in "${SEEDS[@]}"; do
     
     # check if the output file already exists. If it does, skip the inference for this prompt and seed.
     PROMPT_TAG=$(build_prompt_tag "$PROMPT")
-    SAVE_DIR="$WORK_DIR/outputs_wan_2_1_${task}/general_${GPU_TAG}/${PROMPT_TAG}"
+    SAVE_DIR="$WORK_DIR/outputs_wan_2_1_${task}_new/general_${GPU_TAG}/${PROMPT_TAG}"
     OUTPUT_FILE="$SAVE_DIR/${task}_${SIZE}_frame_num_${FRAME_NUM}_seed_${SEED}_shift_${SAMPLE_SHIFT}_guide_${SAMPLE_GUIDE_SCALE}.mp4"
     if [ -f "$OUTPUT_FILE" ]; then
         echo "Output file already exists for prompt: $PROMPT, seed: $SEED. Skipping inference."
@@ -135,9 +135,9 @@ for SEED in "${SEEDS[@]}"; do
         --base_seed $SEED \
         --sample_shift $SAMPLE_SHIFT \
         --sample_guide_scale $SAMPLE_GUIDE_SCALE \
-        --save_diffusion_steps False \
+        --save_diffusion_steps True \
         --diffusion_output_dir $SAVE_DIR/${task}_${SIZE}_diffusion_steps \
-        --diffusion_sample_count 5 \
+        --diffusion_sample_count 10 \
         --diffusion_summary_every 10 \
         --prompt "$PROMPT" \
         --save_file $OUTPUT_FILE

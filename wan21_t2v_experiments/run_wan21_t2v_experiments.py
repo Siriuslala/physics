@@ -474,6 +474,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head_evolution_preprocess_despike_quantile", type=float, default=0.98)
     parser.add_argument("--head_evolution_preprocess_min_component_area", type=int, default=2)
     parser.add_argument("--head_evolution_concentrated_region_top_ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--head_evolution_headwise_palette",
+        type=str,
+        default="default",
+        choices=["default", "wandb"],
+        help="Color palette used by head-wise head_evolution plots.",
+    )
 
     # Head trajectory dynamics options
     parser.add_argument(
@@ -1023,6 +1030,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional existing head_trajectory_dynamics directory used for early-alignment scatter plots.",
     )
     parser.add_argument(
+        "--reuse_head_evolution_dir",
+        type=str,
+        default="",
+        help="Optional existing head_evolution directory used for support-quality scatter plots.",
+    )
+    parser.add_argument(
         "--trajectory_consensus_stages",
         type=str,
         default="candidate_consensus,head_contribution",
@@ -1080,7 +1093,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--trajectory_consensus_reference_distance_metric",
         type=str,
         default="center_l2",
-        help="CSV reference-distance metric names reused from head_trajectory_dynamics for early-alignment scatter plots.",
+        help="CSV early-alignment metric names reused from head_trajectory_dynamics / head_evolution for scatter plots.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_alignment_summary_steps",
+        type=int,
+        default=10,
+        help="Number of earliest diffusion steps used to summarize each head's scatter horizontal-axis metric.",
     )
     parser.add_argument(
         "--trajectory_consensus_scatter_outlier_heads",
@@ -1177,13 +1196,81 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="obj",
         choices=["obj", "global"],
-        help="Scalar target used by trajectory_consensus_dynamics Taylor attribution: object-region velocity sum or global velocity sum.",
+        help="Spatial-temporal support used by trajectory_consensus_dynamics Taylor attribution: object region or full field.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_taylor_patching_metric",
+        type=str,
+        default="v_sum",
+        choices=["v_sum", "ref_dot", "sem_obj"],
+        help=(
+            "Scalar patching metric used by trajectory_consensus_dynamics Taylor attribution. "
+            "`v_sum` sums velocity on the chosen support, `ref_dot` dots the current velocity with the detached clean conditional velocity reference, "
+            "and `sem_obj` dots the conditional velocity with the detached clean conditional-minus-unconditional semantic increment on the final object support."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_consensus_taylor_ablation_mode",
+        type=str,
+        default="zero_ablation",
+        choices=["zero_ablation", "mean_ablation"],
+        help=(
+            "Baseline used by trajectory_consensus_dynamics Taylor attribution. "
+            "`zero_ablation` uses zero baseline and `mean_ablation` uses the per-head mean activation vector over tracked token positions."
+        ),
     )
     parser.add_argument(
         "--trajectory_consensus_taylor_use_gradient_checkpointing",
         type=_str2bool,
         default=True,
         help="When True, trajectory_consensus_dynamics Taylor attribution uses gradient checkpointing for downstream Wan blocks.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_filter_heads",
+        type=_str2bool,
+        default=False,
+        help="When True, trajectory_consensus_dynamics exports a filtered head list from cached head_contribution results.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_filter_step",
+        type=int,
+        default=1,
+        help="Diffusion step used by trajectory_consensus_dynamics filtered-head export.",
+    )
+    parser.add_argument(
+        "--trajectory_consensus_filter_convergence_speed_rule",
+        type=str,
+        default="gt_-inf",
+        help=(
+            "Threshold rule for support-quality-derived convergence speed in trajectory_consensus_dynamics filtered-head export. "
+            "Use `gt_x` for >= x or `lt_x` for <= x."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_consensus_filter_contribution_rule",
+        type=str,
+        default="lt_inf",
+        help=(
+            "Threshold rule for the selected head-contribution metric in trajectory_consensus_dynamics filtered-head export. "
+            "Use `gt_x` for >= x or `lt_x` for <= x."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_consensus_filter_contribution_metric",
+        type=str,
+        default="",
+        help=(
+            "Metric column used by trajectory_consensus_dynamics filtered-head export. "
+            "Examples: `contribution`, `ablate_dot_obj`, `proj_dot_obj`. "
+            "If empty, the code infers `contribution` for `taylor_approx` and otherwise requires an explicit value."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_consensus_filter_module",
+        type=str,
+        default="cross",
+        choices=["cross", "self"],
+        help="Attention module filtered by trajectory_consensus_dynamics filtered-head export.",
     )
     parser.add_argument("--trajectory_consensus_sa_anchor_step", type=int, default=49)
     parser.add_argument("--trajectory_consensus_sa_anchor_layer", type=int, default=27)
@@ -1337,6 +1424,7 @@ def main():
     trajectory_consensus_self_heads = _parse_optional_csv_strs_with_none(args.trajectory_consensus_self_heads)
     trajectory_consensus_modules = _parse_csv_strs(args.trajectory_consensus_modules)
     trajectory_consensus_reference_distance_metrics = _parse_csv_strs(args.trajectory_consensus_reference_distance_metric)
+    trajectory_consensus_alignment_summary_steps = int(args.trajectory_consensus_alignment_summary_steps)
     trajectory_consensus_scatter_outlier_heads = _parse_csv_strs(args.trajectory_consensus_scatter_outlier_heads)
     trajectory_consensus_scatter_outlier_cross_heads = _parse_csv_strs(args.trajectory_consensus_scatter_outlier_cross_heads)
     trajectory_consensus_scatter_outlier_self_heads = _parse_csv_strs(args.trajectory_consensus_scatter_outlier_self_heads)
@@ -1444,6 +1532,7 @@ def main():
             head_evolution_preprocess_despike_quantile=args.head_evolution_preprocess_despike_quantile,
             head_evolution_preprocess_min_component_area=args.head_evolution_preprocess_min_component_area,
             head_evolution_concentrated_region_top_ratio=args.head_evolution_concentrated_region_top_ratio,
+            head_evolution_headwise_palette=args.head_evolution_headwise_palette,
             reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
         )
     elif experiment_name == "head_trajectory_dynamics":
@@ -1833,6 +1922,7 @@ def main():
             target_verb_words=target_verb_words,
             reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip() or None,
             reuse_head_trajectory_dynamics_dir=args.reuse_head_trajectory_dynamics_dir.strip() or None,
+            reuse_head_evolution_dir=args.reuse_head_evolution_dir.strip() or None,
             trajectory_consensus_stages=trajectory_consensus_stages,
             trajectory_consensus_steps=trajectory_consensus_steps,
             trajectory_consensus_layers=trajectory_consensus_layers,
@@ -1841,6 +1931,7 @@ def main():
             trajectory_consensus_modules=trajectory_consensus_modules,
             trajectory_consensus_branch=args.trajectory_consensus_branch,
             trajectory_consensus_reference_distance_metrics=trajectory_consensus_reference_distance_metrics,
+            trajectory_consensus_alignment_summary_steps=trajectory_consensus_alignment_summary_steps,
             trajectory_consensus_scatter_outlier_heads=trajectory_consensus_scatter_outlier_heads,
             trajectory_consensus_scatter_outlier_cross_heads=trajectory_consensus_scatter_outlier_cross_heads,
             trajectory_consensus_scatter_outlier_self_heads=trajectory_consensus_scatter_outlier_self_heads,
@@ -1866,7 +1957,15 @@ def main():
             trajectory_consensus_taylor_object_only=args.trajectory_consensus_taylor_object_only,
             trajectory_consensus_taylor_num_latent_frames=args.trajectory_consensus_taylor_num_latent_frames,
             trajectory_consensus_taylor_metric_scope=args.trajectory_consensus_taylor_metric_scope,
+            trajectory_consensus_taylor_patching_metric=args.trajectory_consensus_taylor_patching_metric,
+            trajectory_consensus_taylor_ablation_mode=args.trajectory_consensus_taylor_ablation_mode,
             trajectory_consensus_taylor_use_gradient_checkpointing=args.trajectory_consensus_taylor_use_gradient_checkpointing,
+            trajectory_consensus_filter_heads=args.trajectory_consensus_filter_heads,
+            trajectory_consensus_filter_step=args.trajectory_consensus_filter_step,
+            trajectory_consensus_filter_convergence_speed_rule=args.trajectory_consensus_filter_convergence_speed_rule,
+            trajectory_consensus_filter_contribution_rule=args.trajectory_consensus_filter_contribution_rule,
+            trajectory_consensus_filter_contribution_metric=args.trajectory_consensus_filter_contribution_metric,
+            trajectory_consensus_filter_module=args.trajectory_consensus_filter_module,
             trajectory_consensus_sa_anchor_step=args.trajectory_consensus_sa_anchor_step,
             trajectory_consensus_sa_anchor_layer=args.trajectory_consensus_sa_anchor_layer,
             trajectory_consensus_sa_covered_mass_min=args.trajectory_consensus_sa_covered_mass_min,
