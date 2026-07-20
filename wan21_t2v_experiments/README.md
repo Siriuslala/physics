@@ -49,19 +49,22 @@ All modifications are runtime monkey patches and do not edit `projects/Wan2_1` s
   - `task`: use `t2v-1.3B` here
   - `size`: e.g. `832*480`
   - `frame_num`: e.g. `81`
+  - `rope_modification_lambda_h`: height-axis phase/distance scale for the auxiliary scaled-RoPE spatial plots
+  - `rope_modification_lambda_w`: width-axis phase/distance scale for the auxiliary scaled-RoPE spatial plots
 - Output:
   - `rope_decay_curve_frame_level.pdf`
   - `rope_decay_curve_temporal_frame_level.pdf`
   - `rope_decay_curve_spatial_height_axis.pdf`
   - `rope_decay_curve_spatial_width_axis.pdf`
   - `rope_decay_curve_spatial_center_heatmap.pdf`
+  - `rope_decay_curve_spatial_center_heatmap_lambda_h{lambda_h}_lambda_w{lambda_w}.pdf`
   - `rope_decay_curve_spatial_radial_profile.pdf`
   - `rope_decay_curve_token_level.pdf`
   - `rope_decay_curve_summary.json`
 - Key readout:
   - temporal RoPE kernel decay vs latent frame distance
   - spatial RoPE decay along height / width axes inside one frame
-  - same-frame spatial coherence heatmap for one center anchor token
+  - same-frame spatial coherence heatmap for one center anchor token, including an auxiliary heatmap with scaled height/width RoPE phase-distance values
   - flattened token-level RoPE kernel decay vs relative video-token distance
   - the token-level figure is an auxiliary canonical-anchor view rather than the main temporal/spatial analysis target
   - see detailed note: `docs/rope_decay_curve.md`

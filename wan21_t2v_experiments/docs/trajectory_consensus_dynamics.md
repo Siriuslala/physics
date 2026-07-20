@@ -1487,15 +1487,16 @@ The following figure families are the recommended default set.
    - Drawing method:
      - one mode fixes the layer and uses diffusion step as the x-axis;
      - the other mode fixes the diffusion step and uses transformer layer as the x-axis;
-     - y-axis is the winner-minus-loser gap of one selected feature;
-     - draw the raw gap together with a smoothed trend curve.
+     - y-axis is the winner-minus-loser gap of one selected feature.
    - Interpretation:
      - if the gap becomes positive and stays positive early, the feature is a plausible early selection signal;
      - if the gap remains near zero until late, the feature is more likely a consequence of convergence than a precursor.
    - Current default implementation:
-     - render step-wise panels at fixed layer and layer-wise panels at fixed step;
+     - for fixed-layer step-wise evolution, render one PDF per feature under `layer1_mechanistic/feature_evolution/by_layer/layer_XX/`;
+     - each fixed-layer feature PDF draws only the raw winner-minus-loser gap curve and omits figure titles and smoothed trend curves;
+     - additionally render `global_mutual_consistency_all_layers.pdf` as a 6-by-5 grid over the 30 transformer layers, where each subplot is titled by its layer index, uses diffusion step as the x-axis, and omits y-axis labels;
+     - for fixed-step layer-wise evolution, render multi-feature panels under `layer1_mechanistic/feature_evolution/by_step/`;
      - use the axis variable itself as the horizontal coordinate, not an abstract observation index;
-     - draw both the raw winner-minus-loser gap curve and a smoothed trend curve;
      - the default feature set emphasizes proposal, compatibility, chainability, mutual consistency, and agreement features.
 
 #### Layer II. Mesoscopic trend figures

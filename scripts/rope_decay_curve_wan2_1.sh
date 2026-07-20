@@ -7,6 +7,8 @@ conda activate video
 task="t2v-1.3B"
 SIZE="832*480"
 FRAME_NUM=81
+ROPE_DECAY_CURVE_LAMBDA_H=0.70
+ROPE_DECAY_CURVE_LAMBDA_W=0.70
 
 SAVE_DIR="$WORK_DIR/outputs_wan_2_1_${task}/rope_decay_curve/832x480_f${FRAME_NUM}"
 mkdir -p "$SAVE_DIR"
@@ -19,4 +21,6 @@ python $ROOT_DIR/wan21_t2v_experiments/run_wan21_t2v_experiments.py \
     --task $task \
     --prompt "rope decay curve" \
     --size $SIZE \
-    --frame_num $FRAME_NUM
+    --frame_num $FRAME_NUM \
+    --rope_modification_lambda_h $ROPE_DECAY_CURVE_LAMBDA_H \
+    --rope_modification_lambda_w $ROPE_DECAY_CURVE_LAMBDA_W

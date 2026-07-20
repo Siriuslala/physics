@@ -6462,6 +6462,10 @@ def _plot_wan21_t2v_self_attention_feature_evolution_panel(
     fixed_value: int,
     save_file: str,
     title: str,
+    show_titles: bool = True,
+    show_smooth: bool = True,
+    show_ylabel: bool = True,
+    show_legend: bool = True,
 ) -> str:
     """Render winner-minus-loser evolution curves either step-wise or layer-wise."""
     import matplotlib
@@ -6502,21 +6506,76 @@ def _plot_wan21_t2v_self_attention_feature_evolution_panel(
         if not feature_rows:
             axis.set_axis_off()
             continue
-        axis.plot(xs, ys, marker="o", linewidth=1.4, color="#2563eb", alpha=0.55, label="raw gap")
-        smooth_xs, smooth_ys = _smooth_wan21_t2v_curve_values(xs, ys, window_radius=2)
-        if smooth_xs.size > 0:
-            axis.plot(smooth_xs, smooth_ys, linewidth=2.4, color="#dc2626", alpha=0.95, label="smoothed gap")
+        axis.plot(xs, ys, marker="o", linewidth=1.4, color="#2563eb", alpha=0.75, label="raw gap")
+        if bool(show_smooth):
+            smooth_xs, smooth_ys = _smooth_wan21_t2v_curve_values(xs, ys, window_radius=2)
+            if smooth_xs.size > 0:
+                axis.plot(smooth_xs, smooth_ys, linewidth=2.4, color="#dc2626", alpha=0.95, label="smoothed gap")
         axis.axhline(0.0, color="#64748b", linewidth=1.0, linestyle="--", alpha=0.75)
-        axis.set_title(_trajectory_consensus_self_attention_feature_display_name(feature_name), fontsize=10)
+        if bool(show_titles):
+            axis.set_title(_trajectory_consensus_self_attention_feature_display_name(feature_name), fontsize=10)
         axis.set_xlabel(x_label)
-        axis.set_ylabel("winner-minus-loser gap")
+        if bool(show_ylabel):
+            axis.set_ylabel("winner-minus-loser gap")
         axis.grid(alpha=0.22, linestyle="--")
-        axis.legend(fontsize=8)
+        if bool(show_legend):
+            axis.legend(fontsize=8)
 
     for panel_index in range(len(feature_names), num_rows * num_cols):
         axes[panel_index // num_cols, panel_index % num_cols].set_axis_off()
 
-    fig.suptitle(title, fontsize=11)
+    if bool(show_titles) and str(title):
+        fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(save_file))
+    fig.savefig(save_file, format="pdf")
+    plt.close(fig)
+    return save_file
+
+
+def _plot_wan21_t2v_self_attention_feature_all_layers_grid(
+    rows: Sequence[Dict[str, object]],
+    feature_name: str,
+    save_file: str,
+    max_layers: int = 30,
+) -> str:
+    """Render one feature's winner-minus-loser step evolution as a 6x5 layer grid."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    feature_name = str(feature_name)
+    feature_rows = [row for row in rows if str(row["feature"]) == feature_name]
+    if not feature_rows:
+        return ""
+    layers = sorted({int(row["layer"]) for row in feature_rows})[: int(max_layers)]
+    if not layers:
+        return ""
+
+    num_rows = 6
+    num_cols = 5
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(14.5, 15.0), sharex=False, sharey=False)
+    axes = np.atleast_1d(axes).reshape(num_rows, num_cols)
+    for panel_index in range(num_rows * num_cols):
+        axis = axes[panel_index // num_cols, panel_index % num_cols]
+        if panel_index >= len(layers):
+            axis.set_axis_off()
+            continue
+        layer = int(layers[panel_index])
+        layer_rows = [
+            row for row in feature_rows
+            if int(row["layer"]) == int(layer)
+        ]
+        layer_rows = sorted(layer_rows, key=lambda row: int(row["step"]))
+        xs = [int(row["step"]) for row in layer_rows]
+        ys = [_safe_wan21_t2v_float(row.get("mean_gap", float("nan"))) for row in layer_rows]
+        axis.plot(xs, ys, marker="o", markersize=2.4, linewidth=1.0, color="#2563eb", alpha=0.8)
+        axis.axhline(0.0, color="#64748b", linewidth=0.8, linestyle="--", alpha=0.65)
+        axis.set_title(f"Layer {int(layer):02d}", fontsize=9)
+        axis.set_xlabel("step", fontsize=8)
+        axis.grid(alpha=0.18, linestyle="--")
+        axis.tick_params(axis="both", labelsize=7)
+
     fig.tight_layout()
     _ensure_dir(os.path.dirname(save_file))
     fig.savefig(save_file, format="pdf")
@@ -7038,7 +7097,11 @@ def _trajectory_consensus_render_self_attention_plot_task(task: Tuple) -> Any:
     """Render one non-observation self-attention plot task."""
     plot_kind = str(task[0])
     if plot_kind == "evolution":
-        _, rows, feature_names, axis_mode, fixed_value, save_file, title = task
+        _, rows, feature_names, axis_mode, fixed_value, save_file, title, *style_flags = task
+        show_titles = bool(style_flags[0]) if len(style_flags) >= 1 else True
+        show_smooth = bool(style_flags[1]) if len(style_flags) >= 2 else True
+        show_ylabel = bool(style_flags[2]) if len(style_flags) >= 3 else True
+        show_legend = bool(style_flags[3]) if len(style_flags) >= 4 else True
         return _plot_wan21_t2v_self_attention_feature_evolution_panel(
             rows=rows,
             feature_names=feature_names,
@@ -7046,6 +7109,17 @@ def _trajectory_consensus_render_self_attention_plot_task(task: Tuple) -> Any:
             fixed_value=int(fixed_value),
             save_file=str(save_file),
             title=str(title),
+            show_titles=bool(show_titles),
+            show_smooth=bool(show_smooth),
+            show_ylabel=bool(show_ylabel),
+            show_legend=bool(show_legend),
+        )
+    if plot_kind == "evolution_all_layers_grid":
+        _, rows, feature_name, save_file = task
+        return _plot_wan21_t2v_self_attention_feature_all_layers_grid(
+            rows=rows,
+            feature_name=str(feature_name),
+            save_file=str(save_file),
         )
     if plot_kind == "signed_offset":
         _, signed_offset_rows, selected_observations, save_file, title = task
@@ -7353,26 +7427,47 @@ def _render_wan21_t2v_self_attention_coupling_plots(
     all_steps = sorted({int(row["step"]) for row in layerwise_gap_rows})
     misc_plot_tasks: List[Tuple] = []
     for layer in all_layers:
-        evolution_save = os.path.join(
-            layer1_evolution_dir,
-            "by_layer",
-            f"layer_{int(layer):02d}",
-            "winner_loser_gap_vs_step.pdf",
-        )
-        if _maybe_skip_wan21_t2v_existing_plot(evolution_save, skip_existing_plots):
-            plot_paths.append(evolution_save)
-        else:
-            misc_plot_tasks.append(
-                (
-                    "evolution",
-                    stepwise_gap_rows,
-                    tuple(evolution_features),
-                    "step",
-                    int(layer),
-                    evolution_save,
-                    f"Winner-minus-loser gaps versus step at layer={int(layer)}",
-                )
+        for feature_name in evolution_features:
+            evolution_save = os.path.join(
+                layer1_evolution_dir,
+                "by_layer",
+                f"layer_{int(layer):02d}",
+                f"{str(feature_name)}_winner_loser_gap_vs_step.pdf",
             )
+            if _maybe_skip_wan21_t2v_existing_plot(evolution_save, skip_existing_plots):
+                plot_paths.append(evolution_save)
+            else:
+                misc_plot_tasks.append(
+                    (
+                        "evolution",
+                        stepwise_gap_rows,
+                        (str(feature_name),),
+                        "step",
+                        int(layer),
+                        evolution_save,
+                        "",
+                        False,
+                        False,
+                        True,
+                        False,
+                    )
+                )
+    global_mc_all_layers_save = os.path.join(
+        layer1_evolution_dir,
+        "by_layer",
+        "global_mutual_consistency_all_layers.pdf",
+    )
+    if _maybe_skip_wan21_t2v_existing_plot(global_mc_all_layers_save, skip_existing_plots):
+        plot_paths.append(global_mc_all_layers_save)
+    else:
+        misc_plot_tasks.append(
+            (
+                "evolution_all_layers_grid",
+                stepwise_gap_rows,
+                "global_mutual_consistency",
+                global_mc_all_layers_save,
+            )
+        )
     for step in all_steps:
         evolution_save = os.path.join(
             layer1_evolution_dir,

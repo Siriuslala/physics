@@ -15,13 +15,13 @@ GPU_IDS=2
 export CUDA_VISIBLE_DEVICES=$GPU_IDS
 GPU_TAG=a800
 
-SEEDS=(8 1 20 23 29)
+SEEDS=(23 29 20 8 1)
 BENCHMARK_NAME=test
 BATCH_SIZE=1
 
-# SEEDS=(42)
-# BENCHMARK_NAME=phygenbench  # test | videophy2 | videophy2_rewrite | phygenbench
-# BATCH_SIZE=4
+SEEDS=(42)
+BENCHMARK_NAME=videophy2_object_interactions  # test | videophy2 | videophy2_object_interactions | videophy2_rewrite | phygenbench
+BATCH_SIZE=4
 
 MODEL_TYPE=1.3B
 
@@ -30,17 +30,18 @@ MODEL_TYPE=1.3B
 # MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_only/lambda_only-bsz_16-lr_1e-3-lambda_scope_head-lambda_lr_5e-4-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_0.80-seed_42
 # MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_only/lambda_only-bsz_16-lr_1e-3-lambda_scope_head-lambda_lr_1e-3-lambda_beta_1e-4-lambda_tcond_1-lambda_hidden_128-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_0.80-seed_42
 # MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_only/lambda_only-bsz_16-lr_1e-3-lambda_scope_head-lambda_lr_1e-3-lambda_beta_0-lambda_tcond_1-lambda_hidden_128-range_bounded_leq_one_min_0.45_eps_5e-2-steps_3000-warmup_0.01-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_1.00-seed_42
-MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_16-lr_1e-4-lora_rank_128-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_3000-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42
-MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_16-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lam_schedulecosine_1500-steps_3000-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.1_prob_0.9-seed_42
-# MODEL_PATH=
-# CKPT_STEP=
+# MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_16-lora_modules_attn_ffn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42
+# MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42
+MODEL_PATH=
 
-CKPT_STEP=1500
+CKPT_STEP=
+# CKPT_STEP=1000
 
 
 # null | 1,2,3,4,5
 SPATIAL_ROPE_LAMBDA_STEPS=
 SPATIAL_ROPE_LAMBDA_STEPS=1,2,3,4,5
+# SPATIAL_ROPE_LAMBDA_STEPS=1,2,3,4
 
 # dir
 # $WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lora
@@ -66,6 +67,7 @@ T5_CPU=0
 declare -A BENCHMARK_TO_INPUT_JSONL
 BENCHMARK_TO_INPUT_JSONL[test]="$ROOT_DIR/wan_eval/datasets/test/prompts.jsonl"
 BENCHMARK_TO_INPUT_JSONL[videophy2]="$ROOT_DIR/wan_eval/datasets/videophy2/prompts.jsonl"
+BENCHMARK_TO_INPUT_JSONL[videophy2_object_interactions]="$ROOT_DIR/wan_eval/datasets/videophy2/prompts-Object_Interactions.jsonl"
 BENCHMARK_TO_INPUT_JSONL[videophy2_rewrite]="$ROOT_DIR/wan_eval/datasets/videophy2_rewrite/prompts.jsonl"
 BENCHMARK_TO_INPUT_JSONL[phygenbench]="$ROOT_DIR/wan_eval/datasets/phygenbench/prompts.jsonl"
 

@@ -91,11 +91,25 @@ def get_solid_dynamics_cases_from_videophy(input_path, output_path):
             if item["states_of_matter"] == "solid_solid":
                 writer.write(item)
 
+def get_cases_from_videophy2_by_category(input_path, output_path, category):
+    with jsonlines.open(input_path, "r") as reader, jsonlines.open(output_path, "w") as writer:
+        for item in reader:
+            if item["category"] == category:
+                writer.write(item)
+
 def get_liquid_dynamics_cases_from_phygenbench(input_path, output_path):
     with jsonlines.open(input_path, "r") as reader, jsonlines.open(output_path, "w") as writer:
         for item in reader:
             if item["states_of_matter"] == "liquid_liquid":
                 writer.write(item)
+
+def find_categories(input_path):
+    ret = set()
+    with jsonlines.open(input_path, "r") as f:
+        for line in f:
+            ret.add(line["category"])
+    print(ret)
+    return ret
 
 
 if __name__ == "__main__":
@@ -123,3 +137,8 @@ if __name__ == "__main__":
     # condition_key = "caption"
     # format_jsonl_line_vid_gen(old_jsonl_path, new_jsonl_path, condition_key)
     
+    jsonl_path = str(root_dir / "wan_eval/datasets/videophy2/prompts.jsonl")
+    category = "Sports and Physical Activities"
+    output_path = str(root_dir / f"wan_eval/datasets/videophy2/prompts-{category}.jsonl")
+    # find_categories(jsonl_path)
+    get_cases_from_videophy2_by_category(jsonl_path, output_path, category)

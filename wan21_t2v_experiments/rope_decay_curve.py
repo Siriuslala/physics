@@ -8,14 +8,28 @@ import torch
 from .utils import _ensure_dir, _save_json
 
 
+_WAN21_T2V_ROPE_AXIS_FONT_SCALE = 1.5
+_WAN21_T2V_ROPE_AXIS_BASE_FONTSIZE = 10
+_WAN21_T2V_ROPE_AXIS_FONTSIZE = int(
+    _WAN21_T2V_ROPE_AXIS_BASE_FONTSIZE * _WAN21_T2V_ROPE_AXIS_FONT_SCALE
+)
+
+
 def _wan21_t2v_rope_angular_frequencies(real_dim: int, theta: float = 10000.0) -> torch.Tensor:
     """Return RoPE angular frequencies used by Wan's rope_params helper."""
     if int(real_dim) <= 0 or int(real_dim) % 2 != 0:
         raise ValueError(f"RoPE real_dim must be a positive even integer, got {real_dim}.")
+    if float(theta) <= 0.0:
+        raise ValueError(f"RoPE theta must be positive, got {theta}.")
     return 1.0 / torch.pow(
         torch.tensor(float(theta), dtype=torch.float64),
         torch.arange(0, int(real_dim), 2, dtype=torch.float64) / float(real_dim),
     )
+
+
+def _format_wan21_t2v_rope_lambda_value(value: float) -> str:
+    """Return a compact lambda value string for plot labels and filenames."""
+    return f"{float(value):g}"
 
 
 def _wan21_t2v_mean_rope_cosine_kernel(delta: int, angular_frequencies: torch.Tensor) -> float:
@@ -52,22 +66,27 @@ def _plot_wan21_t2v_rope_decay_curve(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axis = plt.subplots(1, 1, figsize=(8.2, 4.8))
+    fig, axis = plt.subplots(1, 1, figsize=(7.2, 5.8))
     color_cycle = ["#2563eb", "#dc2626", "#16a34a", "#d97706"]
-    for color_index, (label, y_values) in enumerate(series):
+    for color_index, series_item in enumerate(series):
+        if len(series_item) == 3:
+            label, y_values, color = series_item
+        else:
+            label, y_values = series_item
+            color = color_cycle[color_index % len(color_cycle)]
         axis.plot(
             x_values,
             y_values,
             linewidth=1.9,
-            color=color_cycle[color_index % len(color_cycle)],
+            color=color,
             label=label,
         )
-    axis.set_title(title)
-    axis.set_xlabel(x_label)
-    axis.set_ylabel(y_label)
+    axis.set_xlabel(x_label, fontsize=_WAN21_T2V_ROPE_AXIS_FONTSIZE)
+    axis.set_ylabel(y_label, fontsize=_WAN21_T2V_ROPE_AXIS_FONTSIZE)
+    axis.tick_params(axis="both", which="major", labelsize=_WAN21_T2V_ROPE_AXIS_FONTSIZE)
     axis.grid(alpha=0.22, linestyle="--")
     if len(series) > 1:
-        axis.legend(fontsize=8)
+        axis.legend(fontsize=_WAN21_T2V_ROPE_AXIS_FONTSIZE)
     fig.tight_layout()
     _ensure_dir(os.path.dirname(save_file))
     fig.savefig(save_file, format="pdf")
@@ -81,22 +100,57 @@ def _plot_wan21_t2v_rope_heatmap(
     title: str,
     x_label: str,
     y_label: str,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
 ):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, axis = plt.subplots(1, 1, figsize=(7.2, 5.8))
-    image = axis.imshow(heatmap.detach().cpu().numpy(), cmap="viridis", origin="lower", aspect="auto")
+    image = axis.imshow(
+        heatmap.detach().cpu().numpy(),
+        cmap="viridis",
+        origin="lower",
+        aspect="auto",
+        vmin=vmin,
+        vmax=vmax,
+    )
     axis.set_title(title)
-    axis.set_xlabel(x_label)
-    axis.set_ylabel(y_label)
-    fig.colorbar(image, ax=axis, shrink=0.85)
+    axis.set_xlabel(x_label, fontsize=_WAN21_T2V_ROPE_AXIS_FONTSIZE)
+    axis.set_ylabel(y_label, fontsize=_WAN21_T2V_ROPE_AXIS_FONTSIZE)
+    axis.tick_params(axis="both", which="major", labelsize=_WAN21_T2V_ROPE_AXIS_FONTSIZE)
+    colorbar = fig.colorbar(image, ax=axis, shrink=0.85)
+    colorbar.ax.tick_params(labelsize=_WAN21_T2V_ROPE_AXIS_FONTSIZE)
     fig.tight_layout()
     _ensure_dir(os.path.dirname(save_file))
     fig.savefig(save_file, format="pdf")
     plt.close(fig)
     return save_file
+
+
+def _wan21_t2v_build_spatial_center_heatmap(
+    token_grid_height: int,
+    token_grid_width: int,
+    spatial_anchor_y: int,
+    spatial_anchor_x: int,
+    temporal_frequencies: torch.Tensor,
+    height_frequencies: torch.Tensor,
+    width_frequencies: torch.Tensor,
+) -> torch.Tensor:
+    """Return same-frame full-head RoPE coherence from one spatial center anchor."""
+    spatial_heatmap = torch.zeros((token_grid_height, token_grid_width), dtype=torch.float64)
+    for yy in range(token_grid_height):
+        for xx in range(token_grid_width):
+            spatial_heatmap[yy, xx] = _wan21_t2v_full_rope_kernel(
+                delta_f=0,
+                delta_h=int(yy - spatial_anchor_y),
+                delta_w=int(xx - spatial_anchor_x),
+                temporal_frequencies=temporal_frequencies,
+                height_frequencies=height_frequencies,
+                width_frequencies=width_frequencies,
+            )
+    return spatial_heatmap
 
 
 def _wan21_t2v_spatial_radial_profile(spatial_heatmap: torch.Tensor, center_y: int, center_x: int):
@@ -134,9 +188,16 @@ def run_wan21_t2v_rope_decay_curve(
     device_id: Optional[int] = None,
     offload_model: bool = True,
     parallel_cfg=None,
+    rope_modification_lambda_h: float = 1.0,
+    rope_modification_lambda_w: float = 1.0,
 ):
     """Visualize Wan2.1 RoPE-only temporal/spatial decay without loading the model."""
     del wan21_root, ckpt_dir, prompt, shift, sample_solver, sampling_steps, guide_scale, seed, device_id, offload_model, parallel_cfg
+    if float(rope_modification_lambda_h) <= 0.0 or float(rope_modification_lambda_w) <= 0.0:
+        raise ValueError(
+            "rope_decay_curve lambda scales must be positive, got "
+            f"lambda_h={rope_modification_lambda_h}, lambda_w={rope_modification_lambda_w}."
+        )
 
     from projects.Wan2_1 import wan
 
@@ -148,6 +209,12 @@ def run_wan21_t2v_rope_decay_curve(
     temporal_frequencies = _wan21_t2v_rope_angular_frequencies(temporal_real_dim)
     height_frequencies = _wan21_t2v_rope_angular_frequencies(spatial_real_dim)
     width_frequencies = _wan21_t2v_rope_angular_frequencies(spatial_real_dim)
+    lambda_h = float(rope_modification_lambda_h)
+    lambda_w = float(rope_modification_lambda_w)
+    lambda_h_label = _format_wan21_t2v_rope_lambda_value(lambda_h)
+    lambda_w_label = _format_wan21_t2v_rope_lambda_value(lambda_w)
+    scaled_height_frequencies = lambda_h * height_frequencies
+    scaled_width_frequencies = lambda_w * width_frequencies
 
     latent_frames = (int(frame_num) - 1) // int(cfg.vae_stride[0]) + 1
     latent_height = int(size[1]) // int(cfg.vae_stride[1])
@@ -209,19 +276,31 @@ def run_wan21_t2v_rope_decay_curve(
 
     spatial_anchor_y = token_grid_height // 2
     spatial_anchor_x = token_grid_width // 2
-    spatial_heatmap = torch.zeros((token_grid_height, token_grid_width), dtype=torch.float64)
-    for yy in range(token_grid_height):
-        for xx in range(token_grid_width):
-            spatial_heatmap[yy, xx] = _wan21_t2v_full_rope_kernel(
-                delta_f=0,
-                delta_h=int(yy - spatial_anchor_y),
-                delta_w=int(xx - spatial_anchor_x),
-                temporal_frequencies=temporal_frequencies,
-                height_frequencies=height_frequencies,
-                width_frequencies=width_frequencies,
-            )
+    spatial_heatmap = _wan21_t2v_build_spatial_center_heatmap(
+        token_grid_height=token_grid_height,
+        token_grid_width=token_grid_width,
+        spatial_anchor_y=spatial_anchor_y,
+        spatial_anchor_x=spatial_anchor_x,
+        temporal_frequencies=temporal_frequencies,
+        height_frequencies=height_frequencies,
+        width_frequencies=width_frequencies,
+    )
+    scaled_spatial_heatmap = _wan21_t2v_build_spatial_center_heatmap(
+        token_grid_height=token_grid_height,
+        token_grid_width=token_grid_width,
+        spatial_anchor_y=spatial_anchor_y,
+        spatial_anchor_x=spatial_anchor_x,
+        temporal_frequencies=temporal_frequencies,
+        height_frequencies=scaled_height_frequencies,
+        width_frequencies=scaled_width_frequencies,
+    )
     spatial_radius_values, spatial_radial_profile = _wan21_t2v_spatial_radial_profile(
         spatial_heatmap=spatial_heatmap,
+        center_y=spatial_anchor_y,
+        center_x=spatial_anchor_x,
+    )
+    _, scaled_spatial_radial_profile = _wan21_t2v_spatial_radial_profile(
+        spatial_heatmap=scaled_spatial_heatmap,
         center_y=spatial_anchor_y,
         center_x=spatial_anchor_x,
     )
@@ -297,9 +376,32 @@ def run_wan21_t2v_rope_decay_curve(
         x_label="token-grid width index",
         y_label="token-grid height index",
     )
+    scaled_spatial_heatmap_path = _plot_wan21_t2v_rope_heatmap(
+        heatmap=scaled_spatial_heatmap,
+        save_file=os.path.join(
+            output_dir,
+            "rope_decay_curve_spatial_center_heatmap_"
+            f"lambda_h{lambda_h_label}_lambda_w{lambda_w_label}.pdf",
+        ),
+        title=(
+            f"Wan2.1 RoPE Spatial Coherence Heatmap | {task} | "
+            f"lambda_h={lambda_h_label}, lambda_w={lambda_w_label}"
+        ),
+        x_label="token-grid width index",
+        y_label="token-grid height index",
+        vmin=float(spatial_heatmap.min().item()),
+        vmax=float(spatial_heatmap.max().item()),
+    )
     spatial_radial_plot_path = _plot_wan21_t2v_rope_decay_curve(
         x_values=spatial_radius_values,
-        series=[("same_frame_center_anchor", spatial_radial_profile)],
+        series=[
+            ("original RoPE", spatial_radial_profile),
+            (
+                f"RoPE with $\\lambda_h$={lambda_h_label}, $\\lambda_w$={lambda_w_label}",
+                scaled_spatial_radial_profile,
+                "#16a34a",
+            ),
+        ],
         save_file=os.path.join(output_dir, "rope_decay_curve_spatial_radial_profile.pdf"),
         title=f"Wan2.1 RoPE Spatial Radial Profile | {task} | size={size[0]}x{size[1]}",
         x_label="integer-rounded spatial radius in token grid",
@@ -334,9 +436,12 @@ def run_wan21_t2v_rope_decay_curve(
         "spatial_height_plot_path": height_plot_path,
         "spatial_width_plot_path": width_plot_path,
         "spatial_heatmap_path": spatial_heatmap_path,
+        "scaled_spatial_heatmap_path": scaled_spatial_heatmap_path,
         "spatial_radial_plot_path": spatial_radial_plot_path,
         "token_plot_path": token_plot_path,
         "spatial_anchor_token_index": [int(spatial_anchor_y), int(spatial_anchor_x)],
+        "rope_modification_lambda_h": float(lambda_h),
+        "rope_modification_lambda_w": float(lambda_w),
     }
     _save_json(os.path.join(output_dir, "rope_decay_curve_summary.json"), summary)
     return summary

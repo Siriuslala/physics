@@ -88,7 +88,7 @@ SAMPLE_STEPS=50
 SAMPLE_SHIFT=5.0
 SAMPLE_GUIDE_SCALE=5.0
 
-SEEDS=(26)
+SEEDS=(20)
 PROMPTS=(
     "Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times."
 )
@@ -132,8 +132,8 @@ fi
 # Experiment mode
 # candidate_consensus | head_contribution | filter_heads | self_attention_coupling | seed_influence | plot_candidate | plot_head | plot_self | all
 # RUN_MODE="candidate_consensus"  # candidate_consensus | plot_candidate
-RUN_MODE="plot_head"  # head_contribution | plot_head | filter_heads
-# RUN_MODE="plot_self"  # self_attention_coupling | plot_self
+# RUN_MODE="plot_head"  # head_contribution | plot_head | filter_heads
+RUN_MODE="plot_self"  # self_attention_coupling | plot_self
 # RUN_MODE="seed_influence"  # 
 
 # Optional scope controls

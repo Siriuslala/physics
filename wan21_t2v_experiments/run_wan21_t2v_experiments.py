@@ -1604,6 +1604,8 @@ def main():
     elif experiment_name == "rope_decay_curve":
         run_wan21_t2v_rope_decay_curve(
             **common_kwargs,
+            rope_modification_lambda_h=args.rope_modification_lambda_h,
+            rope_modification_lambda_w=args.rope_modification_lambda_w,
         )
     elif experiment_name == "rope_modification":
         run_wan21_t2v_rope_modification(

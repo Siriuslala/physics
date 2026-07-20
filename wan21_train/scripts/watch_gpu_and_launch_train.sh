@@ -3,10 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-TARGET_GPU_INDEX=2  # ！
+TARGET_GPU_INDEX=3  # ！
 MEMORY_THRESHOLD_MIB=50000
 LOG_ENABLED=0  # ！
-MODE="train"  # train | eval
+MODE="eval"  # train | eval
 TRAIN_SCRIPT="$(pwd)/train_wan21_t2v_1b3_fixed_lambda_lora.sh"
 EVAL_SCRIPT="$(pwd)/../../wan_eval/scripts/infer_eval_2.1.sh"
 

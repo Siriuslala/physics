@@ -21,7 +21,7 @@ export DIFFSYNTH_SKIP_DOWNLOAD=true
 
 
 # GPU settings ==============================
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=3
 NUM_PROCESSES=1
 
 # export CUDA_VISIBLE_DEVICES=5,6
@@ -71,7 +71,7 @@ VIDEO_CLIP_SECONDS=5.0
 # With ENABLE_BATCHED_SFT=1, standard Wan T2V SFT uses DATASET_BATCH_SIZE as real per-process batch size.
 # Effective global batch = DATASET_BATCH_SIZE * NUM_PROCESSES * GRADIENT_ACCUMULATION_STEPS.
 GLOBAL_BATCH_SIZE=32
-DATASET_BATCH_SIZE=8  # batchsize per forward
+DATASET_BATCH_SIZE=4  # batchsize per forward
 ENABLE_BATCHED_SFT=1
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then WORLD_SIZE=$NUM_PROCESSES; else WORLD_SIZE=1; fi
 GRADIENT_ACCUMULATION_STEPS=$(( (GLOBAL_BATCH_SIZE + DATASET_BATCH_SIZE * WORLD_SIZE - 1) / (DATASET_BATCH_SIZE * WORLD_SIZE) ))
@@ -108,8 +108,8 @@ FIXED_LAMBDA_SCHEDULE_STEPS=0  # 0 means use MAX_TRAIN_STEPS / total update step
 FIXED_LAMBDA_GLOBAL=0  # 1: apply lambda on all training timesteps; 0: only apply it in the early timestep boundary.
 
 LORA_RANK=64
-LORA_ALPHA=32
-LORA_MODULE_PRESET=attn  # attn | ffn | attn_ffn
+LORA_ALPHA=16
+LORA_MODULE_PRESET=attn_ffn  # attn | ffn | attn_ffn
 case "$LORA_MODULE_PRESET" in
   attn) LORA_TARGET_MODULES=q,k,v,o ;;
   ffn) LORA_TARGET_MODULES=ffn.0,ffn.2 ;;

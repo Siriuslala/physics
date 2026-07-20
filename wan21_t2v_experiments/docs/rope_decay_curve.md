@@ -326,9 +326,12 @@ frame-level 图的横轴是 latent token-frame 相对距离
 - 目标点遍历该帧全部空间坐标
 - 每个像素值都是该目标点相对 anchor 的 RoPE-only full-head coherence
 
-对应输出文件：
+The corresponding output files are:
 
 - `rope_decay_curve_spatial_center_heatmap.pdf`
+- `rope_decay_curve_spatial_center_heatmap_lambda_h{lambda_h}_lambda_w{lambda_w}.pdf`
+
+The second heatmap uses scaled spatial RoPE phases. The height-axis phase is evaluated as \(\lambda_h\Delta_h\omega_h\), and the width-axis phase is evaluated as \(\lambda_w\Delta_w\omega_w\). The temporal phase is unchanged. Its colorbar uses the same lower and upper limits as `rope_decay_curve_spatial_center_heatmap.pdf` so that the two heatmaps are visually comparable.
 
 summary 里的 `spatial_anchor_token_index` 保存的正是
 
@@ -352,9 +355,9 @@ summary 里的 `spatial_anchor_token_index` 保存的正是
 
 \[ K_{\text{radial}}(\rho) = \frac{1}{|\mathcal{S}_{\rho}|} \sum_{(h,w)\in\mathcal{S}_{\rho}} K_{\text{heatmap}}(h,w). \]
 
-这条曲线回答的是：如果不区分具体方向，只按“离中心多远”来统计，那么 same-frame spatial coherence 的平均 envelope 如何变化。
+This curve answers how the same-frame spatial coherence envelope changes when spatial direction is marginalized and only center distance is retained. The figure contains two curves: `original RoPE` for the unscaled Wan2.1 RoPE basis, and `RoPE with λ_h=..., λ_w=...` for the auxiliary spatial phases \(\lambda_h\Delta_h\omega_h\) and \(\lambda_w\Delta_w\omega_w\).
 
-对应输出文件：
+The corresponding output file is:
 
 - `rope_decay_curve_spatial_radial_profile.pdf`
 
@@ -471,6 +474,7 @@ token-level 图的横轴是 flattened video-token 相对距离。先定义 flatt
 - `rope_decay_curve_spatial_height_axis.pdf`
 - `rope_decay_curve_spatial_width_axis.pdf`
 - `rope_decay_curve_spatial_center_heatmap.pdf`
+- `rope_decay_curve_spatial_center_heatmap_lambda_h{lambda_h}_lambda_w{lambda_w}.pdf`
 - `rope_decay_curve_spatial_radial_profile.pdf`
 - `rope_decay_curve_token_level.pdf`
 - `rope_decay_curve_summary.json`
@@ -485,6 +489,9 @@ summary 里还会保存：
 - `token_grid_width`
 - `sequence_token_count`
 - `spatial_anchor_token_index`
+- `scaled_spatial_heatmap_path`
+- `rope_modification_lambda_h`
+- `rope_modification_lambda_w`
 
 ## 9. Reading Guide
 
