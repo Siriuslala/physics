@@ -2,6 +2,7 @@ import cv2
 import csv
 import json
 import jsonlines
+import pandas as pd
 
 import os
 from pathlib import Path
@@ -112,6 +113,30 @@ def find_categories(input_path):
     return ret
 
 
+def jsonl_to_excel(jsonl_file_path, excel_file_path):
+    """
+    读取JSONL文件并写入Excel文件
+    
+    Args:
+        jsonl_file_path (str): JSONL文件路径
+        excel_file_path (str): 输出Excel文件路径
+    """
+    # 存储所有行数据
+    data = []
+    
+    # 读取JSONL文件
+    with jsonlines.open(jsonl_file_path, 'r') as f:
+        for item in f:
+            data.append({
+                'id': item.get('id', ''),
+                'states_of_matter': item.get('states_of_matter', ''),
+                'prompt': item.get('prompt', '')
+            })
+    
+    df = pd.DataFrame(data)
+    df.to_excel(excel_file_path, index=False, engine='openpyxl')
+    
+
 if __name__ == "__main__":
     pass
 
@@ -137,8 +162,11 @@ if __name__ == "__main__":
     # condition_key = "caption"
     # format_jsonl_line_vid_gen(old_jsonl_path, new_jsonl_path, condition_key)
     
-    jsonl_path = str(root_dir / "wan_eval/datasets/videophy2/prompts.jsonl")
-    category = "Sports and Physical Activities"
-    output_path = str(root_dir / f"wan_eval/datasets/videophy2/prompts-{category}.jsonl")
-    # find_categories(jsonl_path)
-    get_cases_from_videophy2_by_category(jsonl_path, output_path, category)
+    # jsonl_path = str(root_dir / "wan_eval/datasets/videophy2/prompts.jsonl")
+    # category = "Sports and Physical Activities"
+    # output_path = str(root_dir / f"wan_eval/datasets/videophy2/prompts-{category}.jsonl")
+    # # find_categories(jsonl_path)
+    # get_cases_from_videophy2_by_category(jsonl_path, output_path, category)
+
+    jsonl_path = str(root_dir / "wan_eval/datasets/videophy/prompts.jsonl")
+    jsonl_to_excel(jsonl_path, str(root_dir / "prompts.xlsx"))

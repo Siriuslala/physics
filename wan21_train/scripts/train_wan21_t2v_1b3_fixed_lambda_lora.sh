@@ -70,8 +70,8 @@ VIDEO_CLIP_SECONDS=5.0
 # Hyper-params settings ============================== 
 # With ENABLE_BATCHED_SFT=1, standard Wan T2V SFT uses DATASET_BATCH_SIZE as real per-process batch size.
 # Effective global batch = DATASET_BATCH_SIZE * NUM_PROCESSES * GRADIENT_ACCUMULATION_STEPS.
-GLOBAL_BATCH_SIZE=32
-DATASET_BATCH_SIZE=4  # batchsize per forward
+GLOBAL_BATCH_SIZE=32  # !
+DATASET_BATCH_SIZE=4  # batchsize per gpu in each forward pass
 ENABLE_BATCHED_SFT=1
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then WORLD_SIZE=$NUM_PROCESSES; else WORLD_SIZE=1; fi
 GRADIENT_ACCUMULATION_STEPS=$(( (GLOBAL_BATCH_SIZE + DATASET_BATCH_SIZE * WORLD_SIZE - 1) / (DATASET_BATCH_SIZE * WORLD_SIZE) ))
@@ -85,8 +85,8 @@ ADAM_EPSILON=1e-8
 WEIGHT_DECAY=0.0
 MAX_GRAD_NORM=1.0
 NUM_EPOCHS=3
-MAX_TRAIN_STEPS=1500
-SAVE_STEPS=100
+MAX_TRAIN_STEPS=1500  # !
+SAVE_STEPS=100  # !
 SAVE_TRAINING_STATE=1
 RESUME_TRAINING=0  # 0 | auto | /path/to/training_state_latest
 
@@ -94,22 +94,22 @@ RESUME_TRAINING=0  # 0 | auto | /path/to/training_state_latest
 MIN_TIMESTEP_BOUNDARY=0.0
 MAX_TIMESTEP_BOUNDARY=1.0
 TIMESTEP_SAMPLING_STRATEGY=early_rest_mixture  # uniform | early_rest_mixture
-TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.1
-TIMESTEP_MIXTURE_EARLY_PROB=0.9
+TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.1  # !
+TIMESTEP_MIXTURE_EARLY_PROB=0.7  # !
 
 
 # Fixed manual spatial RoPE lambda settings ==============================
 # This mode keeps lambda frozen and trains LoRA to adapt to the manual RoPE bias.
 FIXED_LAMBDA_SCOPE=model  # ignore this
-FIXED_LAMBDA_H=0.75
-FIXED_LAMBDA_W=0.75
+FIXED_LAMBDA_H=0.75  # !
+FIXED_LAMBDA_W=0.75  # !
 FIXED_LAMBDA_SCHEDULE=cosine  # constant | linear | cosine. cosine anneals from 1 to the target lambda.
 FIXED_LAMBDA_SCHEDULE_STEPS=0  # 0 means use MAX_TRAIN_STEPS / total update steps.
 FIXED_LAMBDA_GLOBAL=0  # 1: apply lambda on all training timesteps; 0: only apply it in the early timestep boundary.
 
 LORA_RANK=64
-LORA_ALPHA=16
-LORA_MODULE_PRESET=attn_ffn  # attn | ffn | attn_ffn
+LORA_ALPHA=32
+LORA_MODULE_PRESET=attn  # attn | ffn | attn_ffn
 case "$LORA_MODULE_PRESET" in
   attn) LORA_TARGET_MODULES=q,k,v,o ;;
   ffn) LORA_TARGET_MODULES=ffn.0,ffn.2 ;;

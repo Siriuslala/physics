@@ -21,11 +21,11 @@ export DIFFSYNTH_SKIP_DOWNLOAD=true
 
 
 # GPU settings ==============================
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=2
 NUM_PROCESSES=1
 
-export CUDA_VISIBLE_DEVICES=5,6
-NUM_PROCESSES=2
+# export CUDA_VISIBLE_DEVICES=2
+# NUM_PROCESSES=2
 
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then LAUNCH_MODE=multi; else LAUNCH_MODE=single; fi
 
@@ -70,8 +70,8 @@ VIDEO_CLIP_SECONDS=5.0
 # Hyper-params settings ============================== 
 # With ENABLE_BATCHED_SFT=1, standard Wan T2V SFT uses DATASET_BATCH_SIZE as real per-process batch size.
 # Effective global batch = DATASET_BATCH_SIZE * NUM_PROCESSES * GRADIENT_ACCUMULATION_STEPS.
-GLOBAL_BATCH_SIZE=16
-DATASET_BATCH_SIZE=1  # batchsize per forward
+GLOBAL_BATCH_SIZE=32
+DATASET_BATCH_SIZE=4  # batchsize per forward
 ENABLE_BATCHED_SFT=1
 if [[ "$NUM_PROCESSES" -gt 1 ]]; then WORLD_SIZE=$NUM_PROCESSES; else WORLD_SIZE=1; fi
 GRADIENT_ACCUMULATION_STEPS=$(( (GLOBAL_BATCH_SIZE + DATASET_BATCH_SIZE * WORLD_SIZE - 1) / (DATASET_BATCH_SIZE * WORLD_SIZE) ))
@@ -85,7 +85,7 @@ ADAM_EPSILON=1e-8
 WEIGHT_DECAY=0.0
 MAX_GRAD_NORM=1.0
 NUM_EPOCHS=3
-MAX_TRAIN_STEPS=3000
+MAX_TRAIN_STEPS=1500
 SAVE_STEPS=100
 SAVE_TRAINING_STATE=1
 RESUME_TRAINING=0  # 0 | auto | /path/to/training_state_latest
@@ -93,7 +93,7 @@ RESUME_TRAINING=0  # 0 | auto | /path/to/training_state_latest
 # Timestep sampling settings ==============================
 MIN_TIMESTEP_BOUNDARY=0.0
 MAX_TIMESTEP_BOUNDARY=1.0
-TIMESTEP_SAMPLING_STRATEGY=early_rest_mixture  # uniform | early_rest_mixture
+TIMESTEP_SAMPLING_STRATEGY=uniform  # uniform | early_rest_mixture
 TIMESTEP_MIXTURE_EARLY_BOUNDARY=0.10
 TIMESTEP_MIXTURE_EARLY_PROB=0.8
 

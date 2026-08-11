@@ -623,6 +623,8 @@ class BatchWanT2V(wan.WanT2V):
         spatial_rope_lambda_timestep_conditioned: bool | None = None,
         spatial_rope_lambda_hidden_dim: int | None = None,
         spatial_rope_lambda_checkpoint: str | None = None,
+        spatial_rope_lambda_fixed_h: float | None = None,
+        spatial_rope_lambda_fixed_w: float | None = None,
         lora_target_modules: str | None = None,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
@@ -650,8 +652,22 @@ class BatchWanT2V(wan.WanT2V):
         lambda_parametrization = str(training_args.get('wan_spatial_rope_lambda_parametrization') or 'unconstrained')
         lambda_min = float(training_args.get('wan_spatial_rope_lambda_min', 0.5))
         lambda_init_eps = float(training_args.get('wan_spatial_rope_lambda_init_eps', 1e-4))
-        lambda_fixed_h = float(training_args.get('wan_spatial_rope_lambda_fixed_h', 1.0))
-        lambda_fixed_w = float(training_args.get('wan_spatial_rope_lambda_fixed_w', 1.0))
+        lambda_fixed_h = float(
+            spatial_rope_lambda_fixed_h if spatial_rope_lambda_fixed_h is not None
+            else training_args.get('wan_spatial_rope_lambda_fixed_h', 1.0)
+        )
+        lambda_fixed_w = float(
+            spatial_rope_lambda_fixed_w if spatial_rope_lambda_fixed_w is not None
+            else training_args.get('wan_spatial_rope_lambda_fixed_w', 1.0)
+        )
+        manual_fixed_lambda = spatial_rope_lambda_fixed_h is not None or spatial_rope_lambda_fixed_w is not None
+        if manual_fixed_lambda:
+            lambda_enabled = True
+            if lambda_parametrization != 'fixed':
+                logging.warning(
+                    'Manual fixed lambda override was provided; forcing spatial RoPE lambda parametrization to fixed at inference time.'
+                )
+                lambda_parametrization = 'fixed'
         lambda_checkpoint_path = spatial_rope_lambda_checkpoint or artifacts['lambda_checkpoint_path']
         resolved_lora_target_modules = parse_lora_target_modules(lora_target_modules)
         if resolved_lora_target_modules is None:
@@ -914,6 +930,8 @@ def run_worker(args, samples: list[PromptSample]) -> None:
         spatial_rope_lambda_timestep_conditioned=args.spatial_rope_lambda_timestep_conditioned,
         spatial_rope_lambda_hidden_dim=args.spatial_rope_lambda_hidden_dim,
         spatial_rope_lambda_checkpoint=args.spatial_rope_lambda_checkpoint,
+        spatial_rope_lambda_fixed_h=args.spatial_rope_lambda_fixed_h,
+        spatial_rope_lambda_fixed_w=args.spatial_rope_lambda_fixed_w,
         lora_target_modules=args.lora_target_modules,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
@@ -1072,6 +1090,8 @@ def parse_args():
     parser.add_argument('--spatial_rope_lambda_timestep_conditioned', action='store_true', default=None, help='Enable timestep-conditioned lambda MLP g(e_t).')
     parser.add_argument('--spatial_rope_lambda_hidden_dim', type=int, default=None, help='Hidden dimension of the timestep-conditioned lambda MLP.')
     parser.add_argument('--spatial_rope_lambda_checkpoint', type=str, default='', help='Optional explicit lambda checkpoint path. When omitted, the script tries to infer it from model_path.')
+    parser.add_argument('--spatial_rope_lambda_fixed_h', type=float, default=None, help='Optional manual override for fixed-lambda height scale at inference.')
+    parser.add_argument('--spatial_rope_lambda_fixed_w', type=float, default=None, help='Optional manual override for fixed-lambda width scale at inference.')
     parser.add_argument('--spatial_rope_lambda_steps', type=str, default='', help='Optional comma-separated 1-based denoising step indices where lambda stays active, for example `1,2,3,4,5`. Empty means enable lambda on every denoising step.')
     parser.add_argument('--worker_mode', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--disable_tqdm', action='store_true', help=argparse.SUPPRESS)
@@ -1090,6 +1110,10 @@ def validate_args(args):
         raise ValueError(f'frame_num must be positive and satisfy 4n+1, got {args.frame_num}.')
     if args.batch_size <= 0:
         raise ValueError(f'batch_size must be positive, got {args.batch_size}.')
+    if args.spatial_rope_lambda_fixed_h is not None and args.spatial_rope_lambda_fixed_h <= 0:
+        raise ValueError(f'spatial_rope_lambda_fixed_h must be positive, got {args.spatial_rope_lambda_fixed_h}.')
+    if args.spatial_rope_lambda_fixed_w is not None and args.spatial_rope_lambda_fixed_w <= 0:
+        raise ValueError(f'spatial_rope_lambda_fixed_w must be positive, got {args.spatial_rope_lambda_fixed_w}.')
     parse_step_list(args.spatial_rope_lambda_steps)
     if args.gpu_ids:
         gpu_ids = [gpu_id.strip() for gpu_id in args.gpu_ids.split(',') if gpu_id.strip()]

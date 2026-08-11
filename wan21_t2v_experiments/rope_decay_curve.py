@@ -397,7 +397,7 @@ def run_wan21_t2v_rope_decay_curve(
         series=[
             ("original RoPE", spatial_radial_profile),
             (
-                f"RoPE with $\\lambda_h$={lambda_h_label}, $\\lambda_w$={lambda_w_label}",
+                f"RoPE with $\\lambda^h$={lambda_h_label}, $\\lambda^w$={lambda_w_label}",
                 scaled_spatial_radial_profile,
                 "#16a34a",
             ),

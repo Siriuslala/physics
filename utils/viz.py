@@ -320,6 +320,9 @@ def save_wan21_t2v_video_timeline_pdf(
     save_file: str,
     num_frames: int = 10,
     title: Optional[str] = None,
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+    save_dpi: int = 300,
 ) -> Tuple[List[int], List[int]]:
     """Render a one-row PDF timeline by sampling frames from an MP4 video.
 
@@ -329,6 +332,10 @@ def save_wan21_t2v_video_timeline_pdf(
         num_frames: Number of displayed frames. The default `10` matches the
             default cross-attention timeline configuration.
         title: Optional figure title. When omitted, the base filename is used.
+        start: Optional 0-based inclusive start frame index. When omitted,
+            sampling starts from the first decoded frame.
+        end: Optional 0-based inclusive end frame index. When omitted, sampling
+            ends at the last decoded frame.
 
     Returns:
         A tuple `(frame_indices_0based, frame_labels_1based)` describing the
@@ -347,13 +354,32 @@ def save_wan21_t2v_video_timeline_pdf(
 
     frames = _load_video_frames(video_path)
     video_frame_count = len(frames)
-    sampled_indices = _resolve_wan21_t2v_video_timeline_indices(
-        video_frame_count=video_frame_count,
+    start_idx = 0 if start is None else int(start)
+    end_idx = video_frame_count - 1 if end is None else int(end)
+    if start_idx < 0:
+        raise ValueError(f"start must be non-negative, got {start_idx}.")
+    if end_idx < 0:
+        raise ValueError(f"end must be non-negative, got {end_idx}.")
+    if start_idx >= video_frame_count:
+        raise ValueError(
+            f"start={start_idx} is outside decoded video frame range [0, {video_frame_count - 1}]."
+        )
+    if end_idx >= video_frame_count:
+        raise ValueError(
+            f"end={end_idx} is outside decoded video frame range [0, {video_frame_count - 1}]."
+        )
+    if end_idx < start_idx:
+        raise ValueError(f"end must be >= start, got start={start_idx}, end={end_idx}.")
+
+    frame_window_count = end_idx - start_idx + 1
+    sampled_window_indices = _resolve_wan21_t2v_video_timeline_indices(
+        video_frame_count=frame_window_count,
         num_frames=int(num_frames),
     )
-    if not sampled_indices:
+    if not sampled_window_indices:
         raise ValueError(f"No frames available for visualization: {video_path}")
 
+    sampled_indices = [start_idx + int(idx) for idx in sampled_window_indices]
     sampled_labels = [int(idx) + 1 for idx in sampled_indices]
     sampled_frames = [frames[int(idx)] for idx in sampled_indices]
 
@@ -375,7 +401,7 @@ def save_wan21_t2v_video_timeline_pdf(
     fig.subplots_adjust(left=0.005, right=0.995, top=0.88, bottom=0.01, wspace=0.01, hspace=0.0)
 
     _ensure_dir(os.path.dirname(save_file))
-    fig.savefig(save_file, format="pdf")
+    fig.savefig(save_file, format="pdf", dpi=int(save_dpi))
     plt.close(fig)
 
     return sampled_indices, sampled_labels
@@ -383,11 +409,74 @@ def save_wan21_t2v_video_timeline_pdf(
 
 if __name__ == "__main__":
     os.chdir(SCRIPT_DIR)
-    save_wan21_t2v_video_timeline_pdf(
-        video_path=str(work_dir / "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attn_head_ablation/Against_a_pure_white_background,_there_is_a_wooden_horizontal_surface,_with_one_single_wooden_slope_attached_to_its_left_end._One_small_green_ball_starts_from_rest_at_the_top_of_the_slope,_slides_straight_along_the_slope_the_entire_time_with_its_speed_inc/seed_2_shift_5.0_guide_5.0/ablate_traj_new_speed_gt0p2_contri_lt0p1-steps_all_steps/wan21_t2v_cross_attn_head_ablation_steps_all_seed_2.mp4"),
-        save_file=str(work_dir / "wan_eval_viz/ball_seed2_ablate_new_speed_gt0p2_contri_lt0p1.pdf"),
-    )
 
+    # save_wan21_t2v_video_timeline_pdf(
+    #     video_path=str(work_dir / "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_1_shift_5.0_guide_5.0/wan21_t2v_cross_attention_token_viz_seed_1.mp4"),
+    #     save_file=str(work_dir / "/work/liyueyan/Interpretability/physics/general_viz/basketball_seed1_.pdf"),
+    #     start=20,
+    #     end=80,
+    # )
+
+    # save_wan21_t2v_video_timeline_pdf(
+    #     video_path=str(work_dir / "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/rope_modification/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_29_shift_5.0_guide_5.0/lambda_modify_mode_manual-lambdaf_1.0-lambdah_0.5-lambdaw_0.5-lambda_steps_1-2-3-4-5.mp4"),
+    #     save_file=str(work_dir / "/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_train/ball_seed29_lambda0.50.pdf"),
+    #     # start=25,
+    #     # end=70,
+    #     save_dpi=300,
+    # )
+
+    # save_wan21_t2v_video_timeline_pdf(
+    #     video_path=str(work_dir / "/work/liyueyan/Interpretability/physics/wan_eval/test/a800/1/fixed_lambda_lora-bsz_16-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_3000-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42/ckpt_step_1500_lambda_steps_1-2-3-4-5/1.mp4"),
+    #     save_file=str(work_dir / "/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_train/ball_seed1.pdf"),
+    #     start=10,
+    #     end=80,
+    # )
+
+    # ======== videophy
+    case = 232
+    # save_wan21_t2v_video_timeline_pdf(
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy/a800/42/wan2.1_1B3/ckpt_step_latest/{case}.mp4"),
+    #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy/case{case}_wan2.1_1B3.pdf"),
+    #     save_dpi=100,
+    # )
+
+    # save_wan21_t2v_video_timeline_pdf(
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy/a800/42/wan2.1_1B3/ckpt_step_latest_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
+    #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy/case{case}_wan2.1_1B3_manual0.70.pdf"),
+    #     save_dpi=100,
+    #     # end=55,
+    # )
+
+    # save_wan21_t2v_video_timeline_pdf(
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy/a800/42/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42/ckpt_step_800_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
+    #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy/case{case}_bsz_32-lora_rank_64_alpha_32_modules_attn-lambda_0.75-mixed_0.1_0.9-ckpt_step_800_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70.pdf"),
+    #     # start=15,
+    #     save_dpi=100,
+    # )
+
+    # ======== videophy_rewrite
+    case = 9
+    # save_wan21_t2v_video_timeline_pdf(
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy_rewrite/a800/42/wan2.1_1B3/ckpt_step_latest/{case}.mp4"),
+    #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy_rewrite/case{case}_wan2.1_1B3.pdf"),
+    #     save_dpi=100,
+    # )
+
+    # save_wan21_t2v_video_timeline_pdf(
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy_rewrite/a800/42/wan2.1_1B3/ckpt_step_latest_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
+    #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy_rewrite/case{case}_wan2.1_1B3_manual0.70.pdf"),
+    #     save_dpi=100,
+    #     # end=55,
+    # )
+
+    # save_wan21_t2v_video_timeline_pdf(
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy_rewrite/a800/42/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42/ckpt_step_800_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
+    #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy_rewrite/case{case}_bsz_32-lora_rank_64_alpha_32_modules_attn-lambda_0.75-mixed_0.1_0.9-ckpt_step_800_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70.pdf"),
+    #     # start=15,
+    #     save_dpi=100,
+    # )
+
+    # ======== diffusion process
     # save_wan21_t2v_diffusion_steps_timeline_pdf(
     #     diffusion_frames_dir=str(work_dir / "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B_new/general_a800/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./t2v-1.3B_832*480_diffusion_steps"),
     #     save_file=str(work_dir / "general_viz/basketball_seed26_denoising.pdf"),
