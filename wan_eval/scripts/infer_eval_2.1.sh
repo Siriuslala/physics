@@ -21,7 +21,7 @@ GPU_TAG=a800
 
 SEEDS=(42)
 BENCHMARK_NAME=videophy  # test videophy | videophy_rewrite | videophy2 | videophy2_object_interactions | videophy2_rewrite | phygenbench
-BATCH_SIZE=1
+BATCH_SIZE=8
 
 MODEL_TYPE=1.3B
 
@@ -32,8 +32,9 @@ MODEL_TYPE=1.3B
 # MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lambda_only/lambda_only-bsz_16-lr_1e-3-lambda_scope_head-lambda_lr_1e-3-lambda_beta_0-lambda_tcond_1-lambda_hidden_128-range_bounded_leq_one_min_0.45_eps_5e-2-steps_3000-warmup_0.01-adam_beta1_0.9-beta2_0.999-timestep_mixed_early_0.10_prob_1.00-seed_42
 # MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42
 # MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn_ffn-lambda_scope_model-lambda_h_0.70-lambda_w_0.70-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.8-seed_42
-MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.3-seed_42
+# MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.7-seed_42
 # MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/fixed_lambda_lora/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_1.0-seed_42
+MODEL_PATH=$WORK_TRAIN_DIR/Wan2.1-T2V-1B3/lora/bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-steps_1500-warmup_0.03-adam_beta1_0.9-beta2_0.999-timestep_uniform_0.0_1.0-seed_42
 # MODEL_PATH=
 
 CKPT_STEP=
@@ -42,12 +43,12 @@ CKPT_STEP=800  # !
 
 # null | 1,2,3,4,5
 SPATIAL_ROPE_LAMBDA_STEPS=
-SPATIAL_ROPE_LAMBDA_STEPS=1,2,3,4,5
+# SPATIAL_ROPE_LAMBDA_STEPS=1,2,3,4,5  # !
 # SPATIAL_ROPE_LAMBDA_STEPS=1,2,3,4
 
 # null | 0.75 | 0.75,0.80
 LAMBDA_MANUAL=
-LAMBDA_MANUAL=0.70  # !
+# LAMBDA_MANUAL=0.70  # !
 
 
 SIZE=832*480

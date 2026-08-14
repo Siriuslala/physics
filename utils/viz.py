@@ -410,12 +410,12 @@ def save_wan21_t2v_video_timeline_pdf(
 if __name__ == "__main__":
     os.chdir(SCRIPT_DIR)
 
-    # save_wan21_t2v_video_timeline_pdf(
-    #     video_path=str(work_dir / "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_1_shift_5.0_guide_5.0/wan21_t2v_cross_attention_token_viz_seed_1.mp4"),
-    #     save_file=str(work_dir / "/work/liyueyan/Interpretability/physics/general_viz/basketball_seed1_.pdf"),
-    #     start=20,
-    #     end=80,
-    # )
+    save_wan21_t2v_video_timeline_pdf(
+        video_path=str(work_dir / "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attn_head_ablation/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_8_shift_5.0_guide_5.0/_ablate_traj_new_speed_lt0p1_del_layer_0_15_middle_deep_plus_contri_gt0p5_del_0_5-steps_all_steps/wan21_t2v_cross_attn_head_ablation_steps_all_seed_8.mp4"),
+        save_file=str(work_dir / "/work/liyueyan/Interpretability/physics/wan_eval_viz/basketball_seed8_ablate_traj_new_speed_lt0p1_del_layer_0_15_middle_deep_plus_contri_gt0p5_del_0_5.pdf"),
+        start=20,
+        end=80,
+    )
 
     # save_wan21_t2v_video_timeline_pdf(
     #     video_path=str(work_dir / "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/rope_modification/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_29_shift_5.0_guide_5.0/lambda_modify_mode_manual-lambdaf_1.0-lambdah_0.5-lambdaw_0.5-lambda_steps_1-2-3-4-5.mp4"),
@@ -433,47 +433,49 @@ if __name__ == "__main__":
     # )
 
     # ======== videophy
-    case = 232
+    case = 111
     # save_wan21_t2v_video_timeline_pdf(
-    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy/a800/42/wan2.1_1B3/ckpt_step_latest/{case}.mp4"),
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy/a800/42/wan2.1_1B3/_ckpt_step_latest/{case}.mp4"),
     #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy/case{case}_wan2.1_1B3.pdf"),
     #     save_dpi=100,
     # )
 
     # save_wan21_t2v_video_timeline_pdf(
-    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy/a800/42/wan2.1_1B3/ckpt_step_latest_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy/a800/42/wan2.1_1B3/_ckpt_step_latest_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
     #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy/case{case}_wan2.1_1B3_manual0.70.pdf"),
     #     save_dpi=100,
     #     # end=55,
     # )
 
     # save_wan21_t2v_video_timeline_pdf(
-    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy/a800/42/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42/ckpt_step_800_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy/a800/42/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42/_ckpt_step_800_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
     #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy/case{case}_bsz_32-lora_rank_64_alpha_32_modules_attn-lambda_0.75-mixed_0.1_0.9-ckpt_step_800_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70.pdf"),
     #     # start=15,
     #     save_dpi=100,
     # )
 
     # ======== videophy_rewrite
-    case = 9
+    case = 99
     # save_wan21_t2v_video_timeline_pdf(
-    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy_rewrite/a800/42/wan2.1_1B3/ckpt_step_latest/{case}.mp4"),
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy_rewrite/a800/42/wan2.1_1B3/_ckpt_step_latest/{case}.mp4"),
     #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy_rewrite/case{case}_wan2.1_1B3.pdf"),
     #     save_dpi=100,
+    #     end=55,
     # )
 
     # save_wan21_t2v_video_timeline_pdf(
-    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy_rewrite/a800/42/wan2.1_1B3/ckpt_step_latest_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy_rewrite/a800/42/wan2.1_1B3/_ckpt_step_latest_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
     #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy_rewrite/case{case}_wan2.1_1B3_manual0.70.pdf"),
     #     save_dpi=100,
-    #     # end=55,
+    #     # end=50,
     # )
 
     # save_wan21_t2v_video_timeline_pdf(
-    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy_rewrite/a800/42/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42/ckpt_step_800_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
+    #     video_path=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval/videophy_rewrite/a800/42/fixed_lambda_lora-bsz_32-lr_1e-4-lora_rank_64-lora_alpha_32-lora_modules_attn-lambda_scope_model-lambda_h_0.75-lambda_w_0.75-lambda_global_0-lam_schedulecosine_0-steps_1500-warmup_0.03-timestep_mixed_early_0.1_prob_0.9-seed_42/_ckpt_step_800_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70/{case}.mp4"),
     #     save_file=str(work_dir / f"/work/liyueyan/Interpretability/physics/wan_eval_viz/wan_eval_videophy_rewrite/case{case}_bsz_32-lora_rank_64_alpha_32_modules_attn-lambda_0.75-mixed_0.1_0.9-ckpt_step_800_lambda_steps_1-2-3-4-5_lambda_manual_0.70_0.70.pdf"),
     #     # start=15,
     #     save_dpi=100,
+    #     end=50,
     # )
 
     # ======== diffusion process
