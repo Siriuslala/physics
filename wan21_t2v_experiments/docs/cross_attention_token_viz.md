@@ -57,7 +57,7 @@ The actual trajectory extraction used by this experiment is implemented by
 
 - `_extract_wan21_t2v_attention_region_center_trajectory`
 
-in [utils.py](/home/liyueyan/Interpretability/physics/wan21_t2v_experiments/utils.py#L1570).
+in [utils.py]
 
 This is **not** the simple global soft center over the whole frame. It is a more localized region-center method.
 

@@ -4,7 +4,7 @@
 
 Current entrypoint:
 
-- [infer_wan_t2v.py](/home/liyueyan/Interpretability/physics/wan_eval/infer_wan_t2v.py:1): batch inference for official `wan2.1 t2v` checkpoints using a JSONL file with required fields `id` and `prompt`.
+- `infer_wan_t2v.py`: batch inference for official `wan2.1 t2v` checkpoints using a JSONL file with required fields `id` and `prompt`.
 
 The script keeps the official Wan weights, DiT, T5, VAE, and sampling solvers unchanged. It only adds a batch wrapper around the official `WanT2V.generate()` logic so multiple prompts can be denoised in parallel.
 

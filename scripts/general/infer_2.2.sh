@@ -15,7 +15,7 @@ export CUDA_VISIBLE_DEVICES=0
 # SIZE="832*480"  # 
 # CKPT_DIR="/datacache/modelscope/Wan2.2-T2V-A14B"  # "/datacache/modelscope/Wan2.2-T2V-A14B", "/datacache/modelscope/Wan2.2-TI2V-5B"
 # PROMPT="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
-# SAVE_DIR="/home/liyueyan/Interpretability/physics"
+# SAVE_DIR="$ROOT_DIR"
 
 # ti2v-5B
 # task="ti2v-5B"  
@@ -33,7 +33,7 @@ SEED=41
 
 
 PROMPT="A ball falls to the ground and bounces up"
-SAVE_DIR="/home/liyueyan/Interpretability/physics/outputs_wan_2_2"
+SAVE_DIR="$WORK_DIR/outputs_wan_2_2"
 
 # prompts
 # "A basketball falls to the ground and bounces up"

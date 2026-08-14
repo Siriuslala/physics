@@ -91,9 +91,9 @@ ATTENTION_PDF_SHARE_COLOR_SCALE=False  # if True, all frames in one attention PD
 
 DRAW_ATTENTION_MAP_ONLY=True  # whether to only visualize attention & trajectory via the saved attention maps
 DRAW_ATTENTION_MAPS_PATH=""  # the path to the saved attention maps (.pt) for re-drawing; if empty, use the attention maps in the standard output dir
-DRAW_ATTENTION_MAPS_PATH="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_8_shift_5.0_guide_5.0/cross_attention_maps.pt"
+DRAW_ATTENTION_MAPS_PATH="$WORK_DIR/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_8_shift_5.0_guide_5.0/cross_attention_maps.pt"
 
-# VISUALIZATION_OUTPUT_DIR="/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw"  # "/work/liyueyan/Interpretability/physics/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw1"  # for re-drawing
+# VISUALIZATION_OUTPUT_DIR="$WORK_DIR/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw"  # "$WORK_DIR/outputs_wan_2_1_t2v-1.3B/cross_attention_token_viz/Against_a_pure_white_background,_a_basketball_falls_vertically_from_mid-air_onto_a_wooden_floor_and_bounces_up_several_times./seed_26_shift_5.0_guide_5.0/re-draw1"  # for re-drawing
 VISUALIZATION_OUTPUT_DIR=""
 
 STREAM_FLUSH_PER_STEP=False

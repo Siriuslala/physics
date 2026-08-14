@@ -58,7 +58,7 @@ Wan2.1 splits one head into three consecutive RoPE channel blocks:
 - one block for the width axis.
 
 For `t2v-1.3B`, \(d = 128\), so the real channel split is \(44/42/42\) across \((f, h, w)\).
-The implementation is in [wan/modules/model.py](</home/liyueyan/Interpretability/physics/projects/Wan2_1/wan/modules/model.py:42>) and [wan/modules/model.py](</home/liyueyan/Interpretability/physics/projects/Wan2_1/wan/modules/model.py:477>).
+The implementation is in `wan/modules/model.py` and `wan/modules/model.py`.
 
 The attention logit for token pair \((i, j)\), layer \(\ell\), and head \(m\) is
 
@@ -154,7 +154,7 @@ So if we want slower temporal decay than spatial decay, a natural direction is
 \lambda_f < \lambda_h,\qquad \lambda_f < \lambda_w.
 \]
 
-In the current code, this is implemented by rescaling the RoPE complex phase directly in [wan21_t2v_experiment_patch.py](</home/liyueyan/Interpretability/physics/wan21_t2v_experiments/wan21_t2v_experiment_patch.py:745>).
+In the current code, this is implemented by rescaling the RoPE complex phase directly in `wan21_t2v_experiment_patch.py`.
 
 ### 4.3 Rotation and attention
 
@@ -858,9 +858,9 @@ The unified presentation in Sections 6 and 8 is the cleaner mathematical view of
 
 The main files are:
 
-- [rope_modification.py](/home/liyueyan/Interpretability/physics/wan21_t2v_experiments/rope_modification.py)
-- [wan21_t2v_experiment_patch.py](/home/liyueyan/Interpretability/physics/wan21_t2v_experiments/wan21_t2v_experiment_patch.py)
-- [run_wan21_t2v_experiments.py](/home/liyueyan/Interpretability/physics/wan21_t2v_experiments/run_wan21_t2v_experiments.py)
+- `rope_modification.py`
+- `wan21_t2v_experiment_patch.py`
+- `run_wan21_t2v_experiments.py`
 
 ## 12. Recommended Evaluation
 

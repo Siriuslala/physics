@@ -119,7 +119,7 @@ During visualization materialization, PDF rendering can be parallelized over CPU
 
 The standard launcher script is:
 
-`/home/liyueyan/Interpretability/physics/scripts/self_attention_viz_wan2_1.sh`
+`scripts/self_attention_viz_wan2_1.sh`
 
 The experiment requires an existing `cross_attention_token_viz` output directory because the reference object region is built from reused cross-attention maps.
 

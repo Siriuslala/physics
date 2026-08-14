@@ -11,7 +11,7 @@ absolute-looking prefixes such as `home/jovyan/.../128_split/0/<video>.mp4`.
 Use the preparation script to flatten each shard into one directory:
 
 ```bash
-python /home/liyueyan/Interpretability/physics/wan21_train/prepare_wisa80k_for_diffsynth.py \
+python wan21_train/prepare_wisa80k_for_diffsynth.py \
   --extract \
   --build-metadata \
   --num-workers 8
@@ -28,7 +28,7 @@ Default paths:
 For a smoke test that writes nothing:
 
 ```bash
-python /home/liyueyan/Interpretability/physics/wan21_train/prepare_wisa80k_for_diffsynth.py \
+python wan21_train/prepare_wisa80k_for_diffsynth.py \
   --inspect-meta \
   --extract \
   --limit-zips 1 \
@@ -39,7 +39,7 @@ To build separated physics-category metadata files after extraction, use
 `--metadata-mode categories` and pass an output directory to `--metadata-out`:
 
 ```bash
-python /home/liyueyan/Interpretability/physics/wan21_train/prepare_wisa80k_for_diffsynth.py \
+python wan21_train/prepare_wisa80k_for_diffsynth.py \
   --build-metadata \
   --metadata-mode categories \
   --metadata-out /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata \
@@ -86,7 +86,7 @@ The older dynamics-only single-file command remains available but now uses the
 same strict dynamics filters:
 
 ```bash
-python /home/liyueyan/Interpretability/physics/wan21_train/prepare_wisa80k_for_diffsynth.py \
+python wan21_train/prepare_wisa80k_for_diffsynth.py \
   --build-metadata \
   --only-dynamics \
   --metadata-out /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/metadata_dynamics.csv
@@ -97,7 +97,7 @@ To merge the three category CSVs into one training metadata file while
 downsampling the overrepresented `reflection` subtype to 4000 rows:
 
 ```bash
-python /home/liyueyan/Interpretability/physics/wan21_train/prepare_wisa80k_for_diffsynth.py \
+python wan21_train/prepare_wisa80k_for_diffsynth.py \
   --merge-category-metadata /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata \
   --merge-out /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata/metadata_physics_merged_reflection4000.csv \
   --reflection-sample-n 4000 \
@@ -107,14 +107,14 @@ python /home/liyueyan/Interpretability/physics/wan21_train/prepare_wisa80k_for_d
 After generating a metadata CSV, check its label and `q0` distribution:
 
 ```bash
-python /home/liyueyan/Interpretability/physics/wan21_train/prepare_wisa80k_for_diffsynth.py \
+python wan21_train/prepare_wisa80k_for_diffsynth.py \
   --summarize-csv /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata/metadata_dynamics.csv
 ```
 
 To inspect a CSV without opening the full file, export a small JSONL sample:
 
 ```bash
-python /home/liyueyan/Interpretability/physics/wan21_train/prepare_wisa80k_for_diffsynth.py \
+python wan21_train/prepare_wisa80k_for_diffsynth.py \
   --sample-csv /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata/metadata_dynamics.csv \
   --sample-n 20 \
   --sample-out /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/metadata_sample.jsonl
@@ -126,7 +126,7 @@ first rows.
 If you also want the sampled videos copied next to the JSONL file:
 
 ```bash
-python /home/liyueyan/Interpretability/physics/wan21_train/prepare_wisa80k_for_diffsynth.py \
+python wan21_train/prepare_wisa80k_for_diffsynth.py \
   --sample-csv /datacache/huggingface/hub/datasets--qihoo360--WISA-80K/data/video_data/physics_metadata/metadata_dynamics.csv \
   --sample-n 20 \
   --sample-copy-dir /tmp/wisa_sample_videos \
