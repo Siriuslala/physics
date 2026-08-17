@@ -19,6 +19,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter
 import pandas as pd
 import yaml
 from wandb.proto import wandb_internal_pb2
@@ -26,6 +27,11 @@ from wandb.sdk.internal import datastore
 
 
 RESERVED_X_COLUMNS = {"_step", "_runtime", "_timestamp"}
+LAMBDA_EFF_WIDTH_COLOR = "#5BC5DB"
+LAMBDA_EFF_HEIGHT_COLOR = "#9BC750"
+LAMBDA_EFF_AXIS_LABEL_FONT_SIZE = 20
+LAMBDA_EFF_TICK_FONT_SIZE = 20
+LAMBDA_EFF_LEGEND_FONT_SIZE = 16
 
 
 def parse_args() -> argparse.Namespace:
@@ -382,6 +388,144 @@ def _plot_metric_group(
     plt.close(fig)
 
 
+def _extract_lambda_eff_metric_pairs(numeric_df: pd.DataFrame) -> dict[str, dict[str, dict[str, str]]]:
+    """Collect lambda_eff h/w metrics grouped by sampled timestep and statistic.
+
+    Expected metric names follow the pattern
+    ``lambda_eff/t{timestep}/{axis}_{statistic}``, where ``axis`` is ``h`` or
+    ``w`` and ``statistic`` is one of ``min``, ``max``, or ``mean``.
+
+    Args:
+        numeric_df: Numeric-only metric table.
+
+    Returns:
+        Nested mapping ``{timestep: {statistic: {axis: metric_name}}}``.
+    """
+    pattern = re.compile(r"^lambda_eff/t(?P<timestep>\d+)/(?:)(?P<axis>[hw])_(?P<stat>min|max|mean)$")
+    grouped_metrics: dict[str, dict[str, dict[str, str]]] = {}
+    for metric_name in numeric_df.columns:
+        match = pattern.match(metric_name)
+        if match is None:
+            continue
+        timestep = match.group("timestep")
+        axis = match.group("axis")
+        stat = match.group("stat")
+        grouped_metrics.setdefault(timestep, {}).setdefault(stat, {})[axis] = metric_name
+    return grouped_metrics
+
+
+def _plot_lambda_eff_pdf(
+    history_df: pd.DataFrame,
+    numeric_df: pd.DataFrame,
+    timestep: str,
+    stat_name: str,
+    metric_pair: dict[str, str],
+    output_path: Path,
+) -> None:
+    """Plot one lambda_eff PDF figure with height/width overlaid.
+
+    Args:
+        history_df: Raw parsed W&B history table.
+        numeric_df: Numeric-only metric table.
+        timestep: Sampled diffusion timestep identifier.
+        stat_name: Statistic name, such as ``min``, ``max``, or ``mean``.
+        metric_pair: Mapping from axis name to concrete metric column.
+        output_path: Destination PDF path.
+    """
+    height_metric = metric_pair.get("h")
+    width_metric = metric_pair.get("w")
+    if height_metric is None or width_metric is None:
+        return
+
+    steps = _get_step_series(history_df)
+    height_series = pd.to_numeric(numeric_df[height_metric], errors="coerce")
+    width_series = pd.to_numeric(numeric_df[width_metric], errors="coerce")
+    visible_mask = steps.notna() & (steps >= 0) & (steps <= 1000)
+    visible_steps = steps.loc[visible_mask]
+    visible_height_series = height_series.loc[visible_mask]
+    visible_width_series = width_series.loc[visible_mask]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(
+        visible_steps,
+        visible_height_series,
+        linewidth=2.0,
+        color=LAMBDA_EFF_HEIGHT_COLOR,
+        label="height",
+    )
+    ax.plot(
+        visible_steps,
+        visible_width_series,
+        linewidth=2.0,
+        color=LAMBDA_EFF_WIDTH_COLOR,
+        label="width",
+    )
+    ax.set_xlim(0, 1000)
+    if stat_name == "mean":
+        ax.set_ylim(0.90, 1.10)
+        ax.set_yticks([0.90, 0.95, 1.00, 1.05, 1.10])
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+    else:
+        combined_series = pd.concat([visible_height_series, visible_width_series], axis=0).dropna()
+        if not combined_series.empty:
+            y_min = float(combined_series.min())
+            y_max = float(combined_series.max())
+            if y_min == y_max:
+                epsilon = max(abs(y_min) * 1e-4, 1e-6)
+                ax.set_ylim(y_min - epsilon, y_max + epsilon)
+            else:
+                ax.set_ylim(y_min, y_max)
+    ax.set_xlabel("Step", fontsize=LAMBDA_EFF_AXIS_LABEL_FONT_SIZE)
+    ax.set_ylabel("Value", fontsize=LAMBDA_EFF_AXIS_LABEL_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=LAMBDA_EFF_TICK_FONT_SIZE)
+    ax.grid(alpha=0.3, linestyle="--")
+    ax.legend(fontsize=LAMBDA_EFF_LEGEND_FONT_SIZE)
+    fig.tight_layout()
+    fig.savefig(output_path, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def create_lambda_eff_pdf_figures(
+    output_dir: Path,
+    history_df: pd.DataFrame,
+    numeric_df: pd.DataFrame,
+) -> None:
+    """Create extra lambda_eff PDF figures when the required metrics exist.
+
+    For each sampled timestep ``t{x}``, this function creates a subdirectory
+    named ``lambda_eff_t{x}`` under ``figures`` and saves three PDF files:
+    ``lambda_eff_hw_min.pdf``, ``lambda_eff_hw_max.pdf``, and
+    ``lambda_eff_hw_mean.pdf``. Each figure overlays the height and width
+    curves for that statistic.
+
+    Args:
+        output_dir: Destination directory for all visualizations.
+        history_df: Raw parsed W&B history table.
+        numeric_df: Numeric-only metric table.
+    """
+    lambda_eff_groups = _extract_lambda_eff_metric_pairs(numeric_df)
+    if not lambda_eff_groups:
+        return
+
+    figures_dir = output_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    for timestep, stat_groups in sorted(lambda_eff_groups.items(), key=lambda item: int(item[0])):
+        timestep_dir = figures_dir / f"lambda_eff_t{timestep}"
+        timestep_dir.mkdir(parents=True, exist_ok=True)
+        for stat_name in ("min", "max", "mean"):
+            metric_pair = stat_groups.get(stat_name)
+            if metric_pair is None:
+                continue
+            _plot_lambda_eff_pdf(
+                history_df=history_df,
+                numeric_df=numeric_df,
+                timestep=timestep,
+                stat_name=stat_name,
+                metric_pair=metric_pair,
+                output_path=timestep_dir / f"lambda_eff_hw_{stat_name}.pdf",
+            )
+
+
 def export_metadata(
     output_dir: Path,
     run_dir: Path,
@@ -480,6 +624,12 @@ def create_figures(
                 title=f"Metric group: {group_name}",
                 output_path=figures_dir / f"group_{file_stem}{suffix}.png",
             )
+
+    create_lambda_eff_pdf_figures(
+        output_dir=output_dir,
+        history_df=history_df,
+        numeric_df=numeric_df,
+    )
 
 
 def main() -> None:
