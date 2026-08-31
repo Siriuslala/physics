@@ -1,6 +1,5 @@
 <h1 align="center">Why Do Video Diffusion Models Violate Physics? Unveiling the Flaws in Attention Mechanisms</h1>
 
----
 <p align="center">
   <b>Yueyan Li</b> · <b>Haibo Wang</b> · <b>Caixia Yuan</b> · <b>Xiaojie Wang</b>
 </p>
