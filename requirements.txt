@@ -1,0 +1,6 @@
+decord
+librosa
+peft
+modelscope
+wandb
+jsonlines

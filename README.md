@@ -147,9 +147,11 @@ Analysis never edits `projects/Wan2_1`. Every intervention is a runtime patch.
 git clone https://github.com/Siriuslala/physics.git
 cd physics
 
-conda create -n video python=3.10 -y
+conda create -n video python=3.10
 conda activate video
-pip install -r projects/Wan2_1/requirements.txt
+
+# manually install flash attention
+bash setup.sh
 ```
 
 Download [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B) (or the 14B checkpoint) and copy the environment template:
