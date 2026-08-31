@@ -444,7 +444,7 @@ def _plot_lambda_eff_pdf(
     visible_steps = steps.loc[visible_mask]
     visible_height_series = height_series.loc[visible_mask]
     visible_width_series = width_series.loc[visible_mask]
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(7.5, 6))
     ax.plot(
         visible_steps,
         visible_height_series,
@@ -476,6 +476,7 @@ def _plot_lambda_eff_pdf(
                 ax.set_ylim(y_min, y_max)
     ax.set_xlabel("Step", fontsize=LAMBDA_EFF_AXIS_LABEL_FONT_SIZE)
     ax.set_ylabel("Value", fontsize=LAMBDA_EFF_AXIS_LABEL_FONT_SIZE)
+    ax.set_box_aspect(1)
     ax.tick_params(axis="both", labelsize=LAMBDA_EFF_TICK_FONT_SIZE)
     ax.grid(alpha=0.3, linestyle="--")
     ax.legend(fontsize=LAMBDA_EFF_LEGEND_FONT_SIZE)
