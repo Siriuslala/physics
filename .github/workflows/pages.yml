@@ -1,0 +1,50 @@
+name: Deploy project page
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - index.html
+      - assets/**
+      - scripts/build_project_page.sh
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out website sources
+        uses: actions/checkout@v6
+      - name: Assemble static website
+        run: |
+          bash scripts/build_project_page.sh "$RUNNER_TEMP/physics-site"
+          printf '{"repository":"%s","commit":"%s"}\n' "$GITHUB_REPOSITORY" "$GITHUB_SHA" > "$RUNNER_TEMP/physics-site/deployment.json"
+      - name: Upload website artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/physics-site
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy website
+        id: deployment
+        uses: actions/deploy-pages@v4

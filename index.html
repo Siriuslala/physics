@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="An interpretability study of motion planning in video diffusion models: how attention forms trajectories, why RoPE spatial anchoring can violate physics, and how spatial frequency scaling helps.">
+  <meta name="theme-color" content="#fafaf8">
+  <meta property="og:title" content="Why Do Video Diffusion Models Violate Physics?">
+  <meta property="og:description" content="Unveiling the Flaws in Attention Mechanisms. From early motion planning to better physical consistency through a lightweight RoPE modification.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://siriuslala.github.io/physics/">
+  <meta property="og:image" content="https://siriuslala.github.io/physics/assets/teaser.png">
+  <link rel="canonical" href="https://siriuslala.github.io/physics/">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23225d4b'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-size='25' fill='white'%3Eφ%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/project-page.css">
+  <script src="assets/project-page.js" defer></script>
+  <title>Why Do Video Diffusion Models Violate Physics?</title>
+</head>
+<body>
+  <a class="skip-link" href="#abstract">Skip to content</a>
+  <nav class="nav" aria-label="Page navigation">
+    <a class="wordmark" href="#top">Video diffusion &amp; physics</a>
+    <div><a href="#basketball">Basketball</a><a href="#method">Method</a><a href="#videophy">VideoPhy</a></div>
+  </nav>
+  <header class="hero" id="top">
+    <p class="eyebrow">A mechanistic look at motion planning</p>
+    <h1>Why Do Video Diffusion Models<br class="wide-break"> Violate Physics?</h1>
+    <p class="subtitle">Unveiling the Flaws in Attention Mechanisms</p>
+    <p class="authors"><a href="https://siriuslala.github.io/">Yueyan Li</a><span>Haibo Wang</span><span>Caixia Yuan<sup>✉</sup></span><span>Xiaojie Wang</span></p>
+    <p class="author-note">✉ Corresponding author</p>
+    <div class="links"><a class="button primary" href="https://arxiv.org">Read the paper <span aria-hidden="true">↗</span></a><a class="button" href="https://github.com/Siriuslala/physics">Code <span aria-hidden="true">↗</span></a><a class="button" href="#basketball">See the results <span aria-hidden="true">↓</span></a></div>
+    <p class="takeaway">Physical failures can begin when attention commits to the wrong positions.<br>Relaxing spatial RoPE helps the model explore better motion trajectories.</p>
+  </header>
+  <main>
+    <section class="abstract prose" id="abstract" aria-labelledby="abstract-title">
+      <h2 id="abstract-title">Abstract</h2>
+      <p>Despite impressive visual quality, state-of-the-art video diffusion models often generate content that violates real-world physical laws. While existing solutions rely on external priors or specialized data, we investigate the root cause by exploring the internal mechanisms of these models. Specifically, we present the first interpretability study on the “motion planning” process of text-to-video diffusion models, revealing how motion trajectories form during early denoising stages. Building upon the “first shape, then details” finding, we combine cross-attention trajectory patterns with causal head contributions to identify a specific subset of attention heads driving motion planning. Further, our self-attention analysis shows that Rotary Position Embedding (RoPE) induces excessive spatial attention decay. This causes early candidate regions to prematurely lock into physically implausible positions, suppressing reasonable trajectories in adjacent frames and triggering generation failure modes. To address this fundamental flaw, we propose a lightweight architectural modification that scales the frequency of RoPE across different denoising steps. This strategy reduces excessive attention decay, helping the model explore better candidate regions to establish coherent physical motion. Finally, training-free and training-based experiments confirm the effectiveness of our approach in enhancing the physical commonsense of generated videos.</p>
+    </section>
+
+    <section id="basketball" aria-labelledby="basketball-title">
+      <div class="section-heading"><div><p class="eyebrow">01 / A simple motion, a revealing failure</p><h2 id="basketball-title">Basketball free-fall</h2></div><button class="playback" type="button" aria-pressed="false" hidden>Pause animations</button></div>
+      <p class="section-intro">The same prompt, four random seeds. Compare the original model with our method.</p>
+      <blockquote>“Against a pure white background, a basketball falls vertically from mid-air onto a wooden floor and bounces up several times.”</blockquote>
+      <div class="gallery">
+        <figure class="comparison">
+          <video autoplay muted loop playsinline preload="metadata" poster="assets/videos/basketball-seed-8/poster.jpg" width="832" height="276" aria-label="Basketball free-fall · Seed 8. Left: before, original model. Right: after, ours." src="assets/videos/basketball-seed-8/comparison.mp4">
+
+            <img src="assets/videos/basketball-seed-8/comparison.gif" alt="Basketball free-fall · Seed 8: original model on the left, ours on the right.">
+          </video>
+          <img class="fallback" data-src="assets/videos/basketball-seed-8/comparison.gif" alt="Basketball free-fall · Seed 8: original model on the left, ours on the right." width="640" height="212" hidden>
+          <figcaption>Basketball free-fall · Seed 8</figcaption>
+        </figure>
+        <figure class="comparison">
+          <video autoplay muted loop playsinline preload="metadata" poster="assets/videos/basketball-seed-20/poster.jpg" width="832" height="276" aria-label="Basketball free-fall · Seed 20. Left: before, original model. Right: after, ours." src="assets/videos/basketball-seed-20/comparison.mp4">
+
+            <img src="assets/videos/basketball-seed-20/comparison.gif" alt="Basketball free-fall · Seed 20: original model on the left, ours on the right.">
+          </video>
+          <img class="fallback" data-src="assets/videos/basketball-seed-20/comparison.gif" alt="Basketball free-fall · Seed 20: original model on the left, ours on the right." width="640" height="212" hidden>
+          <figcaption>Basketball free-fall · Seed 20</figcaption>
+        </figure>
+        <figure class="comparison">
+          <video autoplay muted loop playsinline preload="metadata" poster="assets/videos/basketball-seed-23/poster.jpg" width="832" height="276" aria-label="Basketball free-fall · Seed 23. Left: before, original model. Right: after, ours." src="assets/videos/basketball-seed-23/comparison.mp4">
+
+            <img src="assets/videos/basketball-seed-23/comparison.gif" alt="Basketball free-fall · Seed 23: original model on the left, ours on the right.">
+          </video>
+          <img class="fallback" data-src="assets/videos/basketball-seed-23/comparison.gif" alt="Basketball free-fall · Seed 23: original model on the left, ours on the right." width="640" height="212" hidden>
+          <figcaption>Basketball free-fall · Seed 23</figcaption>
+        </figure>
+        <figure class="comparison">
+          <video autoplay muted loop playsinline preload="metadata" poster="assets/videos/basketball-seed-29/poster.jpg" width="832" height="276" aria-label="Basketball free-fall · Seed 29. Left: before, original model. Right: after, ours." src="assets/videos/basketball-seed-29/comparison.mp4">
+
+            <img src="assets/videos/basketball-seed-29/comparison.gif" alt="Basketball free-fall · Seed 29: original model on the left, ours on the right.">
+          </video>
+          <img class="fallback" data-src="assets/videos/basketball-seed-29/comparison.gif" alt="Basketball free-fall · Seed 29: original model on the left, ours on the right." width="640" height="212" hidden>
+          <figcaption>Basketball free-fall · Seed 29</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="method" aria-labelledby="method-title">
+      <p class="eyebrow">02 / From mechanism to intervention</p>
+      <h2 id="method-title">Why motion planning goes wrong</h2>
+      <div class="prose method-intro"><p>Motion planning brings text semantics into the video latent and determines where an object appears across frames. In Wan2.1-T2V-1.3B, this happens largely within the first <strong>5 of 50 denoising steps</strong>. Cross-attention reveals several candidate positions before a trajectory takes shape; causal interventions distinguish the heads that drive motion from those that merely display its pattern.</p></div>
+      <article class="finding">
+        <div class="finding-heading"><span class="step-number">1</span><h3>Self-attention can anchor motion to the same spatial position.</h3></div>
+        <p class="prose">Self-attention coordinates video tokens across frames. But 3D RoPE induces a spatial anchoring bias: a query tends to attend to nearby spatial coordinates in other frames. A physically plausible candidate farther away can therefore receive too little attention.</p>
+        <figure class="paper-figure"><a href="assets/self_attention.png" target="_blank" rel="noopener"><img src="assets/self_attention.png" alt="Figure 6: self-attention maps at denoising steps 3 and 20 concentrate around the same spatial position across frames." loading="lazy" width="886" height="115"></a><figcaption><strong>Figure 6.</strong> Head-averaged self-attention from a region in frame 0 to other frames, layer 20. The spatial anchor persists across frames.</figcaption></figure>
+      </article>
+      <article class="finding">
+        <div class="finding-heading"><span class="step-number">2</span><h3>Early commitments can suppress a better trajectory.</h3></div>
+        <p class="prose">Candidate regions initially compete without a stable winner. When a few frames settle early, spatial anchoring increases support for nearby positions in other frames—even if those positions violate physics. In the seed-20 failure, frame 14 switches from a lower candidate to a higher one as frame 10 stabilizes, leading to a basketball suspended in mid-air.</p>
+        <figure class="paper-figure evolution"><a href="assets/candidate_evolution.png" target="_blank" rel="noopener"><img src="assets/candidate_evolution.png" alt="Figure 8: seven rows show candidate-region competition at denoising steps 1 through 7 for seed 20, layer 16. Columns are video frames; brightness indicates mutual consistency." loading="lazy" width="2448" height="996"></a><figcaption><strong>Figure 8.</strong> Candidate regions over the first 7 denoising steps (top to bottom), seed 20, layer 16. Brighter regions have greater mutual consistency. [W] is the candidate closest to the final trajectory; [L] is the strongest loser. A “winner” need not be physically correct. <a href="assets/candidate_evolution.png" target="_blank" rel="noopener">Open the full-resolution figure ↗</a></figcaption></figure>
+      </article>
+      <article class="finding intervention">
+        <div class="finding-heading"><span class="step-number">3</span><h3>A lightweight RoPE modification opens up the search.</h3></div>
+        <p class="prose">We reduce the height and width RoPE frequencies during early denoising, weakening excessive spatial decay while preserving temporal RoPE. Section 6.1 applies the following transformation to queries and keys alike:</p>
+        <div class="equation" aria-label="Equation 3: spatial RoPE frequency scaling">
+          <math display="block"><mrow><msup><mi>f</mi><mi>h</mi></msup><mo stretchy="false">(</mo><mi>q</mi><mo>,</mo><mi>p</mi><mo stretchy="false">)</mo><mo>=</mo><msup><mi>q</mi><mi>h</mi></msup><msup><mi>e</mi><mrow><mi>i</mi><msup><mi>p</mi><mi>h</mi></msup><msup><mi>λ</mi><mi>h</mi></msup><mi>θ</mi></mrow></msup><mo>,</mo><mspace width="1em"/><msup><mi>f</mi><mi>w</mi></msup><mo stretchy="false">(</mo><mi>q</mi><mo>,</mo><mi>p</mi><mo stretchy="false">)</mo><mo>=</mo><msup><mi>q</mi><mi>w</mi></msup><msup><mi>e</mi><mrow><mi>i</mi><msup><mi>p</mi><mi>w</mi></msup><msup><mi>λ</mi><mi>w</mi></msup><mi>θ</mi></mrow></msup><mo>.</mo></mrow></math><span class="equation-label">(3)</span>
+        </div>
+        <p class="notation">For one 2D channel pair per axis, <i>q</i> = [<i>q</i><sup>f</sup>, <i>q</i><sup>h</sup>, <i>q</i><sup>w</sup>] ∈ ℂ³ represents six real query channels; <i>p</i> = (<i>p</i><sup>f</sup>, <i>p</i><sup>h</sup>, <i>p</i><sup>w</sup>) ∈ ℕ³ gives the frame, height and width coordinates. Each complex scalar <i>q</i><sup>a</sup> encodes a real 2D pair. θ ∈ ℝ is its rotary frequency, <i>i</i> is the imaginary unit, and 0 &lt; λ<sup>h</sup>, λ<sup>w</sup> &lt; 1 are scalar spatial scales. The transformation applies pairwise across all channels.</p>
+        <div class="method-options"><div><h4>Training-free</h4><p>Scale spatial RoPE for the first 5 denoising steps, then restore the original frequencies. No weight update is required.</p></div><div><h4>Training-based</h4><p>Adapt self- and cross-attention with LoRA and emphasize early denoising during training. At inference, use λ<sup>h</sup> = λ<sup>w</sup> = 0.70 for the first 5 steps.</p></div></div>
+      </article>
+    </section>
+
+    <section id="videophy" aria-labelledby="videophy-title">
+      <div class="section-heading"><div><p class="eyebrow">03 / Beyond basketball</p><h2 id="videophy-title">Physical interactions in VideoPhy</h2></div><button class="playback" type="button" aria-pressed="false" hidden>Pause animations</button></div>
+      <p class="section-intro">Six examples of everyday physical interactions. The original model appears on the left; our method appears on the right.</p>
+      <div class="gallery">
+        <figure class="comparison">
+          <video autoplay muted loop playsinline preload="metadata" poster="assets/videos/videophy-cork/poster.jpg" width="832" height="276" aria-label="Cork being twisted out of a bottle.. Left: before, original model. Right: after, ours." src="assets/videos/videophy-cork/comparison.mp4">
+
+            <img src="assets/videos/videophy-cork/comparison.gif" alt="Cork being twisted out of a bottle.: original model on the left, ours on the right.">
+          </video>
+          <img class="fallback" data-src="assets/videos/videophy-cork/comparison.gif" alt="Cork being twisted out of a bottle.: original model on the left, ours on the right." width="640" height="212" hidden>
+          <figcaption>Cork being twisted out of a bottle.</figcaption>
+        </figure>
+        <figure class="comparison">
+          <video autoplay muted loop playsinline preload="metadata" poster="assets/videos/videophy-log/poster.jpg" width="832" height="276" aria-label="A large log floats downstream in a rushing river.. Left: before, original model. Right: after, ours." src="assets/videos/videophy-log/comparison.mp4">
+
+            <img src="assets/videos/videophy-log/comparison.gif" alt="A large log floats downstream in a rushing river.: original model on the left, ours on the right.">
+          </video>
+          <img class="fallback" data-src="assets/videos/videophy-log/comparison.gif" alt="A large log floats downstream in a rushing river.: original model on the left, ours on the right." width="640" height="212" hidden>
+          <figcaption>A large log floats downstream in a rushing river.</figcaption>
+        </figure>
+        <figure class="comparison">
+          <video autoplay muted loop playsinline preload="metadata" poster="assets/videos/videophy-refrigerator/poster.jpg" width="832" height="276" aria-label="Refrigerator door closing after getting a soda.. Left: before, original model. Right: after, ours." src="assets/videos/videophy-refrigerator/comparison.mp4">
+
+            <img src="assets/videos/videophy-refrigerator/comparison.gif" alt="Refrigerator door closing after getting a soda.: original model on the left, ours on the right.">
+          </video>
+          <img class="fallback" data-src="assets/videos/videophy-refrigerator/comparison.gif" alt="Refrigerator door closing after getting a soda.: original model on the left, ours on the right." width="640" height="212" hidden>
+          <figcaption>Refrigerator door closing after getting a soda.</figcaption>
+        </figure>
+        <figure class="comparison">
+          <video autoplay muted loop playsinline preload="metadata" poster="assets/videos/videophy-wine/poster.jpg" width="832" height="276" aria-label="Wine pouring from a bottle into a glass.. Left: before, original model. Right: after, ours." src="assets/videos/videophy-wine/comparison.mp4">
+
+            <img src="assets/videos/videophy-wine/comparison.gif" alt="Wine pouring from a bottle into a glass.: original model on the left, ours on the right.">
+          </video>
+          <img class="fallback" data-src="assets/videos/videophy-wine/comparison.gif" alt="Wine pouring from a bottle into a glass.: original model on the left, ours on the right." width="640" height="212" hidden>
+          <figcaption>Wine pouring from a bottle into a glass.</figcaption>
+        </figure>
+        <figure class="comparison">
+          <video autoplay muted loop playsinline preload="metadata" poster="assets/videos/videophy-pancake/poster.jpg" width="832" height="276" aria-label="Spatula flips pancake in air.. Left: before, original model. Right: after, ours." src="assets/videos/videophy-pancake/comparison.mp4">
+
+            <img src="assets/videos/videophy-pancake/comparison.gif" alt="Spatula flips pancake in air.: original model on the left, ours on the right.">
+          </video>
+          <img class="fallback" data-src="assets/videos/videophy-pancake/comparison.gif" alt="Spatula flips pancake in air.: original model on the left, ours on the right." width="640" height="212" hidden>
+          <figcaption>Spatula flips pancake in air.</figcaption>
+        </figure>
+        <figure class="comparison">
+          <video autoplay muted loop playsinline preload="metadata" poster="assets/videos/videophy-car/poster.jpg" width="832" height="276" aria-label="A car gliding over a road slick with rainwater.. Left: before, original model. Right: after, ours." src="assets/videos/videophy-car/comparison.mp4">
+
+            <img src="assets/videos/videophy-car/comparison.gif" alt="A car gliding over a road slick with rainwater.: original model on the left, ours on the right.">
+          </video>
+          <img class="fallback" data-src="assets/videos/videophy-car/comparison.gif" alt="A car gliding over a road slick with rainwater.: original model on the left, ours on the right." width="640" height="212" hidden>
+          <figcaption>A car gliding over a road slick with rainwater.</figcaption>
+        </figure>
+      </div>
+      <p class="results-note">Our systematic evaluation uses 344 VideoPhy cases and human judgments of semantic adherence and physical commonsense. The largest gains are on interactions involving solids. See the paper for model-specific settings and quantitative results.</p>
+    </section>
+  </main>
+  <footer><p>Why Do Video Diffusion Models Violate Physics?</p><div><a href="https://arxiv.org">Paper</a><a href="https://github.com/Siriuslala/physics">Code</a><a href="#top">Back to top ↑</a></div></footer>
+</body>
+</html>

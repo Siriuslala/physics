@@ -1,0 +1,152 @@
+[
+  {
+    "id": "basketball-seed-8",
+    "title": "Basketball free-fall \u00b7 Seed 8",
+    "source_folder": "basketball_seed_8",
+    "size": [
+      832,
+      480
+    ],
+    "fps": 16.0,
+    "duration_seconds": 5.06,
+    "sha256": {
+      "before": "583922fe4e8549b4528e15a737c6f5647444f034bc73b4a49567f24a367e74b8",
+      "after": "0b86df1f9f8f781078b63a6137c726b3fe1c684262d3ab34b3feb005e2c180b7"
+    }
+  },
+  {
+    "id": "basketball-seed-20",
+    "title": "Basketball free-fall \u00b7 Seed 20",
+    "source_folder": "basketball_seed_20",
+    "size": [
+      832,
+      480
+    ],
+    "fps": 16.0,
+    "duration_seconds": 5.06,
+    "sha256": {
+      "before": "26a60eb21bcfb1a37f22a51124f16c3bfde36b20d414a2b4d2ba150ba9d44424",
+      "after": "5ccbaa551b51da049b930facefbdbfc15bea3affb0d872bb627e1341da5daebe"
+    }
+  },
+  {
+    "id": "basketball-seed-23",
+    "title": "Basketball free-fall \u00b7 Seed 23",
+    "source_folder": "basketball_seed_23",
+    "size": [
+      832,
+      480
+    ],
+    "fps": 16.0,
+    "duration_seconds": 5.06,
+    "sha256": {
+      "before": "640092020f4d7bad140453ab38cf43d401551084aace1aa8c4eb152bb8030ff0",
+      "after": "5ccbaa551b51da049b930facefbdbfc15bea3affb0d872bb627e1341da5daebe"
+    }
+  },
+  {
+    "id": "basketball-seed-29",
+    "title": "Basketball free-fall \u00b7 Seed 29",
+    "source_folder": "basketball_seed_29",
+    "size": [
+      832,
+      480
+    ],
+    "fps": 16.0,
+    "duration_seconds": 5.06,
+    "sha256": {
+      "before": "21327b456ae8d48117ed21da44b49315bf749c7b8719a90e46002f3036023398",
+      "after": "9e5d5a958cb739ff00e5ec027ad4913960ed4edf47a32e592538cb474bcbce7c"
+    }
+  },
+  {
+    "id": "videophy-cork",
+    "title": "Cork being twisted out of a bottle.",
+    "source_folder": "videophy_Cork being twisted out of a bottle.",
+    "size": [
+      832,
+      480
+    ],
+    "fps": 16.0,
+    "duration_seconds": 5.06,
+    "sha256": {
+      "before": "154c5cbd71bfd7879929115d0bc2945ef3987a1fae090a128a51d1d10c5c6009",
+      "after": "e2d9513195f8bebd16c3c31f06604c600cd9bf099abc812714b0ceb11eefaa11"
+    }
+  },
+  {
+    "id": "videophy-log",
+    "title": "A large log floats downstream in a rushing river.",
+    "source_folder": "videophy_A large log floats downstream in a rushing river.",
+    "size": [
+      832,
+      480
+    ],
+    "fps": 16.0,
+    "duration_seconds": 5.06,
+    "sha256": {
+      "before": "fa7677e13aea0ebd03463a607ac94b33e21762d96ed41f2074838b3c8618ddb2",
+      "after": "8c51513209c4ef7122fb25e4f0101c3805239b6fe7912998e7343c40f1410407"
+    }
+  },
+  {
+    "id": "videophy-refrigerator",
+    "title": "Refrigerator door closing after getting a soda.",
+    "source_folder": "videophy_Refrigerator door closing after getting a soda.",
+    "size": [
+      832,
+      480
+    ],
+    "fps": 16.0,
+    "duration_seconds": 5.06,
+    "sha256": {
+      "before": "a3953e6f0c4ed5af05897861713a89db9c5a6689ab10f968b9623969662ec888",
+      "after": "a3080b510900c6d58ff10e16afcb96e5a6dbda1d2384cf7b20196fb245e8e47b"
+    }
+  },
+  {
+    "id": "videophy-wine",
+    "title": "Wine pouring from a bottle into a glass.",
+    "source_folder": "videophy_Wine pouring from a bottle into a glass.",
+    "size": [
+      832,
+      480
+    ],
+    "fps": 16.0,
+    "duration_seconds": 5.06,
+    "sha256": {
+      "before": "d1665dad6e54563160ccf6082d57b2f9e84f603d0778e82b714ed257f985b72e",
+      "after": "08a17f86bd5882de59969efe751550f022fb33c812363f71f6184fbaa255e284"
+    }
+  },
+  {
+    "id": "videophy-pancake",
+    "title": "Spatula flips pancake in air.",
+    "source_folder": "videophy_Spatula flips pancake in air.",
+    "size": [
+      832,
+      480
+    ],
+    "fps": 16.0,
+    "duration_seconds": 5.06,
+    "sha256": {
+      "before": "0eecd483ea68f8bb2b8bbc3c3a02f160373f585a1d01f0f4e4f1d9f5d6d1937e",
+      "after": "6e91659ddce9faf81391f68f4eed24d4556c17d726de51d4d652d0b1ca3963a3"
+    }
+  },
+  {
+    "id": "videophy-car",
+    "title": "A car gliding over a road slick with rainwater.",
+    "source_folder": "videophy_A car gliding over a road slick with rainwater.\u201d",
+    "size": [
+      832,
+      480
+    ],
+    "fps": 16.0,
+    "duration_seconds": 5.06,
+    "sha256": {
+      "before": "28ff80fd23168614882ec81667419bfe3e5604d0c5adf4237437d1727056778b",
+      "after": "b8ae6dc08f8568a4940fa333d1171c3caef14a67d1bd8d7ec96360b491e56a5a"
+    }
+  }
+]

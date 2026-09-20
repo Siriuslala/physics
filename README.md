@@ -8,12 +8,12 @@
   <a href="https://arxiv.org/abs/xxxx.xxxxx"><img src="https://img.shields.io/badge/arXiv-xxxx.xxxxx-b31b1b.svg" alt="arXiv"></a>
 </p>
 
-<!-- <p align="center"><em>Under review at ICLR 2027</em></p> -->
+<p align="center"><b>Project Page:</b> <a href="https://siriuslala.github.io/physics/">https://siriuslala.github.io/physics/</a></p>
 
 This repository contains the code for our interpretability study of **motion planning** in text-to-video diffusion models. We analyze how Wan2.1-T2V forms object trajectories during early denoising, locate the attention-head circuits that drive this process, and show that a lightweight RoPE frequency scaling improves physical commonsense.
 
 <p align="center">
-  <img src="assets/teaser.png" width="100%"/>
+  <img src="assets/teaser.png" width="680"/>
 </p>
 <p align="center">
   <em>Figure 1. Same prompt, different seeds. Wan2.1-T2V-1.3B often produces mid-air bouncing, anti-gravity floating, or sudden freezing instead of a physically plausible bounce.</em>
@@ -41,7 +41,7 @@ No extra physics simulator, no extra foundation-model teacher, and no change to 
 T2V latents are too noisy to decode early on, so we track **video-to-object-token cross-attention**. In 50-step sampling, object locations go from noise to multiple candidate regions to a deterministic trajectory around step 5.
 
 <p align="center">
-  <img src="assets/cross_attention.png" width="100%"/>
+  <img src="assets/cross_attention.png" width="760"/>
 </p>
 <p align="center">
   <em>Head-averaged cross-attention in layer 27. The bounce trajectory is already visible by step 7.</em>
@@ -53,17 +53,17 @@ We score each cross-attention head by **convergence speed** (how fast its map lo
 
 | Type | Trajectory pattern | Contribution | Ablation effect |
 | --- | --- | --- | --- |
-| (1)(2) | Weak / chaotic | Can be large | Appearance / background, not motion |
+| (1)(2), excluding layer 0–1 heads | Weak / chaotic | Can be large | Mainly appearance / background |
 | (3) | Clear | High | Trajectory collapses |
 | (4) | Clear | Near zero | Trajectory almost unchanged |
 
-A visible trajectory is a **sufficient but not necessary** condition for a motion-planning head.
+A clear trajectory pattern is **not sufficient** to identify a motion-planning head: causal contribution and ablation are also needed. Heads in the earliest layers can additionally affect motion initialization without displaying a clear trajectory pattern.
 
 <p align="center">
-  <img src="assets/head_ablation.png" width="100%"/>
+  <img src="assets/head_ablation.png" width="720"/>
 </p>
 <p align="center">
-  <em>Zero-ablation of the four head types. Only Type (3) heads are necessary for a coherent bounce.</em>
+  <em>Zero-ablation of the four head types. Ablating Type (3) heads collapses the trajectory; Type (1) also affects motion when layer 0–1 heads are included.</em>
 </p>
 
 ### Self-attention fails through RoPE spatial anchoring
@@ -71,13 +71,13 @@ A visible trajectory is a **sufficient but not necessary** condition for a motio
 Cross-attention injects *what* to generate. Self-attention decides *where* the object should be in each frame. Early on, every frame contains several **candidate regions**. Self-attention then votes among them via mutual consistency.
 
 <p align="center">
-  <img src="assets/self_attention.png" width="100%"/>
+  <img src="assets/self_attention.png" width="760"/>
 </p>
 <p align="center">
   <em>A query region in frame 0 attends to the same spatial coordinate in other frames (RoPE spatial anchoring).</em>
 </p>
 <p align="center">
-  <img src="assets/candidates.png" width="100%"/>
+  <img src="assets/candidates.png" width="680"/>
 </p>
 <p align="center">
   <em>Multiple candidate regions extracted from early cross-attention.</em>
@@ -103,23 +103,70 @@ Smaller $\lambda^{h/w}$ slows spatial attention decay, so early denoising can ex
 On **VideoPhy** (344 cases; Semantic Adherence / Physical Commonsense, human evaluation):
 
 <p align="center">
-  <img src="assets/videophy_table.png" width="100%"/>
+  <img src="assets/videophy_table.png" width="720"/>
 </p>
 
 The gain is largest on **solid-\*** interactions, which is the regime our analysis targets. Prompt refinement mainly helps instruction following; combining it with modified RoPE further boosts physical consistency.
 
+### Basketball free-fall
+
+Each animation shows **Before: original model (left)** and **After: our method (right)** on a shared timeline.
+
 <p align="center">
-  <img src="assets/qualitative_basketball.png" width="100%"/>
-</p>
-<p align="center">
-  <em>Basketball free-fall. Top: Wan2.1-T2V-1.3B. Bottom: LoRA + modified RoPE ($\lambda^{h}=\lambda^{w}=0.70$ on the first 5 steps).</em>
+  <img src="assets/videos/basketball-seed-8/comparison.gif" width="640" alt="Basketball free-fall · Seed 8 — original model on the left, our method on the right">
+  <br><em>Basketball free-fall · Seed 8</em>
 </p>
 
 <p align="center">
-  <img src="assets/qualitative_cork.png" width="90%"/>
+  <img src="assets/videos/basketball-seed-20/comparison.gif" width="640" alt="Basketball free-fall · Seed 20 — original model on the left, our method on the right">
+  <br><em>Basketball free-fall · Seed 20</em>
 </p>
 
-Training only attention LoRA (not FFN) preserves object appearance while improving motion, which is consistent with the interpretability result that physical failures live in attention rather than in the feed-forward layers.
+<p align="center">
+  <img src="assets/videos/basketball-seed-23/comparison.gif" width="640" alt="Basketball free-fall · Seed 23 — original model on the left, our method on the right">
+  <br><em>Basketball free-fall · Seed 23</em>
+</p>
+
+<p align="center">
+  <img src="assets/videos/basketball-seed-29/comparison.gif" width="640" alt="Basketball free-fall · Seed 29 — original model on the left, our method on the right">
+  <br><em>Basketball free-fall · Seed 29</em>
+</p>
+
+### VideoPhy
+
+Each animation shows **Before: original model (left)** and **After: our method (right)** on a shared timeline.
+
+<p align="center">
+  <img src="assets/videos/videophy-cork/comparison.gif" width="640" alt="Cork being twisted out of a bottle. — original model on the left, our method on the right">
+  <br><em>Cork being twisted out of a bottle.</em>
+</p>
+
+<p align="center">
+  <img src="assets/videos/videophy-log/comparison.gif" width="640" alt="A large log floats downstream in a rushing river. — original model on the left, our method on the right">
+  <br><em>A large log floats downstream in a rushing river.</em>
+</p>
+
+<p align="center">
+  <img src="assets/videos/videophy-refrigerator/comparison.gif" width="640" alt="Refrigerator door closing after getting a soda. — original model on the left, our method on the right">
+  <br><em>Refrigerator door closing after getting a soda.</em>
+</p>
+
+<p align="center">
+  <img src="assets/videos/videophy-wine/comparison.gif" width="640" alt="Wine pouring from a bottle into a glass. — original model on the left, our method on the right">
+  <br><em>Wine pouring from a bottle into a glass.</em>
+</p>
+
+<p align="center">
+  <img src="assets/videos/videophy-pancake/comparison.gif" width="640" alt="Spatula flips pancake in air. — original model on the left, our method on the right">
+  <br><em>Spatula flips pancake in air.</em>
+</p>
+
+<p align="center">
+  <img src="assets/videos/videophy-car/comparison.gif" width="640" alt="A car gliding over a road slick with rainwater. — original model on the left, our method on the right">
+  <br><em>A car gliding over a road slick with rainwater.</em>
+</p>
+
+Full-length, automatically playing MP4 comparisons are available on the [project page](https://siriuslala.github.io/physics/). The original `before.mp4` and `after.mp4` files are preserved in [`assets/videos/`](assets/videos/).
 
 ---
 
@@ -127,6 +174,8 @@ Training only attention LoRA (not FFN) preserves object appearance while improvi
 
 ```text
 .
+├── index.html               # static project page
+├── assets/                  # paper figures, original videos, MP4/GIF comparisons
 ├── wan21_t2v_experiments/   # interpretability toolkit (monkey patches)
 │   ├── docs/                # per-experiment notes
 │   └── run_wan21_t2v_experiments.py
@@ -138,6 +187,10 @@ Training only attention LoRA (not FFN) preserves object appearance while improvi
 ```
 
 Analysis never edits `projects/Wan2_1`. Every intervention is a runtime patch.
+
+The project page is maintained in this repository. Pushing changes to `index.html`, `assets/`, or the website build configuration to `main` automatically builds and deploys the site through [GitHub Actions](https://github.com/Siriuslala/physics/actions/workflows/pages.yml). Experiment-only changes do not trigger a website deployment. No separate website repository or manual file synchronization is needed.
+
+Project-page preview, media preparation, and publishing instructions: [`wan21_t2v_experiments/docs/project_page.md`](wan21_t2v_experiments/docs/project_page.md).
 
 ---
 
