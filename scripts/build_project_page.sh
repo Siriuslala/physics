@@ -18,5 +18,28 @@ for source_dir in "${ROOT_DIR}"/assets/videos/*/; do
         cp "${source_dir}${name}" "${DESTINATION}/assets/videos/${sample_name}/${name}"
     done
 done
+python - "${DESTINATION}" <<'PY'
+import hashlib
+from pathlib import Path
+import re
+import sys
+
+site = Path(sys.argv[1])
+page = site / "index.html"
+
+
+def version_asset(match):
+    """Version a local HTML asset URL from the copied file's bytes to refresh caches."""
+    attribute, relative_path = match.group(1), match.group(2)
+    digest = hashlib.sha256((site / relative_path).read_bytes()).hexdigest()[:12]
+    return f'{attribute}="{relative_path}?v={digest}"'
+
+
+page.write_text(re.sub(
+    r'\b(src|href|poster|data-src)="(assets/[^"?]+)(?:\?[^\"]*)?"',
+    version_asset,
+    page.read_text(),
+))
+PY
 touch "${DESTINATION}/.nojekyll"
 printf 'Static site ready: %s\n' "${DESTINATION}"

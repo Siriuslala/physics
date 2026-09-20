@@ -52,6 +52,8 @@ GitHub README comparisons are GIF images because README markup does not offer de
 
 The site uses system fonts, native MathML, local assets, and no external JavaScript libraries. It supports desktop and mobile layouts. At narrow widths the comparison cards form a single column; each card still shows the two synchronized panels together.
 
+The publication script appends a SHA-256 content version to local asset URLs in the generated HTML, for example `comparison.mp4?v=<hash>`. This covers MP4s, fallback GIFs, posters, figures, stylesheets, and JavaScript. Updating file contents changes the URL on the next deployment, so a returning visitor does not reuse a cached previous version. Source HTML keeps readable, unversioned paths for local development; versioning is applied to the build output automatically.
+
 ## Preview and publication
 
 To preview the repository directly:
