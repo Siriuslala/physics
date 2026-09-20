@@ -28,21 +28,26 @@ EXAMPLES = [
 def prepare_example(source, source_name, slug, title, ffmpeg):
     """Move originals without overwriting; export a synchronized MP4, GIF and poster.
 
-    Inputs are the source directory, original folder name, public slug, caption,
-    and FFmpeg executable. Original bytes are preserved and hashed in the returned
+    Inputs are an optional import directory, original folder name, public slug,
+    caption, and FFmpeg executable. Existing assets are used without an import
+    directory. Original bytes are preserved and hashed in the returned
     manifest record. Both clips must share dimensions, frame rate, and duration.
     Videos are composed left/right at 416 pixels per panel without cropping or
-    retiming. GIFs use 12 fps; the MP4 retains the original frame rate and duration.
+    retiming, with a 24-pixel white gutter for VideoPhy. GIFs use 12 fps; the MP4
+    retains the original frame rate and duration.
     """
     target = ROOT / "assets" / "videos" / slug
     target.mkdir(parents=True, exist_ok=True)
     metadata = []
     originals = {}
     for name in ("before", "after"):
-        src, dst = source / source_name / f"{name}.mp4", target / f"{name}.mp4"
+        src = source / source_name / f"{name}.mp4" if source is not None else None
+        dst = target / f"{name}.mp4"
         if not dst.exists():
+            if src is None:
+                raise FileNotFoundError(f"Missing original {dst}; provide --source to import it.")
             shutil.move(str(src), str(dst))
-        elif src.exists() and src.read_bytes() != dst.read_bytes():
+        elif src is not None and src.exists() and src.read_bytes() != dst.read_bytes():
             raise ValueError(f"Refusing to overwrite a different original: {dst}")
         reader = imageio_ffmpeg.read_frames(str(dst))
         try:
@@ -55,17 +60,21 @@ def prepare_example(source, source_name, slug, title, ffmpeg):
         raise ValueError(f"Mismatched comparison timing or size: {slug}: {metadata}")
 
     width = 416
+    gap = 24 if slug.startswith("videophy-") else 0
     height = round(width * before["size"][1] / before["size"][0] / 2) * 2
-    label = Image.new("RGB", (2 * width, 36), "#f4f5f7")
+    label = Image.new("RGB", (2 * width + gap, 36), "#f4f5f7")
     draw = ImageDraw.Draw(label)
+    if gap:
+        draw.rectangle((width, 0, width + gap - 1, 35), fill="white")
     font = ImageFont.truetype("DejaVuSans.ttf", 17)
     draw.text((16, 8), "Before · Original model", fill="#50545c", font=font)
-    draw.text((width + 16, 8), "After · Ours", fill="#225d4b", font=font)
+    draw.text((width + gap + 16, 8), "After · Ours", fill="#225d4b", font=font)
     label_path = target / "labels.png"
     label.save(label_path)
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
     filters = (
-        f"[0:v]setpts=PTS-STARTPTS,scale={width}:{height}:flags=lanczos,setsar=1[b];"
+        f"[0:v]setpts=PTS-STARTPTS,scale={width}:{height}:flags=lanczos,setsar=1,"
+        f"pad={width + gap}:{height}:0:0:color=white[b];"
         f"[1:v]setpts=PTS-STARTPTS,scale={width}:{height}:flags=lanczos,setsar=1[a];"
         "[b][a]hstack=inputs=2[pair];[2:v][pair]vstack=inputs=2[out]"
     )
@@ -91,20 +100,26 @@ def prepare_example(source, source_name, slug, title, ffmpeg):
     label_path.unlink()
     return {"id": slug, "title": title, "source_folder": source_name,
             "size": before["size"], "fps": before["fps"],
-            "duration_seconds": before["duration"], "sha256": originals}
+            "duration_seconds": before["duration"], "comparison_gap_pixels": gap,
+            "sha256": originals}
 
 
 def main():
-    """Parse the import directory and build all ten comparisons plus provenance."""
+    """Rebuild selected or all examples, retaining unselected manifest records."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, required=True, help="Directory containing before/after folders.")
+    parser.add_argument("--source", type=Path, help="Optional directory to import missing before/after originals.")
+    parser.add_argument("--examples", nargs="+", choices=[item[1] for item in EXAMPLES],
+                        help="Sample IDs to regenerate; defaults to all examples.")
     args = parser.parse_args()
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    records = []
+    manifest_path = ROOT / "assets" / "videos" / "manifest.json"
+    records = {row["id"]: row for row in json.loads(manifest_path.read_text())} if manifest_path.exists() else {}
     for source_name, slug, title in EXAMPLES:
-        records.append(prepare_example(args.source, source_name, slug, title, ffmpeg))
+        if args.examples and slug not in args.examples:
+            continue
+        records[slug] = prepare_example(args.source, source_name, slug, title, ffmpeg)
         print(f"Prepared {slug}", flush=True)
-    (ROOT / "assets" / "videos" / "manifest.json").write_text(json.dumps(records, indent=2) + "\n")
+    manifest_path.write_text(json.dumps(list(records.values()), indent=2) + "\n")
 
 
 if __name__ == "__main__":

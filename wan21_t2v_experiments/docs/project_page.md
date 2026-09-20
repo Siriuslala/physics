@@ -19,6 +19,14 @@ bash scripts/prepare_project_media.sh /work/liyueyan/Interpretability/physics/vi
 
 The source contains ten directories, each with `before.mp4` (the original model) and `after.mp4` (the proposed method). The script moves these originals into `assets/videos/<sample>/`, retaining the original bytes. It refuses to overwrite an existing original with different contents. On reruns, existing destination originals can be reused even after their source files have been moved. Sample names and prompts are specified in `EXAMPLES`; no model size or exact intervention variant is inferred from filenames.
 
+To regenerate a comparison after replacing an original in `assets/videos/`, omit `--source` and select the sample ID:
+
+```bash
+python wan21_t2v_experiments/prepare_project_media.py --examples basketball-seed-23
+```
+
+`--examples` accepts multiple sample IDs. Without it, all examples are regenerated. Existing manifest records for unselected examples are retained. With no `--source`, all originals are read directly from `assets/videos/`.
+
 Each output directory contains:
 
 | File | Purpose |
@@ -28,7 +36,15 @@ Each output directory contains:
 | `comparison.gif` | Automatically animated README image and browser fallback |
 | `poster.jpg` | Initial website preview and paused GIF representation |
 
-`assets/videos/manifest.json` records each source folder, caption, dimensions, frame rate, duration, and SHA-256 hashes of the originals. Before composition, the utility requires the two sources to have matching dimensions, frame rates, and durations. The original sequence is neither cropped nor retimed. Each MP4 panel is resized to 416 pixels wide with its aspect ratio preserved; a label strip identifies the baseline on the left and the proposed method on the right. H.264, YUV 4:2:0 and MP4 fast-start metadata support browser playback. The GIF has a total width of 640 pixels, 12 frames per second, a 192-color palette, and an infinite loop. GIF sampling changes temporal sampling density, not playback speed; its duration is quantized to the GIF frame intervals.
+`assets/videos/manifest.json` records each source folder, caption, dimensions, frame rate, duration, and SHA-256 hashes of the originals. Newly generated records also include `comparison_gap_pixels`, the gutter width before GIF resizing. Before composition, the utility requires the two sources to have matching dimensions, frame rates, and durations. The original sequence is neither cropped nor retimed. Each MP4 panel is resized to 416 pixels wide with its aspect ratio preserved; a label strip identifies the baseline on the left and the proposed method on the right. VideoPhy comparisons include a 24-pixel white gutter between panels and their labels (856 pixels total width, approximately 18 gutter pixels after GIF resizing). Basketball comparisons have a total width of 832 pixels. The same composed layout is used by the MP4, GIF and poster. H.264, YUV 4:2:0 and MP4 fast-start metadata support browser playback. The GIF has a total width of 640 pixels, 12 frames per second, a 192-color palette, and an infinite loop. GIF sampling changes temporal sampling density, not playback speed; its duration is quantized to the GIF frame intervals.
+
+The GIF is generated from the synchronized `comparison.mp4` with this FFmpeg filter graph:
+
+```text
+fps=12,scale=640:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=192:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle
+```
+
+The two branches share the same resized frames: one builds an adaptive palette, and the other applies it with ordered Bayer dithering. `-loop 0` enables infinite repetition. The first comparison frame is exported as `poster.jpg`. Regeneration is a local preparation step; commit the generated files to publish them through the existing workflow.
 
 ## Playback
 

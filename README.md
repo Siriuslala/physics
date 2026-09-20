@@ -134,7 +134,7 @@ Each animation shows **Before: original model (left)** and **After: our method (
 
 ### VideoPhy
 
-Each animation shows **Before: original model (left)** and **After: our method (right)** on a shared timeline.
+Each animation shows **Before: original model (left)** and **After: our method (right)** on a shared timeline. A narrow white gap separates the two panels.
 
 <p align="center">
   <img src="assets/videos/videophy-cork/comparison.gif" width="640" alt="Cork being twisted out of a bottle. — original model on the left, our method on the right">
