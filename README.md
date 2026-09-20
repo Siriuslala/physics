@@ -103,7 +103,7 @@ Smaller $\lambda^{h/w}$ slows spatial attention decay, so early denoising can ex
 On **VideoPhy** (344 cases; Semantic Adherence / Physical Commonsense, human evaluation):
 
 <p align="center">
-  <img src="assets/videophy_table.png" width="720"/>
+  <img src="assets/videophy_eva_table.png" width="720"/>
 </p>
 
 The gain is largest on **solid-\*** interactions, which is the regime our analysis targets. Prompt refinement mainly helps instruction following; combining it with modified RoPE further boosts physical consistency.
