@@ -6,6 +6,8 @@
 
 <p align="center">
   <a href="https://arxiv.org/pdf/2609.23658"><img src="https://img.shields.io/badge/arXiv-2609.23658-b31b1b.svg" alt="arXiv"></a>
+  &nbsp;
+  <a href="https://huggingface.co/papers/2609.23658"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20HF%20Daily%20Paper-Upvote-yellow.svg" alt="HF Daily Paper"></a>
 </p>
 
 <p align="center"><b>Project Page:</b> <a href="https://siriuslala.github.io/physics/">https://siriuslala.github.io/physics/</a></p>
