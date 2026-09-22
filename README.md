@@ -285,15 +285,14 @@ Prompt files are under `wan_eval/datasets/`. See [`wan_eval/README.md`](wan_eval
 ## Citation
 
 ```bibtex
-@inproceedings{video-physics-attention-2027,
+@article{video-physics-attention-2027,
   title     = {Why Do Video Diffusion Models Violate Physics?
                Unveiling the Flaws in Attention Mechanisms},
   author    = {Yueyan Li and Haibo Wang and Caixia Yuan and Xiaojie Wang},
-  booktitle = {International Conference on Learning Representations (under review)},
+  journal={arXiv preprint arXiv:2609.23658},
   year      = {2027}
 }
 ```
-
 ---
 
 ## Acknowledgements
