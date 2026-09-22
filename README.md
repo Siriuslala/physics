@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://arxiv.org/pdf/2609.23658"><img src="https://img.shields.io/badge/arXiv-xxxx.xxxxx-b31b1b.svg" alt="arXiv"></a>
+  <a href="https://arxiv.org/pdf/2609.23658"><img src="https://img.shields.io/badge/arXiv-2609.23658-b31b1b.svg" alt="arXiv"></a>
 </p>
 
 <p align="center"><b>Project Page:</b> <a href="https://siriuslala.github.io/physics/">https://siriuslala.github.io/physics/</a></p>
