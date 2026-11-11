@@ -10,10 +10,12 @@ patched q/k tensors and computes a side-channel sampled probe over selected
 object-region query tokens.
 """
 
+import gc
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
+
 import torch.distributed as dist
 
 from .head_evolution import (
@@ -21,6 +23,8 @@ from .head_evolution import (
     _extract_wan21_t2v_reference_peak_and_centroid_trajectory,
     _preprocess_wan21_t2v_attention_map_fhw,
 )
+from .finetuned_attention import prepare_finetuned_attention
+
 from .utils import (
     Wan21T2VParallelConfig,
     _broadcast_seed_if_needed,
@@ -392,6 +396,7 @@ def _render_wan21_t2v_self_attention_viz_tasks(
     return [results_by_key[key] for key in sorted(results_by_key.keys())]
 
 
+
 def run_wan21_t2v_self_attention_viz(
     wan21_root: str,
     ckpt_dir: str,
@@ -439,6 +444,13 @@ def run_wan21_t2v_self_attention_viz(
     self_attention_viz_visualization_output_dir: str = "",
     self_attention_viz_num_workers: int = 0,
     save_video: bool = True,
+    finetune_lora_checkpoint: str = "",
+    finetune_lora_rank: int = 64,
+    finetune_lora_alpha: int = 32,
+    finetune_lora_modules: str = "attn",
+    rope_modification_lambda_h: float = 1.0,
+    rope_modification_lambda_w: float = 1.0,
+    rope_modification_steps: Sequence[int] = tuple(),
     parallel_cfg: Optional[Wan21T2VParallelConfig] = None,
 ):
     """Run object-guided self-attention visualization with side-channel q/k probing."""
@@ -482,6 +494,7 @@ def run_wan21_t2v_self_attention_viz(
     runtime = _init_wan21_t2v_runtime(parallel_cfg, explicit_device_id=device_id)
     seed = _broadcast_seed_if_needed(seed, runtime)
 
+    intervention_metadata = {}
     pipeline = None
     cfg = None
     state = None
@@ -498,9 +511,14 @@ def run_wan21_t2v_self_attention_viz(
             parallel_cfg=parallel_cfg,
         )
         offload_model = _resolve_wan21_t2v_offload_model(runtime, offload_model)
+        intervention_metadata, intervention_rope = prepare_finetuned_attention(
+            pipeline.model, finetune_lora_checkpoint, finetune_lora_rank,
+            finetune_lora_alpha, finetune_lora_modules, rope_modification_lambda_h,
+            rope_modification_lambda_w, rope_modification_steps, sampling_steps,
+        )
 
         patch_cfg = Wan21T2VPatchBundleConfig(
-            rope=Wan21T2VRopePatchConfig(enabled=True, mode="full"),
+            rope=intervention_rope,
             probe=Wan21T2VAttentionProbeConfig(
                 enabled=True,
                 probe_steps=tuple(resolved_steps),
@@ -563,6 +581,13 @@ def run_wan21_t2v_self_attention_viz(
         video_path = os.path.join(output_dir, f"wan21_t2v_self_attention_viz_seed_{seed}.mp4")
         _save_wan21_t2v_video(video, video_path, fps=cfg.sample_fps)
 
+    # CPU rendering no longer needs the model or decoded CUDA video.
+    pipeline = None
+    video = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     attention_map_path = os.path.join(output_dir, "self_attention_viz_maps.pt")
     if not draw_self_attention_maps_only:
         torch.save(attention_maps, attention_map_path)
@@ -616,6 +641,14 @@ def run_wan21_t2v_self_attention_viz(
 
     summary = {
         "experiment": "wan21_t2v_self_attention_viz",
+        "model_intervention": intervention_metadata,
+        "seed": int(seed),
+        "size": [int(v) for v in size],
+        "sampling_steps": int(sampling_steps),
+        "sample_solver": str(sample_solver),
+        "shift": float(shift),
+        "guide_scale": float(guide_scale),
+        "ckpt_dir": str(ckpt_dir),
         "prompt": prompt,
         "video_path": video_path,
         "attention_map_path": attention_map_path,

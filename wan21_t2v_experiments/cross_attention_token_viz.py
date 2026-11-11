@@ -28,6 +28,11 @@ import torch.cuda.amp as amp
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from .finetuned_attention import prepare_finetuned_attention
+from .wan21_t2v_experiment_patch import (
+    Wan21T2VPatchBundleConfig, install_wan21_t2v_dit_patch_stack,
+)
+
 from .utils import (
     Wan21T2VCrossAttentionVizState,
     Wan21T2VParallelConfig,
@@ -235,6 +240,7 @@ def _materialize_wan21_t2v_cross_attention_token_viz_task(task: Dict[str, object
         "pdf_units": int(task["pdf_units"]),
     }
 
+
 def run_wan21_t2v_cross_attention_token_viz(
     wan21_root: str,
     ckpt_dir: str,
@@ -280,6 +286,13 @@ def run_wan21_t2v_cross_attention_token_viz(
     draw_attention_maps_path: str = "",
     visualization_output_dir: str = "",
     cross_attention_token_viz_num_workers: int = 0,
+    finetune_lora_checkpoint: str = "",
+    finetune_lora_rank: int = 64,
+    finetune_lora_alpha: int = 32,
+    finetune_lora_modules: str = "attn",
+    rope_modification_lambda_h: float = 1.0,
+    rope_modification_lambda_w: float = 1.0,
+    rope_modification_steps: Sequence[int] = tuple(),
     parallel_cfg: Optional[Wan21T2VParallelConfig] = None,
 ):
     """Visualize video-to-text cross-attention maps for user-selected prompt words.
@@ -309,6 +322,7 @@ def run_wan21_t2v_cross_attention_token_viz(
     if runtime.use_usp:
         raise RuntimeError("Cross-attention token visualization currently requires use_usp=False.")
 
+    intervention_metadata = {}
     pipeline = None
     cfg = None
     prompt_tokens: List[str] = []
@@ -338,6 +352,11 @@ def run_wan21_t2v_cross_attention_token_viz(
             parallel_cfg=parallel_cfg,
         )
         offload_model = _resolve_wan21_t2v_offload_model(runtime, offload_model)
+        intervention_metadata, intervention_rope = prepare_finetuned_attention(
+            pipeline.model, finetune_lora_checkpoint, finetune_lora_rank,
+            finetune_lora_alpha, finetune_lora_modules, rope_modification_lambda_h,
+            rope_modification_lambda_w, rope_modification_steps, sampling_steps,
+        )
         word_to_positions, word_to_type, prompt_tokens = _locate_wan21_t2v_prompt_words(
             text_encoder=pipeline.text_encoder,
             prompt=prompt,
@@ -541,6 +560,9 @@ def run_wan21_t2v_cross_attention_token_viz(
             if runtime.rank == 0 and plot_during_sampling and step_maps:
                 _accumulate_from_mean_maps(step_maps, allow_plot=True)
 
+        rope_handle = install_wan21_t2v_dit_patch_stack(
+            pipeline.model, Wan21T2VPatchBundleConfig(rope=intervention_rope),
+        )
         handle = _install_wan21_t2v_cross_attention_viz_patch(
             pipeline.model,
             state,
@@ -562,6 +584,7 @@ def run_wan21_t2v_cross_attention_token_viz(
             )
         finally:
             handle.restore()
+            rope_handle.restore()
 
         if stream_flush_per_step:
             final_step_maps = state.export_step_mean_maps(state.current_step, clear_after_export=True)
@@ -619,6 +642,14 @@ def run_wan21_t2v_cross_attention_token_viz(
 
         summary = {
             "experiment": "wan21_t2v_cross_attention_token_viz",
+            "model_intervention": intervention_metadata,
+            "seed": int(seed),
+            "size": [int(v) for v in size],
+            "sampling_steps": int(sampling_steps),
+            "sample_solver": str(sample_solver),
+            "shift": float(shift),
+            "guide_scale": float(guide_scale),
+            "ckpt_dir": str(ckpt_dir),
             "prompt": prompt,
             "frame_num": int(frame_num),
             "prompt_tokens": prompt_tokens,

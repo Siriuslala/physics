@@ -156,6 +156,10 @@ def build_parser() -> argparse.ArgumentParser:
             "timestep-conditioned scale learning."
         ),
     )
+    parser.add_argument("--finetune_lora_checkpoint", type=str, default="", help="Exact complete LoRA safetensors checkpoint for attention visualization.")
+    parser.add_argument("--finetune_lora_rank", type=int, default=64)
+    parser.add_argument("--finetune_lora_alpha", type=int, default=32)
+    parser.add_argument("--finetune_lora_modules", choices=("attn", "attn_ffn"), default="attn")
     parser.add_argument("--rope_modification_lambda_f", type=float, default=1.0)
     parser.add_argument("--rope_modification_lambda_h", type=float, default=1.0)
     parser.add_argument("--rope_modification_lambda_w", type=float, default=1.0)
@@ -1685,6 +1689,13 @@ def main():
             raise ValueError("--reuse_cross_attention_dir is required for self_attention_viz.")
         run_wan21_t2v_self_attention_viz(
             **common_kwargs,
+            finetune_lora_checkpoint=args.finetune_lora_checkpoint,
+            finetune_lora_rank=args.finetune_lora_rank,
+            finetune_lora_alpha=args.finetune_lora_alpha,
+            finetune_lora_modules=args.finetune_lora_modules,
+            rope_modification_lambda_h=args.rope_modification_lambda_h,
+            rope_modification_lambda_w=args.rope_modification_lambda_w,
+            rope_modification_steps=rope_modification_steps,
             target_object_words=target_object_words,
             target_verb_words=target_verb_words,
             reuse_cross_attention_dir=args.reuse_cross_attention_dir.strip(),
@@ -1844,6 +1855,13 @@ def main():
             )
         run_wan21_t2v_cross_attention_token_viz(
             **common_kwargs,
+            finetune_lora_checkpoint=args.finetune_lora_checkpoint,
+            finetune_lora_rank=args.finetune_lora_rank,
+            finetune_lora_alpha=args.finetune_lora_alpha,
+            finetune_lora_modules=args.finetune_lora_modules,
+            rope_modification_lambda_h=args.rope_modification_lambda_h,
+            rope_modification_lambda_w=args.rope_modification_lambda_w,
+            rope_modification_steps=rope_modification_steps,
             target_object_words=target_object_words,
             target_verb_words=target_verb_words,
             collect_steps=cross_attn_steps,

@@ -126,3 +126,34 @@ The experiment requires an existing `cross_attention_token_viz` output directory
 ## Interpretation Notes
 
 This experiment is most informative when comparing multiple query-frame positions. Early and late query frames can access the largest signed temporal offsets, while middle query frames reveal whether long-range decay remains symmetric after conditioning on a more central temporal position.
+
+
+## Fine-tuned LoRA and early spatial RoPE intervention
+
+Both attention visualization experiments accept the same optional model intervention. The base `--ckpt_dir` remains the official Wan checkpoint directory. `--finetune_lora_checkpoint` selects an exact adapter `.safetensors` file, `--finetune_lora_rank` and `--finetune_lora_alpha` specify the adapter rank and scaling numerator, and `--finetune_lora_modules` selects `attn` (self/cross-attention projections `q,k,v,o`) or `attn_ffn` (these projections plus `ffn.0,ffn.2`). The loader checks the complete adapter key set and every tensor shape before loading. Missing, unexpected, duplicate, and non-adapter tensors are rejected. Base-model missing keys are expected when loading an adapter-only checkpoint. Adapters remain unmerged, matching `wan_eval/infer_wan_t2v.py`.
+
+For a projection input $x\in\mathbb{R}^{d_{\mathrm{in}}}$, let $W\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}$ be its frozen weight, $A\in\mathbb{R}^{r\times d_{\mathrm{in}}}$ and $B\in\mathbb{R}^{d_{\mathrm{out}}\times r}$ its loaded adapter matrices, $r\in\mathbb{N}$ the rank, and $\alpha\in\mathbb{R}_{>0}$ the scaling numerator. The adapted projection, omitting its unchanged bias, is:
+
+$$y=Wx+(\alpha/r)BAx.$$
+
+`--rope_modification_lambda_h` and `--rope_modification_lambda_w` set fixed spatial phase scales. The temporal scale is one. `--rope_modification_steps` is a CSV list of **one-based denoising iteration numbers**, not scheduler timestep values; an empty list applies the scales to every iteration. For a step index $s\in\{1,\ldots,S\}$, where $S\in\mathbb{N}$ is the total number of sampling steps, let $\mathcal{I}\subseteq\{1,\ldots,S\}$ be the selected intervention iterations, and let $\lambda_a\in\mathbb{R}_{>0}$ be the scale for axis $a\in\{f,h,w\}$. Each original complex RoPE multiplier $z_{a,j}(p_a)\in\mathbb{C}$ has unit modulus; $p_a\in\mathbb{N}_0$ is an axis position and $j$ indexes that axis's complex channel. The implementation uses:
+
+$$\widetilde z_{a,j}^{(s)}(p_a)=\exp\!\left(i\lambda_a\operatorname{Arg}z_{a,j}(p_a)\right)\quad\text{for }s\in\mathcal{I}.$$
+
+Outside the selected iterations the original multiplier is retained. Here $i$ is the imaginary unit and $\operatorname{Arg}$ is the principal complex argument. This convention deliberately matches the fixed-lambda inference implementation in `wan_eval/infer_wan_t2v.py`: scaling a wrapped complex phase is not generally identical to multiplying the unwrapped position-frequency product by the scale. Identity axes retain their original complex values rather than reconstructing them through an angle/polar round trip. Fixed spatial scales follow the evaluation module precision convention: the requested values are converted to float32 logarithms on the model device and pass through exp, clamped log, and exp before promotion to the RoPE computation dtype. Thus requested 0.70 has effective value 0.699999988079071, while 0.75 remains exact. The summary preserves requested `rope_lambda_h/w` and separately records `rope_lambda_h_effective`, `rope_lambda_w_effective`, and `rope_lambda_precision`. Both conditional and unconditional CFG branches receive the same intervention at each selected iteration.
+
+The self-attention experiment passes this configuration to its existing q/k probe patch, so its recorded maps use the same modified q/k as generation. The cross-attention experiment installs the RoPE patch before the recording patch and restores them in reverse order. Neither path edits official model source. `model_intervention` in the summary JSON records the exact checkpoint path, adapter rank/alpha/modules and tensor count, spatial scales, iteration list, and phase convention. Redrawing previously saved maps does not reload a model and records no new intervention provenance; the original collection summary remains the authoritative source.
+
+The basketball comparison uses the following paired settings; each modified run must use its own cross-attention directory for object support extraction:
+
+| Seed | LoRA modules | Checkpoint filename | Rank / alpha | Spatial scales (h, w) | Intervention iterations | Cross-attention reference |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8 | `attn` | `step-1000.safetensors` | 64 / 32 | 0.75, 0.75 | 1,2,3,4,5 | step 45, layer 27 |
+| 20 | `attn` | `step-1000.safetensors` | 64 / 32 | 0.75, 0.75 | 1,2,3,4,5 | step 50, layer 27 |
+| 29 | `attn_ffn` | `step-700.safetensors` | 64 / 32 | 0.70, 0.70 | 1,2,3,4,5 | step 50, layer 27 |
+
+The `attn` checkpoint belongs to the fixed-lambda training run with early-timestep probability 0.9; the `attn_ffn` checkpoint belongs to the run with probability 0.5. Both training runs use spatial lambda 0.75, while seed 29 deliberately uses inference lambda 0.70. Use `--self_attention_viz_query_video_frame_indices 1` to query only the first video frame. Inspect object-support overlays before interpreting attention maps. A comparison between the original model and LoRA plus modified RoPE measures their joint intervention; isolating the causal contribution of RoPE requires a matched fine-tuned-model run with identity RoPE.
+
+The model and decoded video are released before CPU PDF rendering so that plotting does not retain inference GPU memory.
+
+Sampling summaries record the base checkpoint directory, seed, resolution, solver, step count, shift, and guidance scale alongside the model intervention.

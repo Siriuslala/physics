@@ -1262,3 +1262,18 @@ For `head_evolution`:
   - affects all PDF rendering in `cross_attention_token_viz` (map/trajectory/timeline).
   - `true`: if target PDF already exists, skip drawing this file.
   - useful for resume after OOM/kill during long visualization rendering.
+
+
+## Fine-tuned attention comparisons
+
+`cross_attention_token_viz` and `self_attention_viz` share strict adapter loading through `--finetune_lora_checkpoint`, `--finetune_lora_rank`, `--finetune_lora_alpha`, and `--finetune_lora_modules` (`attn` or `attn_ffn`). The existing `--rope_modification_lambda_h`, `--rope_modification_lambda_w`, and `--rope_modification_steps` options now also apply to these experiments. Both CFG branches use the selected scales on the selected one-based denoising iterations. Summaries record model-intervention provenance. See [cross-attention](docs/cross_attention_token_viz.md#fine-tuned-lora-and-early-spatial-rope-intervention) and [self-attention](docs/self_attention_viz.md#fine-tuned-lora-and-early-spatial-rope-intervention) for phase conventions and the seed 8/20/29 comparison settings.
+
+### Basketball post-hoc attention comparison
+
+The fixed seed 8/20/29 workflow reuses baseline cross-attention, loads explicitly selected LoRA checkpoints with early spatial RoPE scaling, audits object masks on maps and video, and probes the first-frame object query. See [the workflow](docs/rope_posthoc_attention.md) and [paired metrics](docs/rope_posthoc_comparison.md). The launcher is `scripts/rope_posthoc_attention_wan2_1.sh`; all sampling is restricted to A800 GPUs.
+
+Reference masks can be checked with `python -m wan21_t2v_experiments.region_audit`; see [region audit](docs/region_audit.md) for overlays and explicit per-frame validity review.
+
+The CPU-only [paired attention visualization](docs/rope_posthoc_comparison.md) renders separate two-row, ten-frame comparisons for seeds 8, 20, and 29 across steps 1–20 and layers 0–29, with all-layer trends and paired spatial-alignment matrices. Run `bash scripts/rope_posthoc_visualize_wan2_1.sh` after collecting the comparison CSVs.
+
+Saved cross-attention maps can be materialized for selected tokens with `python -m wan21_t2v_experiments.redraw_cross_attention`; [the cross-attention documentation](docs/cross_attention_token_viz.md) describes the CPU-only workflow. `scripts/redraw_cross_attention_modified_seed20.sh` renders only basketball for modified seed 20.
